@@ -212,10 +212,14 @@ func appendOp(b []byte, op document.Op) []byte {
 		b = appendUUID(b, 2, o.DocID)
 		b = appendBytes(b, 6, o.ContentHash.Bytes[:])
 		b = appendInt(b, 9, o.Size)
-		return appendRawString(b, 10, o.Mime)
+		b = appendRawString(b, 10, o.Mime)
+		b = appendUUID(b, 11, o.AttachmentID)
+		b = appendRawString(b, 12, o.Name)
+		return appendInt(b, 13, int64(o.Scheme))
 	case document.AttachmentDeleteOp:
 		b = appendInt(b, 1, binOpAttachmentDel)
-		return appendUUID(b, 2, o.DocID)
+		b = appendUUID(b, 2, o.DocID)
+		return appendUUID(b, 11, o.AttachmentID)
 	default:
 		return b
 	}
@@ -631,6 +635,12 @@ func decodeOp(r *binReader) document.Op {
 			attach.Size = r.int(wt)
 		case 10:
 			attach.Mime = r.str(wt)
+		case 11:
+			attach.AttachmentID = r.uuid(wt)
+		case 12:
+			attach.Name = r.str(wt)
+		case 13:
+			attach.Scheme = byte(r.int(wt))
 		default:
 			r.skip(wt)
 		}
@@ -666,7 +676,7 @@ func decodeOp(r *binReader) document.Op {
 		attach.DocID, attach.ContentHash = write.DocID, fileWrite.BlobHash
 		return attach
 	case binOpAttachmentDel:
-		return document.AttachmentDeleteOp{DocID: write.DocID}
+		return document.AttachmentDeleteOp{DocID: write.DocID, AttachmentID: attach.AttachmentID}
 	default:
 		r.fail("unknown operation kind in binary body")
 		return nil

@@ -82,12 +82,17 @@ func (o SchemaMigrationOp) toValue() codec.Value {
 	}
 }
 
-// AttachmentPutOp sets the document's one binary attachment: the blob ContentHash names, Size
-// bytes long, of type Mime. The document must exist (or be written in the same transaction); the
-// JSON body is not touched, and replacing the bytes leaves the body's content hash as it was. The
-// blob must be in the blob store before the commit that references it is acknowledged.
+// AttachmentPutOp sets the document's attachment AttachmentID - creating it, or replacing its bytes
+// and name - to the blob ContentHash names, Size bytes long, of type Mime, under Name (unique within
+// the document). The document's other attachments are left alone. The document must exist (or be
+// written in the same transaction); its JSON is not touched, and its content hash stays as it was.
+// The blob must be in the blob store before the commit that references it is acknowledged.
 type AttachmentPutOp struct {
-	DocID       codec.UUID
+	DocID        codec.UUID
+	AttachmentID codec.UUID
+	Name         string
+	// Scheme says how ContentHash was computed (AttachmentHashSchemeChunked1).
+	Scheme      byte
 	ContentHash codec.Hash
 	Size        int64
 	Mime        string
@@ -100,17 +105,21 @@ func (o AttachmentPutOp) toValue() codec.Value {
 		Branch: 4,
 		Inner: codec.RecordValue{Fields: map[int]codec.Value{
 			1: uuidVal(o.DocID),
-			2: hashVal(o.ContentHash),
-			3: codec.Int64Value{V: o.Size},
-			4: codec.StringValue{V: o.Mime},
+			2: uuidVal(o.AttachmentID),
+			3: codec.StringValue{V: o.Name},
+			4: codec.Int32Value{V: int32(o.Scheme)},
+			5: hashVal(o.ContentHash),
+			6: codec.Int64Value{V: o.Size},
+			7: codec.StringValue{V: o.Mime},
 		}},
 	}
 }
 
-// AttachmentDeleteOp removes the document's attachment, leaving the document. Deleting the
-// document (DeleteOp) removes its attachment too, without this op.
+// AttachmentDeleteOp removes the document's attachment AttachmentID, leaving the document and its
+// other attachments. Deleting the document (DeleteOp) removes all its attachments, without this op.
 type AttachmentDeleteOp struct {
-	DocID codec.UUID
+	DocID        codec.UUID
+	AttachmentID codec.UUID
 }
 
 func (AttachmentDeleteOp) isOp() {}
@@ -120,6 +129,7 @@ func (o AttachmentDeleteOp) toValue() codec.Value {
 		Branch: 5,
 		Inner: codec.RecordValue{Fields: map[int]codec.Value{
 			1: uuidVal(o.DocID),
+			2: uuidVal(o.AttachmentID),
 		}},
 	}
 }
@@ -192,25 +202,42 @@ func OpFromValue(value codec.Value) (Op, error) {
 		if err != nil {
 			return nil, NewCommitDecodeError("OpAttachmentPut docId", nil)
 		}
-		h, err := hashFromVal(rec.Fields[2])
+		attID, err := uuidFromVal(rec.Fields[2])
+		if err != nil {
+			return nil, NewCommitDecodeError("OpAttachmentPut attachmentId", nil)
+		}
+		name, ok := rec.Fields[3].(codec.StringValue)
+		if !ok {
+			return nil, NewCommitDecodeError("OpAttachmentPut name", nil)
+		}
+		scheme, ok := rec.Fields[4].(codec.Int32Value)
+		if !ok || scheme.V < 0 || scheme.V > 255 {
+			return nil, NewCommitDecodeError("OpAttachmentPut scheme", nil)
+		}
+		h, err := hashFromVal(rec.Fields[5])
 		if err != nil {
 			return nil, NewCommitDecodeError("OpAttachmentPut contentHash", nil)
 		}
-		size, ok := rec.Fields[3].(codec.Int64Value)
+		size, ok := rec.Fields[6].(codec.Int64Value)
 		if !ok || size.V < 0 {
 			return nil, NewCommitDecodeError("OpAttachmentPut size", nil)
 		}
-		mime, ok := rec.Fields[4].(codec.StringValue)
+		mime, ok := rec.Fields[7].(codec.StringValue)
 		if !ok {
 			return nil, NewCommitDecodeError("OpAttachmentPut mime", nil)
 		}
-		return AttachmentPutOp{DocID: id, ContentHash: h, Size: size.V, Mime: mime.V}, nil
+		return AttachmentPutOp{DocID: id, AttachmentID: attID, Name: name.V, Scheme: byte(scheme.V),
+			ContentHash: h, Size: size.V, Mime: mime.V}, nil
 	case 5:
 		id, err := uuidFromVal(rec.Fields[1])
 		if err != nil {
 			return nil, NewCommitDecodeError("OpAttachmentDelete docId", nil)
 		}
-		return AttachmentDeleteOp{DocID: id}, nil
+		attID, err := uuidFromVal(rec.Fields[2])
+		if err != nil {
+			return nil, NewCommitDecodeError("OpAttachmentDelete attachmentId", nil)
+		}
+		return AttachmentDeleteOp{DocID: id, AttachmentID: attID}, nil
 	default:
 		return nil, NewCommitDecodeError("unknown KdbOp branch", nil)
 	}

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"sync"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -14,7 +15,9 @@ import (
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
 )
 
-// Attachments: one binary attachment per document (docs/kdb-attachments-plan.md).
+// Attachments: binary attachments on documents (docs/kdb-attachments-plan.md). A document has any
+// number; each has a permanent ID and a name unique within the document, and either one selects it
+// (AttachmentSelector).
 //
 // The bytes live in the namespace's attachment store (storage/attachstore) - small ones packed in
 // the ordinary blob store, larger ones as standalone segments - and a commit records which
@@ -35,8 +38,8 @@ const (
 	AttachmentHistoryLatest
 )
 
-// ErrNoAttachment reports a document with no attachment (at the commit asked about).
-var ErrNoAttachment = errors.New("kdb: document has no attachment")
+// ErrNoAttachment reports an attachment the document does not have (at the commit asked about).
+var ErrNoAttachment = errors.New("kdb: no such attachment")
 
 // ErrAttachmentNotRetained reports an attachment version a commit references whose bytes the
 // engine no longer keeps (AttachmentHistoryLatest, or a history truncated past it).
@@ -45,12 +48,64 @@ var ErrAttachmentNotRetained = errors.New("kdb: attachment version is no longer 
 // ErrNoSuchDocument reports an attachment written to a document that does not exist.
 var ErrNoSuchDocument = errors.New("kdb: no such document")
 
-// AttachmentInfo describes a document's attachment.
+// AttachmentInfo describes one attachment of a document.
 type AttachmentInfo struct {
 	DocID       codec.UUID
+	ID          codec.UUID
+	Name        string
 	ContentHash codec.Hash
 	Size        int64
 	Mime        string
+}
+
+func infoOf(docID codec.UUID, a document.Attachment) AttachmentInfo {
+	return AttachmentInfo{DocID: docID, ID: a.ID, Name: a.Name, ContentHash: a.ContentHash, Size: a.Size, Mime: a.Mime}
+}
+
+// AttachmentSelector picks one attachment of a document: by ID when ID is set, otherwise by Name.
+type AttachmentSelector struct {
+	ID   codec.UUID
+	Name string
+}
+
+// AttachmentByID selects an attachment by its ID.
+func AttachmentByID(id codec.UUID) AttachmentSelector { return AttachmentSelector{ID: id} }
+
+// AttachmentByName selects an attachment by its name.
+func AttachmentByName(name string) AttachmentSelector { return AttachmentSelector{Name: name} }
+
+func (s AttachmentSelector) find(set document.AttachmentSet) (document.Attachment, bool) {
+	if s.ID != (codec.UUID{}) {
+		for _, a := range set {
+			if a.ID == s.ID {
+				return a, true
+			}
+		}
+		return document.Attachment{}, false
+	}
+	return set.ByName(s.Name)
+}
+
+func (s AttachmentSelector) String() string {
+	if s.ID != (codec.UUID{}) {
+		return s.ID.String()
+	}
+	return fmt.Sprintf("%q", s.Name)
+}
+
+// PutAttachmentOptions says which attachment PutAttachment writes.
+//
+//   - ID set: that attachment - replaced if the document has it, created with that ID if not.
+//   - Name set, no ID: the attachment of that name is replaced if there is one (keeping its ID);
+//     otherwise a new attachment is created under the name, with a fresh ID.
+//   - Neither: a new attachment, with a fresh ID and that ID as its name.
+//
+// Name, when set alongside an ID, renames the attachment; left empty it keeps its name (or, for a
+// new attachment, takes the ID's string form).
+type PutAttachmentOptions struct {
+	ID   codec.UUID
+	Name string
+	Mime string
 }
 
 // attachmentState is a runtime's attachment stores, one per namespace, and its settings.
@@ -97,7 +152,11 @@ func (rt *EmbeddedKdbRuntime) AttachmentStore(namespaceID string) *attachstore.S
 		}
 		shim = rt.attach.memShim
 	}
-	s := attachstore.New(shim, namespaceID, rt.Storage, rt.attach.config)
+	var small attachstore.SmallBlobs
+	if sb, ok := rt.Storage.(attachstore.SmallBlobs); ok {
+		small = sb
+	}
+	s := attachstore.New(shim, namespaceID, small, rt.attach.config)
 	rt.attach.stores[namespaceID] = s
 	if eng, ok := rt.Storage.(*engine.ServerEngine); ok {
 		// Under history=none the blob store keeps only what the live tree names; attachment
@@ -138,112 +197,172 @@ func (rt *EmbeddedKdbRuntime) AttachmentTableAt(commit codec.Hash) (document.Att
 	return d.AttachmentTableAt(commit)
 }
 
-// PutAttachment stores r's bytes as docID's attachment, of type mime, and commits it: the bytes
-// are durable before the commit that references them is. Replacing an attachment leaves the
-// document's JSON and content hash as they were. It returns the commit.
-func (rt *EmbeddedKdbRuntime) PutAttachment(namespaceID string, docID codec.UUID, r io.Reader, mime string) (codec.Hash, AttachmentInfo, error) {
+// PutAttachment stores r's bytes as one of docID's attachments - which one, opts says - and commits
+// it: the bytes are durable before the commit that references them is. The document's JSON, its
+// content hash and its other attachments are untouched. It returns the commit and the attachment.
+func (rt *EmbeddedKdbRuntime) PutAttachment(namespaceID string, docID codec.UUID, r io.Reader, opts PutAttachmentOptions) (codec.Hash, AttachmentInfo, error) {
 	if err := rt.AssertWritable(); err != nil {
 		return codec.Hash{}, AttachmentInfo{}, err
+	}
+	if opts.Name != "" {
+		if err := document.ValidateAttachmentName(opts.Name); err != nil {
+			return codec.Hash{}, AttachmentInfo{}, err
+		}
 	}
 	info, err := rt.AttachmentStore(namespaceID).Put(r)
 	if err != nil {
 		return codec.Hash{}, AttachmentInfo{}, err
 	}
-	op := document.AttachmentPutOp{DocID: docID, ContentHash: info.Hash, Size: info.Size, Mime: mime}
-	c, prev, err := rt.commitAttachmentOps(namespaceID, docID, []document.Op{op})
+	ref := document.AttachmentRef{Scheme: document.AttachmentHashSchemeChunked1, ContentHash: info.Hash, Size: info.Size, Mime: opts.Mime}
+	return rt.putAttachmentRef(namespaceID, docID, opts.ID, opts.Name, ref)
+}
+
+// RenameAttachment gives one of docID's attachments a new name, keeping its ID and bytes.
+func (rt *EmbeddedKdbRuntime) RenameAttachment(namespaceID string, docID codec.UUID, sel AttachmentSelector, newName string) (codec.Hash, AttachmentInfo, error) {
+	if err := rt.AssertWritable(); err != nil {
+		return codec.Hash{}, AttachmentInfo{}, err
+	}
+	if err := document.ValidateAttachmentName(newName); err != nil {
+		return codec.Hash{}, AttachmentInfo{}, err
+	}
+	head, err := rt.DAG.Head()
 	if err != nil {
 		return codec.Hash{}, AttachmentInfo{}, err
 	}
-	if prev != nil && prev.ContentHash != info.Hash {
-		rt.attach.mu.Lock()
-		rt.attach.replaced = append(rt.attach.replaced, [2]codec.Hash{prev.ContentHash, info.Hash})
-		rt.attach.mu.Unlock()
+	table, err := rt.AttachmentTableAt(head)
+	if err != nil {
+		return codec.Hash{}, AttachmentInfo{}, err
 	}
-	return c, AttachmentInfo{DocID: docID, ContentHash: info.Hash, Size: info.Size, Mime: mime}, nil
+	a, ok := sel.find(table.List(docID))
+	if !ok {
+		return codec.Hash{}, AttachmentInfo{}, fmt.Errorf("%w: %s of %s", ErrNoAttachment, sel, docID)
+	}
+	return rt.putAttachmentRef(namespaceID, docID, a.ID, newName, a.AttachmentRef)
 }
 
-// DeleteAttachment removes docID's attachment, leaving the document. Removing one that is not
-// there is ErrNoAttachment.
-func (rt *EmbeddedKdbRuntime) DeleteAttachment(namespaceID string, docID codec.UUID) (codec.Hash, error) {
+// putAttachmentRef resolves which attachment to write (see PutAttachmentOptions) and commits it.
+func (rt *EmbeddedKdbRuntime) putAttachmentRef(namespaceID string, docID, id codec.UUID, name string, ref document.AttachmentRef) (codec.Hash, AttachmentInfo, error) {
+	var put document.AttachmentPutOp
+	var prev *document.Attachment
+	c, err := rt.commitAttachmentOps(namespaceID, docID, func(set document.AttachmentSet) ([]document.Op, error) {
+		var existing document.Attachment
+		var found bool
+		switch {
+		case id != (codec.UUID{}):
+			existing, found = AttachmentByID(id).find(set)
+		case name != "":
+			existing, found = set.ByName(name)
+		}
+		attID, attName := id, name
+		if found {
+			attID = existing.ID
+			if attName == "" {
+				attName = existing.Name
+			}
+			prev = &existing
+		}
+		if attID == (codec.UUID{}) {
+			fresh, err := codec.RandomUUID()
+			if err != nil {
+				return nil, err
+			}
+			attID = fresh
+		}
+		if attName == "" {
+			attName = attID.String()
+		}
+		put = document.AttachmentPutOp{DocID: docID, AttachmentID: attID, Name: attName,
+			Scheme: ref.Scheme, ContentHash: ref.ContentHash, Size: ref.Size, Mime: ref.Mime}
+		return []document.Op{put}, nil
+	})
+	if err != nil {
+		return codec.Hash{}, AttachmentInfo{}, err
+	}
+	if prev != nil && prev.ContentHash != ref.ContentHash {
+		rt.attach.mu.Lock()
+		rt.attach.replaced = append(rt.attach.replaced, [2]codec.Hash{prev.ContentHash, ref.ContentHash})
+		rt.attach.mu.Unlock()
+	}
+	return c, AttachmentInfo{DocID: docID, ID: put.AttachmentID, Name: put.Name,
+		ContentHash: put.ContentHash, Size: put.Size, Mime: put.Mime}, nil
+}
+
+// DeleteAttachment removes one of docID's attachments, leaving the document and its others.
+// Removing one that is not there is ErrNoAttachment.
+func (rt *EmbeddedKdbRuntime) DeleteAttachment(namespaceID string, docID codec.UUID, sel AttachmentSelector) (codec.Hash, error) {
 	if err := rt.AssertWritable(); err != nil {
 		return codec.Hash{}, err
 	}
-	c, prev, err := rt.commitAttachmentOps(namespaceID, docID, []document.Op{document.AttachmentDeleteOp{DocID: docID}})
+	return rt.commitAttachmentOps(namespaceID, docID, func(set document.AttachmentSet) ([]document.Op, error) {
+		a, ok := sel.find(set)
+		if !ok {
+			return nil, fmt.Errorf("%w: %s of %s", ErrNoAttachment, sel, docID)
+		}
+		return []document.Op{document.AttachmentDeleteOp{DocID: docID, AttachmentID: a.ID}}, nil
+	})
+}
+
+// commitAttachmentOps appends a commit on main's head of the ops plan derives from docID's
+// attachments there, after checking docID exists.
+func (rt *EmbeddedKdbRuntime) commitAttachmentOps(namespaceID string, docID codec.UUID, plan func(document.AttachmentSet) ([]document.Op, error)) (codec.Hash, error) {
+	head, err := rt.DAG.Head()
 	if err != nil {
 		return codec.Hash{}, err
 	}
-	if prev == nil {
-		return c, ErrNoAttachment
-	}
-	return c, nil
-}
-
-// commitAttachmentOps appends a commit of ops on main's head, after checking docID exists there.
-// It returns the commit and docID's attachment before it.
-func (rt *EmbeddedKdbRuntime) commitAttachmentOps(namespaceID string, docID codec.UUID, ops []document.Op) (codec.Hash, *document.AttachmentRef, error) {
-	head, err := rt.DAG.Head()
-	if err != nil {
-		return codec.Hash{}, nil, err
-	}
 	commit, err := rt.DAG.GetCommitOrThrow(head)
 	if err != nil {
-		return codec.Hash{}, nil, err
+		return codec.Hash{}, err
 	}
 	doc, err := rt.Storage.GetDocument(namespaceID, docID, commit.DocumentTreeHash)
 	if err != nil {
-		return codec.Hash{}, nil, err
+		return codec.Hash{}, err
 	}
 	if doc == nil {
-		return codec.Hash{}, nil, fmt.Errorf("%w: %s", ErrNoSuchDocument, docID)
+		return codec.Hash{}, fmt.Errorf("%w: %s", ErrNoSuchDocument, docID)
 	}
 	table, err := rt.AttachmentTableAt(head)
 	if err != nil {
-		return codec.Hash{}, nil, err
+		return codec.Hash{}, err
 	}
-	var prev *document.AttachmentRef
-	if ref, ok := table.Get(docID); ok {
-		prev = &ref
+	ops, err := plan(table.List(docID))
+	if err != nil {
+		return codec.Hash{}, err
 	}
-	if _, isDelete := ops[0].(document.AttachmentDeleteOp); isDelete && prev == nil {
-		return head, nil, nil // nothing to remove; no commit
+	// The table checks what it can before anything is committed (a name another attachment has).
+	if _, err := table.Apply(ops); err != nil {
+		return codec.Hash{}, err
 	}
 	tree, err := rt.Storage.CommitTree(namespaceID, commit.DocumentTreeHash)
 	if err != nil {
-		return codec.Hash{}, nil, err
+		return codec.Hash{}, err
 	}
 	txID, err := codec.RandomUUID()
 	if err != nil {
-		return codec.Hash{}, nil, err
+		return codec.Hash{}, err
 	}
 	author, err := codec.RandomUUID()
 	if err != nil {
-		return codec.Hash{}, nil, err
+		return codec.Hash{}, err
 	}
 	tx := document.Transaction{ID: txID, BaseVersion: head, Operations: ops, Timestamp: codec.TimestampNow(), AuthorNodeID: author}
 	c, err := rt.DAG.AppendCommit(tx, head, tree, commit.SchemaHash, "")
 	if err != nil {
-		return codec.Hash{}, nil, err
+		return codec.Hash{}, err
 	}
-	return c.Hash, prev, nil
+	return c.Hash, nil
 }
 
-// GetAttachment opens docID's attachment as of commit asOf (zero: main's head). The caller closes
-// the reader.
-func (rt *EmbeddedKdbRuntime) GetAttachment(namespaceID string, docID codec.UUID, asOf codec.Hash) (io.ReadCloser, AttachmentInfo, error) {
-	if asOf == (codec.Hash{}) {
-		head, err := rt.DAG.Head()
-		if err != nil {
-			return nil, AttachmentInfo{}, err
-		}
-		asOf = head
-	}
-	info, err := rt.AttachmentInfoAt(namespaceID, docID, asOf)
+// GetAttachment opens one of docID's attachments as of commit asOf (zero: main's head). The reader
+// streams the bytes chunk by chunk, each checked against the content hash, and is pinned to this
+// version: commits, delta compaction and GC meanwhile do not disturb it. The caller closes it.
+func (rt *EmbeddedKdbRuntime) GetAttachment(namespaceID string, docID codec.UUID, sel AttachmentSelector, asOf codec.Hash) (*attachstore.Reader, AttachmentInfo, error) {
+	info, err := rt.AttachmentInfoAt(namespaceID, docID, sel, asOf)
 	if err != nil {
 		return nil, AttachmentInfo{}, err
 	}
-	r, _, err := rt.AttachmentStore(namespaceID).Open(info.ContentHash)
+	r, err := rt.AttachmentStore(namespaceID).Open(info.ContentHash)
 	if errors.Is(err, attachstore.ErrNotFound) {
-		return nil, AttachmentInfo{}, fmt.Errorf("%w: %s of %s at %s", ErrAttachmentNotRetained, info.ContentHash.Hex(), docID, asOf.Hex())
+		return nil, AttachmentInfo{}, fmt.Errorf("%w: %s of %s", ErrAttachmentNotRetained, info.ContentHash.Hex(), docID)
 	}
 	if err != nil {
 		return nil, AttachmentInfo{}, err
@@ -251,17 +370,53 @@ func (rt *EmbeddedKdbRuntime) GetAttachment(namespaceID string, docID codec.UUID
 	return r, info, nil
 }
 
-// AttachmentInfoAt describes docID's attachment at commit, or ErrNoAttachment.
-func (rt *EmbeddedKdbRuntime) AttachmentInfoAt(namespaceID string, docID codec.UUID, commit codec.Hash) (AttachmentInfo, error) {
-	table, err := rt.AttachmentTableAt(commit)
+// AttachmentInfoAt describes one of docID's attachments at commit (zero: main's head), or
+// ErrNoAttachment.
+func (rt *EmbeddedKdbRuntime) AttachmentInfoAt(namespaceID string, docID codec.UUID, sel AttachmentSelector, commit codec.Hash) (AttachmentInfo, error) {
+	set, err := rt.attachmentSetAt(docID, commit)
 	if err != nil {
 		return AttachmentInfo{}, err
 	}
-	ref, ok := table.Get(docID)
+	a, ok := sel.find(set)
 	if !ok {
-		return AttachmentInfo{}, ErrNoAttachment
+		return AttachmentInfo{}, fmt.Errorf("%w: %s of %s", ErrNoAttachment, sel, docID)
 	}
-	return AttachmentInfo{DocID: docID, ContentHash: ref.ContentHash, Size: ref.Size, Mime: ref.Mime}, nil
+	return infoOf(docID, a), nil
+}
+
+// ListAttachments lists docID's attachments at commit (zero: main's head), sorted by name.
+func (rt *EmbeddedKdbRuntime) ListAttachments(namespaceID string, docID codec.UUID, commit codec.Hash) ([]AttachmentInfo, error) {
+	set, err := rt.attachmentSetAt(docID, commit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]AttachmentInfo, len(set))
+	for i, a := range set {
+		out[i] = infoOf(docID, a)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// CountAttachments is how many attachments docID has at commit (zero: main's head).
+func (rt *EmbeddedKdbRuntime) CountAttachments(namespaceID string, docID codec.UUID, commit codec.Hash) (int, error) {
+	set, err := rt.attachmentSetAt(docID, commit)
+	return len(set), err
+}
+
+func (rt *EmbeddedKdbRuntime) attachmentSetAt(docID codec.UUID, commit codec.Hash) (document.AttachmentSet, error) {
+	if commit == (codec.Hash{}) {
+		head, err := rt.DAG.Head()
+		if err != nil {
+			return nil, err
+		}
+		commit = head
+	}
+	table, err := rt.AttachmentTableAt(commit)
+	if err != nil {
+		return nil, err
+	}
+	return table.List(docID), nil
 }
 
 // headAttachmentHashes is every content hash a branch or tag head's attachment table references.
@@ -283,8 +438,8 @@ func (rt *EmbeddedKdbRuntime) headAttachmentHashes(namespaceID string) (map[code
 		if err != nil {
 			return nil, err
 		}
-		table.Walk(func(_ codec.UUID, r document.AttachmentRef) bool {
-			keep[r.ContentHash] = true
+		table.Walk(func(_ codec.UUID, a document.Attachment) bool {
+			keep[a.ContentHash] = true
 			return true
 		})
 	}

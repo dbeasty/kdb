@@ -5,83 +5,247 @@ import (
 	"errors"
 )
 
-// Binary deltas, git-pack style: a target is a sequence of instructions against a base -
-// copy a run of the base, or insert literal bytes. A version of an attachment is stored as a delta
-// against the version that replaced it (deltaFor), so the newest bytes are always whole and an
+// Binary deltas, git-pack style: a target is a sequence of instructions against a base - copy a
+// run of the base, or insert literal bytes. A version of an attachment is stored as a delta against
+// the version that replaced it (Store.StoreAsDelta), so the newest bytes are always whole and an
 // older version costs what changed.
 //
-// Encoding: uvarint target length, then instructions until the end:
+// Encoding: uvarint target length, then instructions until the end of the segment:
 //
 //	0x00 uvarint n, then n literal bytes
 //	0x01 uvarint offset, uvarint n: copy base[offset : offset+n]
 //
-// Matching indexes the base at every deltaBlock-aligned offset by a hash of the deltaBlock bytes
-// there, then rolls the same hash over every offset of the target; a hit is verified, extended
-// forwards as far as the bytes agree and backwards into the pending literal, and emitted as a copy.
+// A delta is read by random access (deltaSource): the instructions are indexed, the literal bytes
+// and base ranges read only where a read lands.
+//
+// Encoding never holds either version whole. The base is indexed at every block-aligned offset by a
+// hash of the block there (the block size grows with the base, so the index stays under ~1M
+// entries); the target is scanned with a rolling hash of the same width through a small page cache;
+// a hit is verified, extended forwards and backwards into the pending literal, and emitted as a
+// copy. Output goes to emit in pieces of at most outPiece bytes.
 
 const (
-	deltaBlock  = 32
-	opLiteral   = 0x00
-	opCopy      = 0x01
-	deltaPrime  = 0x100000001b3
-	minCopySpan = deltaBlock
+	opLiteral  = 0x00
+	opCopy     = 0x01
+	deltaPrime = 0x100000001b3
+	maxIndex   = 1 << 20
+	outPiece   = 1 << 20
+	maxLiteral = 1 << 20 // a literal run longer than this is emitted in pieces
+	pageBytes  = 1 << 20
+	cachePages = 4
 )
 
 var errDeltaCorrupt = errors.New("attachstore: corrupt delta")
 
-// encodeDelta returns target as a delta against base.
-func encodeDelta(base, target []byte) []byte {
-	out := binary.AppendUvarint(nil, uint64(len(target)))
-	if len(base) < deltaBlock || len(target) < deltaBlock {
-		return appendLiteral(out, target)
+// pageCache serves single bytes and short runs of a source a page at a time.
+type pageCache struct {
+	src   source
+	pages map[int64][]byte
+	order []int64
+}
+
+func newPageCache(src source) *pageCache {
+	return &pageCache{src: src, pages: map[int64][]byte{}}
+}
+
+func (c *pageCache) page(i int64) ([]byte, error) {
+	if p, ok := c.pages[i]; ok {
+		return p, nil
 	}
-	index := make(map[uint64]int, len(base)/deltaBlock)
-	for off := 0; off+deltaBlock <= len(base); off += deltaBlock {
-		h := blockHash(base[off : off+deltaBlock])
-		if _, ok := index[h]; !ok {
-			index[h] = off
+	n := min(int64(pageBytes), c.src.size()-i*pageBytes)
+	var buf []byte
+	if len(c.order) >= cachePages {
+		oldest := c.order[0]
+		c.order = c.order[1:]
+		buf = c.pages[oldest][:0]
+		delete(c.pages, oldest)
+	}
+	if cap(buf) < int(n) {
+		buf = make([]byte, n)
+	}
+	buf = buf[:n]
+	if err := c.src.readAt(buf, i*pageBytes); err != nil {
+		return nil, err
+	}
+	c.pages[i] = buf
+	c.order = append(c.order, i)
+	return buf, nil
+}
+
+func (c *pageCache) byteAt(off int64) (byte, error) {
+	p, err := c.page(off / pageBytes)
+	if err != nil {
+		return 0, err
+	}
+	return p[off%pageBytes], nil
+}
+
+// encodeDelta writes target as a delta against base to emit.
+func encodeDelta(base, target source, emit func([]byte) error) error {
+	block := int64(32)
+	for base.size()/block > maxIndex {
+		block *= 2
+	}
+	out := binary.AppendUvarint(nil, uint64(target.size()))
+	flush := func(force bool) error {
+		if len(out) == 0 || (!force && len(out) < outPiece) {
+			return nil
+		}
+		err := emit(out)
+		out = out[:0]
+		return err
+	}
+	tc := newPageCache(target)
+	literal := func(from, to int64) error {
+		for from < to {
+			n := min(to-from, maxLiteral)
+			out = append(out, opLiteral)
+			out = binary.AppendUvarint(out, uint64(n))
+			start := len(out)
+			out = append(out, make([]byte, n)...)
+			if err := target.readAt(out[start:], from); err != nil {
+				return err
+			}
+			from += n
+			if err := flush(false); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if base.size() < block || target.size() < block {
+		if err := literal(0, target.size()); err != nil {
+			return err
+		}
+		return flush(true)
+	}
+
+	// Index the base, a page at a time.
+	index := make(map[uint64]int64, base.size()/block)
+	pg := make([]byte, 0, pageBytes-pageBytes%block)
+	for off := int64(0); off+block <= base.size(); off += int64(cap(pg)) {
+		n := min(int64(cap(pg)), base.size()-off)
+		n -= n % block
+		pg = pg[:n]
+		if err := base.readAt(pg, off); err != nil {
+			return err
+		}
+		for b := int64(0); b < n; b += block {
+			h := blockHash(pg[b : b+block])
+			if _, ok := index[h]; !ok {
+				index[h] = off + b
+			}
 		}
 	}
-	// pow is deltaPrime^(deltaBlock-1), to roll the oldest byte out.
+	bc := newPageCache(base)
+
 	pow := uint64(1)
-	for i := 0; i < deltaBlock-1; i++ {
+	for i := int64(0); i < block-1; i++ {
 		pow *= deltaPrime
 	}
-	litStart := 0
-	i := 0
-	h := blockHash(target[0:deltaBlock])
-	for i+deltaBlock <= len(target) {
-		if bo, ok := index[h]; ok && string(base[bo:bo+deltaBlock]) == string(target[i:i+deltaBlock]) {
-			// Extend backwards into the pending literal, and forwards past the block.
-			start, bstart := i, bo
-			for start > litStart && bstart > 0 && base[bstart-1] == target[start-1] {
-				start--
-				bstart--
+	hashAt := func(i int64) (uint64, error) {
+		var h uint64
+		for k := int64(0); k < block; k++ {
+			b, err := tc.byteAt(i + k)
+			if err != nil {
+				return 0, err
 			}
-			end, bend := i+deltaBlock, bo+deltaBlock
-			for end < len(target) && bend < len(base) && base[bend] == target[end] {
-				end++
-				bend++
+			h = h*deltaPrime + uint64(b)
+		}
+		return h, nil
+	}
+	same := func(bo, to int64) (bool, error) {
+		for k := int64(0); k < block; k++ {
+			x, err := bc.byteAt(bo + k)
+			if err != nil {
+				return false, err
 			}
-			if end-start >= minCopySpan {
-				out = appendLiteral(out, target[litStart:start])
+			y, err := tc.byteAt(to + k)
+			if err != nil {
+				return false, err
+			}
+			if x != y {
+				return false, nil
+			}
+		}
+		return true, nil
+	}
+
+	tn, bn := target.size(), base.size()
+	litStart, i := int64(0), int64(0)
+	h, err := hashAt(0)
+	if err != nil {
+		return err
+	}
+	for i+block <= tn {
+		if bo, ok := index[h]; ok {
+			match, err := same(bo, i)
+			if err != nil {
+				return err
+			}
+			if match {
+				start, bstart := i, bo
+				for start > litStart && bstart > 0 {
+					x, _ := bc.byteAt(bstart - 1)
+					y, _ := tc.byteAt(start - 1)
+					if x != y {
+						break
+					}
+					start--
+					bstart--
+				}
+				end, bend := i+block, bo+block
+				for end < tn && bend < bn {
+					x, err := bc.byteAt(bend)
+					if err != nil {
+						return err
+					}
+					y, err := tc.byteAt(end)
+					if err != nil {
+						return err
+					}
+					if x != y {
+						break
+					}
+					end++
+					bend++
+				}
+				if err := literal(litStart, start); err != nil {
+					return err
+				}
 				out = append(out, opCopy)
 				out = binary.AppendUvarint(out, uint64(bstart))
 				out = binary.AppendUvarint(out, uint64(end-start))
+				if err := flush(false); err != nil {
+					return err
+				}
 				litStart, i = end, end
-				if i+deltaBlock <= len(target) {
-					h = blockHash(target[i : i+deltaBlock])
+				if i+block <= tn {
+					if h, err = hashAt(i); err != nil {
+						return err
+					}
 				}
 				continue
 			}
 		}
-		if i+deltaBlock >= len(target) {
+		if i+block >= tn {
 			break
 		}
-		h = (h-uint64(target[i])*pow)*deltaPrime + uint64(target[i+deltaBlock])
+		first, err := tc.byteAt(i)
+		if err != nil {
+			return err
+		}
+		next, err := tc.byteAt(i + block)
+		if err != nil {
+			return err
+		}
+		h = (h-uint64(first)*pow)*deltaPrime + uint64(next)
 		i++
 	}
-	return appendLiteral(out, target[litStart:])
+	if err := literal(litStart, tn); err != nil {
+		return err
+	}
+	return flush(true)
 }
 
 func blockHash(b []byte) uint64 {
@@ -90,55 +254,4 @@ func blockHash(b []byte) uint64 {
 		h = h*deltaPrime + uint64(c)
 	}
 	return h
-}
-
-func appendLiteral(out, lit []byte) []byte {
-	if len(lit) == 0 {
-		return out
-	}
-	out = append(out, opLiteral)
-	out = binary.AppendUvarint(out, uint64(len(lit)))
-	return append(out, lit...)
-}
-
-// applyDelta rebuilds the target from base and a delta, refusing a delta whose instructions run
-// outside base or past the length it declares.
-func applyDelta(base, delta []byte, maxBytes int64) ([]byte, error) {
-	n, k := binary.Uvarint(delta)
-	if k <= 0 || int64(n) > maxBytes {
-		return nil, errDeltaCorrupt
-	}
-	out := make([]byte, 0, n)
-	off := k
-	for off < len(delta) {
-		op := delta[off]
-		off++
-		switch op {
-		case opLiteral:
-			l, k := binary.Uvarint(delta[off:])
-			if k <= 0 || l > uint64(len(delta)-off-k) || uint64(len(out))+l > n {
-				return nil, errDeltaCorrupt
-			}
-			off += k
-			out = append(out, delta[off:off+int(l)]...)
-			off += int(l)
-		case opCopy:
-			bo, k1 := binary.Uvarint(delta[off:])
-			if k1 <= 0 {
-				return nil, errDeltaCorrupt
-			}
-			l, k2 := binary.Uvarint(delta[off+k1:])
-			if k2 <= 0 || bo > uint64(len(base)) || l > uint64(len(base))-bo || uint64(len(out))+l > n {
-				return nil, errDeltaCorrupt
-			}
-			off += k1 + k2
-			out = append(out, base[bo:bo+l]...)
-		default:
-			return nil, errDeltaCorrupt
-		}
-	}
-	if uint64(len(out)) != n {
-		return nil, errDeltaCorrupt
-	}
-	return out, nil
 }

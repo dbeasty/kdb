@@ -106,9 +106,9 @@ func deltaCommitSample(h wire.Header) wire.DeltaCommitMessage {
 			document.DeleteOp{DocID: id},
 			document.FileWriteOp{Path: "f/x", BlobHash: repeatHex(3)},
 			document.SchemaMigrationOp{MigrationID: id, MigrationPayload: "p"},
-			document.AttachmentPutOp{DocID: id, ContentHash: repeatHex(5), Size: 1 << 40, Mime: "image/png"},
-			document.AttachmentPutOp{DocID: id, ContentHash: codec.Hash{}, Size: 0, Mime: ""},
-			document.AttachmentDeleteOp{DocID: id},
+			document.AttachmentPutOp{DocID: id, AttachmentID: codec.UUID{MSB: 5, LSB: 6}, Name: "a.png", Scheme: 1, ContentHash: repeatHex(5), Size: 1 << 40, Mime: "image/png"},
+			document.AttachmentPutOp{DocID: id, AttachmentID: codec.UUID{MSB: 7}, Name: "é", Scheme: 1, ContentHash: codec.Hash{}, Size: 0, Mime: ""},
+			document.AttachmentDeleteOp{DocID: id, AttachmentID: codec.UUID{MSB: 5, LSB: 6}},
 		},
 		IndexHints: []wire.IndexHint{
 			{IndexID: id, FieldName: "f", IndexType: "HASH", Action: "ADD", DocID: id, Key: &key, CommitHash: repeatHex(4)},

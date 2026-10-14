@@ -38,12 +38,15 @@ internal fun KdbOp.toOpDto(): OpDto =
             OpDto(
                 kind = "attachmentPut",
                 docId = docId.toString(),
+                attachmentId = attachmentId.toString(),
+                name = name,
+                scheme = scheme,
                 blobHashHex = contentHash.toHex(),
                 size = size,
                 mime = mime,
             )
         is KdbOp.AttachmentDelete ->
-            OpDto(kind = "attachmentDelete", docId = docId.toString())
+            OpDto(kind = "attachmentDelete", docId = docId.toString(), attachmentId = attachmentId.toString())
     }
 
 internal fun OpDto.toKdbOp(): KdbOp =
@@ -71,12 +74,18 @@ internal fun OpDto.toKdbOp(): KdbOp =
         "attachmentPut" ->
             KdbOp.AttachmentPut(
                 docId = KdbUuid.fromString(docId ?: error("attachmentPut missing docId")),
+                attachmentId = KdbUuid.fromString(attachmentId ?: error("attachmentPut missing attachmentId")),
+                name = name ?: error("attachmentPut missing name"),
+                scheme = scheme?.takeIf { it in 0..255 } ?: error("attachmentPut missing scheme"),
                 contentHash = KdbHash.fromHex(blobHashHex ?: error("attachmentPut missing contentHash")),
                 size = size?.takeIf { it >= 0 } ?: error("attachmentPut missing size"),
                 mime = mime ?: error("attachmentPut missing mime"),
             )
         "attachmentDelete" ->
-            KdbOp.AttachmentDelete(docId = KdbUuid.fromString(docId ?: error("attachmentDelete missing docId")))
+            KdbOp.AttachmentDelete(
+                docId = KdbUuid.fromString(docId ?: error("attachmentDelete missing docId")),
+                attachmentId = KdbUuid.fromString(attachmentId ?: error("attachmentDelete missing attachmentId")),
+            )
         else -> error("unknown op kind: $kind")
     }
 

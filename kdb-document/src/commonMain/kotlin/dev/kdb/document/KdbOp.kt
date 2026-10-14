@@ -37,17 +37,23 @@ public sealed class KdbOp {
         val migrationPayload: String,
     ) : KdbOp()
 
-    /** Sets the document's one binary attachment (go/kdb/document AttachmentPutOp; branch 4). */
+    /** Creates or replaces one of the document's attachments - [attachmentId], under [name] -
+     * (go/kdb/document AttachmentPutOp; branch 4). [scheme] says how [contentHash] was computed. */
     public data class AttachmentPut(
         val docId: KdbUuid,
+        val attachmentId: KdbUuid,
+        val name: String,
+        val scheme: Int,
         val contentHash: KdbHash,
         val size: Long,
         val mime: String,
     ) : KdbOp()
 
-    /** Removes the document's attachment, leaving the document (AttachmentDeleteOp; branch 5). */
+    /** Removes one of the document's attachments, leaving the document and its others
+     * (AttachmentDeleteOp; branch 5). */
     public data class AttachmentDelete(
         val docId: KdbUuid,
+        val attachmentId: KdbUuid,
     ) : KdbOp()
 
     public fun toKdbValue(): KdbValue =
@@ -95,16 +101,19 @@ public sealed class KdbOp {
                     KdbValue.RecordVal(
                         mapOf(
                             1 to docId.toUuidVal(),
-                            2 to KdbValue.FixedVal(contentHash.bytes.copyOf()),
-                            3 to KdbValue.Int64Val(size),
-                            4 to KdbValue.StringVal(mime),
+                            2 to attachmentId.toUuidVal(),
+                            3 to KdbValue.StringVal(name),
+                            4 to KdbValue.Int32Val(scheme),
+                            5 to KdbValue.FixedVal(contentHash.bytes.copyOf()),
+                            6 to KdbValue.Int64Val(size),
+                            7 to KdbValue.StringVal(mime),
                         ),
                     ),
                 )
             is AttachmentDelete ->
                 KdbValue.UnionVal(
                     5,
-                    KdbValue.RecordVal(mapOf(1 to docId.toUuidVal())),
+                    KdbValue.RecordVal(mapOf(1 to docId.toUuidVal(), 2 to attachmentId.toUuidVal())),
                 )
         }
 
@@ -154,23 +163,35 @@ public sealed class KdbOp {
                     val id =
                         (r.fields[1] as? KdbValue.UuidVal)?.toKdbUuid()
                             ?: throw CommitDecodeException("OpAttachmentPut docId")
+                    val attId =
+                        (r.fields[2] as? KdbValue.UuidVal)?.toKdbUuid()
+                            ?: throw CommitDecodeException("OpAttachmentPut attachmentId")
+                    val name =
+                        (r.fields[3] as? KdbValue.StringVal)?.v
+                            ?: throw CommitDecodeException("OpAttachmentPut name")
+                    val scheme =
+                        (r.fields[4] as? KdbValue.Int32Val)?.v?.takeIf { it in 0..255 }
+                            ?: throw CommitDecodeException("OpAttachmentPut scheme")
                     val h =
-                        (r.fields[2] as? KdbValue.FixedVal)?.v
+                        (r.fields[5] as? KdbValue.FixedVal)?.v
                             ?: throw CommitDecodeException("OpAttachmentPut contentHash")
                     val size =
-                        (r.fields[3] as? KdbValue.Int64Val)?.v?.takeIf { it >= 0 }
+                        (r.fields[6] as? KdbValue.Int64Val)?.v?.takeIf { it >= 0 }
                             ?: throw CommitDecodeException("OpAttachmentPut size")
                     val mime =
-                        (r.fields[4] as? KdbValue.StringVal)?.v
+                        (r.fields[7] as? KdbValue.StringVal)?.v
                             ?: throw CommitDecodeException("OpAttachmentPut mime")
-                    AttachmentPut(id, KdbHash.fromBytes(h.copyOf()), size, mime)
+                    AttachmentPut(id, attId, name, scheme, KdbHash.fromBytes(h.copyOf()), size, mime)
                 }
                 5 -> {
                     val r = uv.value as? KdbValue.RecordVal ?: throw CommitDecodeException("OpAttachmentDelete record")
                     val id =
                         (r.fields[1] as? KdbValue.UuidVal)?.toKdbUuid()
                             ?: throw CommitDecodeException("OpAttachmentDelete docId")
-                    AttachmentDelete(id)
+                    val attId =
+                        (r.fields[2] as? KdbValue.UuidVal)?.toKdbUuid()
+                            ?: throw CommitDecodeException("OpAttachmentDelete attachmentId")
+                    AttachmentDelete(id, attId)
                 }
                 else -> throw CommitDecodeException("unknown KdbOp branch ${uv.branch}")
             }

@@ -21,8 +21,12 @@ func (b *dagBuilder) attachCommit(name string, parent codec.Hash, ops ...documen
 	return c
 }
 
+// attID is the attachment ID every putOp uses unless a test says otherwise.
+var attID = codec.UUID{MSB: 77, LSB: 77}
+
 func putOp(id codec.UUID, content byte) document.AttachmentPutOp {
-	return document.AttachmentPutOp{DocID: id, ContentHash: h(content), Size: int64(content) * 10, Mime: "application/octet-stream"}
+	return document.AttachmentPutOp{DocID: id, AttachmentID: attID, Name: "file", Scheme: document.AttachmentHashSchemeChunked1,
+		ContentHash: h(content), Size: int64(content) * 10, Mime: "application/octet-stream"}
 }
 
 func tableAt(t *testing.T, d *InMemoryCommitDag, c codec.Hash) document.AttachmentTable {
@@ -48,7 +52,7 @@ func TestCommitsCarryTheirAttachmentRoot(t *testing.T) {
 	if one.AttachmentTreeHash == nil {
 		t.Fatal("an attachment put left no root")
 	}
-	if ref, ok := tableAt(t, b.dag, one.Hash).Get(a); !ok || ref.ContentHash != h(1) || ref.Size != 10 {
+	if ref, ok := tableAt(t, b.dag, one.Hash).Get(a, attID); !ok || ref.ContentHash != h(1) || ref.Size != 10 {
 		t.Fatalf("table at one: %+v %v", ref, ok)
 	}
 	json := b.attachCommit("json-only", one.Hash, document.WriteOp{DocID: a, Patch: `{"x":1}`})
@@ -60,20 +64,20 @@ func TestCommitsCarryTheirAttachmentRoot(t *testing.T) {
 	if tab.Len() != 2 {
 		t.Fatalf("len %d", tab.Len())
 	}
-	if ref, _ := tab.Get(a); ref.ContentHash != h(3) {
+	if ref, _ := tab.Get(a, attID); ref.ContentHash != h(3) {
 		t.Fatal("the replaced attachment did not replace")
 	}
 	// Deleting the document takes its attachment; detaching the other empties the table.
 	del := b.attachCommit("delete-a", two.Hash, document.DeleteOp{DocID: a})
-	if _, ok := tableAt(t, b.dag, del.Hash).Get(a); ok {
+	if _, ok := tableAt(t, b.dag, del.Hash).Get(a, attID); ok {
 		t.Fatal("a document delete left its attachment")
 	}
-	empty := b.attachCommit("detach-c", del.Hash, document.AttachmentDeleteOp{DocID: c})
+	empty := b.attachCommit("detach-c", del.Hash, document.AttachmentDeleteOp{DocID: c, AttachmentID: attID})
 	if empty.AttachmentTreeHash != nil {
 		t.Fatal("an empty table still has a root")
 	}
 	// Earlier commits still answer with their own tables.
-	if ref, _ := tableAt(t, b.dag, one.Hash).Get(a); ref.ContentHash != h(1) {
+	if ref, _ := tableAt(t, b.dag, one.Hash).Get(a, attID); ref.ContentHash != h(1) {
 		t.Fatal("the table at an older commit changed")
 	}
 }
@@ -97,7 +101,7 @@ func TestAttachmentTablesRebuildFromHistory(t *testing.T) {
 	if *got.Root() != *want.Root() {
 		t.Fatal("the rebuilt table differs")
 	}
-	if ref, _ := got.Get(a); ref.ContentHash != h(5) {
+	if ref, _ := got.Get(a, attID); ref.ContentHash != h(5) {
 		t.Fatal("rebuilt to the wrong version")
 	}
 }

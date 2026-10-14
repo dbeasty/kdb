@@ -118,7 +118,7 @@ func (e *defaultEngine) plan(
 	if fileViolations := preflightFileWrites(tx, store); len(fileViolations) > 0 {
 		return PreparedCommit{}, ResultSchemaError{Violations: fileViolations}, nil
 	}
-	if attachViolations := preflightAttachments(tx, d.NamespaceID, store, targetDocTreeHash); len(attachViolations) > 0 {
+	if attachViolations := preflightAttachments(tx, d.NamespaceID, d, store, targetDocTreeHash, anchorCommit); len(attachViolations) > 0 {
 		return PreparedCommit{}, ResultSchemaError{Violations: attachViolations}, nil
 	}
 	schemaFrame := runSchemaPhase(tx, store, d.NamespaceID, incomingSchema, baselineDocTreeHash)

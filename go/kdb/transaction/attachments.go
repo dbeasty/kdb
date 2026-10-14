@@ -9,12 +9,14 @@ import (
 )
 
 // Attachment rules (docs/kdb-attachments-plan.md):
-//   - an AttachmentPutOp needs its blob already in the blob store, and its document to exist once
-//     the transaction has applied (stored before, or written in it - not deleted after);
-//   - an attachment change conflicts with a concurrent change to the same document's attachment,
-//     and with a concurrent delete of the document; a document delete conflicts with a concurrent
-//     attachment change; a JSON-only write conflicts with neither - the attachment is not part of
-//     the document's content hash.
+//   - an AttachmentPutOp needs an attachment ID, a valid name unique within its document, its blob
+//     already in the blob store, and its document to exist once the transaction has applied
+//     (stored before, or written in it - not deleted after);
+//   - a change to one attachment conflicts with a concurrent change to that same attachment (its
+//     ID), and with a concurrent delete of the document; a document delete conflicts with a
+//     concurrent change to any of its attachments; changes to different attachments of a document
+//     do not conflict, and a JSON-only write conflicts with none - attachments are not part of the
+//     document's content hash.
 
 // BlobPresence is the optional storage capability preflight uses to ask whether a blob is stored
 // without reading it - an attachment can be gigabytes. A store without it is asked with ReadBlob.
@@ -44,7 +46,8 @@ func touchesAttachmentOps(tx document.Transaction) bool {
 }
 
 func preflightAttachments(
-	tx document.Transaction, namespaceID string, store storage.Adapter, targetTreeHash codec.Hash,
+	tx document.Transaction, namespaceID string, d *dag.InMemoryCommitDag, store storage.Adapter,
+	targetTreeHash, anchorCommit codec.Hash,
 ) []OperationViolation {
 	if !touchesAttachmentOps(tx) {
 		return nil
@@ -74,6 +77,10 @@ func preflightAttachments(
 		}
 		detail := ""
 		switch {
+		case put.AttachmentID == (codec.UUID{}):
+			detail = "attachment has no id"
+		case document.ValidateAttachmentName(put.Name) != nil:
+			detail = document.ValidateAttachmentName(put.Name).Error()
 		case put.Size < 0:
 			detail = "attachment size is negative"
 		case !presentAt(put.DocID):
@@ -87,7 +94,25 @@ func preflightAttachments(
 			}}})
 		}
 	}
-	return out
+	if len(out) > 0 {
+		return out
+	}
+	// The rules a table enforces itself - a name unique within its document - checked by applying
+	// the operations to the table they land on.
+	table, err := d.AttachmentTableAt(anchorCommit)
+	if err != nil {
+		return []OperationViolation{{OpIndex: 0, Op: tx.Operations[0], Violations: []kdberr.FieldViolation{{
+			FieldName: "_attachment", ViolationType: kdberr.CustomConstraint, Detail: err.Error(),
+		}}}}
+	}
+	for index, op := range tx.Operations {
+		if table, err = table.Apply(tx.Operations[index : index+1]); err != nil {
+			return []OperationViolation{{OpIndex: index, Op: op, Violations: []kdberr.FieldViolation{{
+				FieldName: "_attachment", ViolationType: kdberr.CustomConstraint, Detail: err.Error(),
+			}}}}
+		}
+	}
+	return nil
 }
 
 // detectAttachmentConflicts compares each document the transaction's attachment operations (and
@@ -113,10 +138,14 @@ func detectAttachmentConflicts(
 	if base.Len() == 0 && target.Len() == 0 && !touchesAttachmentOps(tx) {
 		return nil, nil
 	}
-	changed := func(id codec.UUID) bool {
-		b, bok := base.Get(id)
-		t, tok := target.Get(id)
+	// One attachment moved, or (for a document delete) any of the document's.
+	attachmentChanged := func(doc, att codec.UUID) bool {
+		b, bok := base.Get(doc, att)
+		t, tok := target.Get(doc, att)
 		return bok != tok || b != t
+	}
+	documentChanged := func(doc codec.UUID) bool {
+		return base.List(doc).Hash() != target.List(doc).Hash()
 	}
 	var out []OperationConflict
 	for index, op := range tx.Operations {
@@ -124,13 +153,14 @@ func detectAttachmentConflicts(
 			continue
 		}
 		var id codec.UUID
+		var changed bool
 		switch o := op.(type) {
 		case document.AttachmentPutOp:
-			id = o.DocID
+			id, changed = o.DocID, attachmentChanged(o.DocID, o.AttachmentID)
 		case document.AttachmentDeleteOp:
-			id = o.DocID
+			id, changed = o.DocID, attachmentChanged(o.DocID, o.AttachmentID)
 		case document.DeleteOp:
-			id = o.DocID
+			id, changed = o.DocID, documentChanged(o.DocID)
 		default:
 			continue
 		}
@@ -138,9 +168,9 @@ func detectAttachmentConflicts(
 		existingDoc, _ := store.GetDocument(namespaceID, id, targetTreeHash)
 		_, isDelete := op.(document.DeleteOp)
 		switch {
-		case changed(id):
+		case changed:
 			// The attachment moved under us - for an attachment op, or for a delete that would
-			// take an attachment the caller has not seen.
+			// take attachments the caller has not seen.
 			out = append(out, OperationConflict{OpIndex: index, Op: op, Type: kdberr.ConcurrentWrite,
 				ExistingDoc: existingDoc, BaseDoc: baseDoc})
 		case !isDelete && baseDoc != nil && existingDoc == nil:

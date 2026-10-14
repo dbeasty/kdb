@@ -73,14 +73,20 @@ func WireRegistry() *schema.Registry {
 			Name: "OpAttachmentPut", Namespace: wireNS,
 			Fields: []schema.FieldSchema{
 				{ID: 1, Name: "docId", Type: uuidPrim},
-				{ID: 2, Name: "contentHash", Type: hashRef},
-				{ID: 3, Name: "size", Type: schema.Prim(schema.PhysicalInt64)},
-				{ID: 4, Name: "mime", Type: schema.Prim(schema.PhysicalString)},
+				{ID: 2, Name: "attachmentId", Type: uuidPrim},
+				{ID: 3, Name: "name", Type: schema.Prim(schema.PhysicalString)},
+				{ID: 4, Name: "scheme", Type: schema.Prim(schema.PhysicalInt32)},
+				{ID: 5, Name: "contentHash", Type: hashRef},
+				{ID: 6, Name: "size", Type: schema.Prim(schema.PhysicalInt64)},
+				{ID: 7, Name: "mime", Type: schema.Prim(schema.PhysicalString)},
 			},
 		})
 		r.RegisterRecord(&schema.RecordSchema{
 			Name: "OpAttachmentDelete", Namespace: wireNS,
-			Fields: []schema.FieldSchema{{ID: 1, Name: "docId", Type: uuidPrim}},
+			Fields: []schema.FieldSchema{
+				{ID: 1, Name: "docId", Type: uuidPrim},
+				{ID: 2, Name: "attachmentId", Type: uuidPrim},
+			},
 		})
 
 		kdbOpWire := schema.Union{Branches: []schema.Type{

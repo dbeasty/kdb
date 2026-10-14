@@ -30,7 +30,12 @@ func putAttachDoc(t *testing.T, rt *embed.EmbeddedKdbRuntime, id codec.UUID, jso
 
 func readAttachment(t *testing.T, rt *embed.EmbeddedKdbRuntime, id codec.UUID, asOf codec.Hash) ([]byte, embed.AttachmentInfo) {
 	t.Helper()
-	r, info, err := rt.GetAttachment(attachNS, id, asOf)
+	return readNamed(t, rt, id, embed.AttachmentByName("file"), asOf)
+}
+
+func readNamed(t *testing.T, rt *embed.EmbeddedKdbRuntime, id codec.UUID, sel embed.AttachmentSelector, asOf codec.Hash) ([]byte, embed.AttachmentInfo) {
+	t.Helper()
+	r, info, err := rt.GetAttachment(attachNS, id, sel, asOf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +68,7 @@ func memoryRuntime(t *testing.T) *embed.EmbeddedKdbRuntime {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rt.SetAttachmentConfig(attachstore.Config{SmallMaxBytes: 1 << 10, ChunkBytes: 4 << 10})
+	rt.SetAttachmentConfig(attachstore.Config{SmallMaxBytes: 1 << 10})
 	return rt
 }
 
@@ -80,7 +85,7 @@ func TestAttachmentVersionsReadAsOfEachCommit(t *testing.T) {
 	for i, n := range []int{100, 20_000, 3} {
 		data := make([]byte, n)
 		r.Read(data)
-		c, info, err := rt.PutAttachment(attachNS, id, bytes.NewReader(data), "application/pdf")
+		c, info, err := rt.PutAttachment(attachNS, id, bytes.NewReader(data), embed.PutAttachmentOptions{Name: "file", Mime: "application/pdf"})
 		if err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
@@ -108,23 +113,23 @@ func TestAttachmentVersionsReadAsOfEachCommit(t *testing.T) {
 func TestAttachmentNeedsItsDocumentAndDeletesWithIt(t *testing.T) {
 	rt := memoryRuntime(t)
 	missing := codec.UUID{MSB: 1}
-	if _, _, err := rt.PutAttachment(attachNS, missing, bytes.NewReader([]byte("x")), "text/plain"); !errors.Is(err, embed.ErrNoSuchDocument) {
+	if _, _, err := rt.PutAttachment(attachNS, missing, bytes.NewReader([]byte("x")), embed.PutAttachmentOptions{Name: "file", Mime: "text/plain"}); !errors.Is(err, embed.ErrNoSuchDocument) {
 		t.Fatalf("attachment on a missing document: %v", err)
 	}
 	id := codec.UUID{MSB: 2}
 	putAttachDoc(t, rt, id, `{"a":1}`)
-	put, _, err := rt.PutAttachment(attachNS, id, bytes.NewReader([]byte("hello")), "text/plain")
+	put, _, err := rt.PutAttachment(attachNS, id, bytes.NewReader([]byte("hello")), embed.PutAttachmentOptions{Name: "file", Mime: "text/plain"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Detach: the document stays, the attachment goes.
-	if _, err := rt.DeleteAttachment(attachNS, id); err != nil {
+	if _, err := rt.DeleteAttachment(attachNS, id, embed.AttachmentByName("file")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := rt.GetAttachment(attachNS, id, codec.Hash{}); !errors.Is(err, embed.ErrNoAttachment) {
+	if _, _, err := rt.GetAttachment(attachNS, id, embed.AttachmentByName("file"), codec.Hash{}); !errors.Is(err, embed.ErrNoAttachment) {
 		t.Fatalf("after detach: %v", err)
 	}
-	if _, err := rt.DeleteAttachment(attachNS, id); !errors.Is(err, embed.ErrNoAttachment) {
+	if _, err := rt.DeleteAttachment(attachNS, id, embed.AttachmentByName("file")); !errors.Is(err, embed.ErrNoAttachment) {
 		t.Fatalf("detaching nothing: %v", err)
 	}
 	// The old commit still has it.
@@ -132,7 +137,7 @@ func TestAttachmentNeedsItsDocumentAndDeletesWithIt(t *testing.T) {
 		t.Fatalf("as of the put: %q", got)
 	}
 	// Deleting the document takes its attachment.
-	if _, _, err := rt.PutAttachment(attachNS, id, bytes.NewReader([]byte("again")), "text/plain"); err != nil {
+	if _, _, err := rt.PutAttachment(attachNS, id, bytes.NewReader([]byte("again")), embed.PutAttachmentOptions{Name: "file", Mime: "text/plain"}); err != nil {
 		t.Fatal(err)
 	}
 	deleteDoc(t, rt, id)
@@ -176,7 +181,7 @@ func openAttachRuntime(t *testing.T, root string, mode storage.HistoryMode) *emb
 	if err != nil {
 		t.Fatal(err)
 	}
-	rt.SetAttachmentConfig(attachstore.Config{SmallMaxBytes: 1 << 10, ChunkBytes: 4 << 10})
+	rt.SetAttachmentConfig(attachstore.Config{SmallMaxBytes: 1 << 10})
 	return rt
 }
 
@@ -189,14 +194,14 @@ func TestAttachmentsSurviveReopen(t *testing.T) {
 		putAttachDoc(t, rt, small, `{"k":"small"}`)
 		putAttachDoc(t, rt, large, `{"k":"large"}`)
 		bigBytes := bytes.Repeat([]byte("0123456789abcdef"), 4096)
-		first, _, err := rt.PutAttachment(attachNS, small, bytes.NewReader([]byte("tiny")), "text/plain")
+		first, _, err := rt.PutAttachment(attachNS, small, bytes.NewReader([]byte("tiny")), embed.PutAttachmentOptions{Name: "file", Mime: "text/plain"})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := rt.PutAttachment(attachNS, large, bytes.NewReader(bigBytes), "image/png"); err != nil {
+		if _, _, err := rt.PutAttachment(attachNS, large, bytes.NewReader(bigBytes), embed.PutAttachmentOptions{Name: "file", Mime: "image/png"}); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := rt.PutAttachment(attachNS, small, bytes.NewReader([]byte("tiny v2")), "text/plain"); err != nil {
+		if _, _, err := rt.PutAttachment(attachNS, small, bytes.NewReader([]byte("tiny v2")), embed.PutAttachmentOptions{Name: "file", Mime: "text/plain"}); err != nil {
 			t.Fatal(err)
 		}
 		if checkpoint {
@@ -242,7 +247,7 @@ func TestOnlyTheLatestAttachmentIsKept(t *testing.T) {
 			putAttachDoc(t, rt, id, `{}`)
 			var firstCommit codec.Hash
 			for i := 0; i < 3; i++ {
-				c, _, err := rt.PutAttachment(attachNS, id, bytes.NewReader(bytes.Repeat([]byte{byte('a' + i)}, 50_000)), "x/y")
+				c, _, err := rt.PutAttachment(attachNS, id, bytes.NewReader(bytes.Repeat([]byte{byte('a' + i)}, 50_000)), embed.PutAttachmentOptions{Name: "file", Mime: "x/y"})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -264,7 +269,7 @@ func TestOnlyTheLatestAttachmentIsKept(t *testing.T) {
 			if !bytes.Equal(got, bytes.Repeat([]byte{'c'}, 50_000)) {
 				t.Fatal("the latest version was lost")
 			}
-			if _, _, err := rt.GetAttachment(attachNS, id, firstCommit); err == nil {
+			if _, _, err := rt.GetAttachment(attachNS, id, embed.AttachmentByName("file"), firstCommit); err == nil {
 				t.Fatal("an old version read back although it is not retained")
 			}
 		})
@@ -287,7 +292,7 @@ func TestAllHistoryKeepsVersionsAsDeltas(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		v := append([]byte(nil), base...)
 		copy(v[i*5000:], []byte("a small edit to this version"))
-		c, _, err := rt.PutAttachment(attachNS, id, bytes.NewReader(v), "x/y")
+		c, _, err := rt.PutAttachment(attachNS, id, bytes.NewReader(v), embed.PutAttachmentOptions{Name: "file", Mime: "x/y"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -309,5 +314,78 @@ func TestAllHistoryKeepsVersionsAsDeltas(t *testing.T) {
 		if got, _ := readAttachment(t, rt, id, c); !bytes.Equal(got, versions[i]) {
 			t.Fatalf("version %d reads back wrong after compaction", i)
 		}
+	}
+}
+
+// A record holds several attachments: each has an ID and a name, is found by either, is listed and
+// counted, and is replaced, renamed or deleted alone.
+func TestSeveralNamedAttachmentsPerRecord(t *testing.T) {
+	rt := memoryRuntime(t)
+	id := codec.UUID{MSB: 9}
+	putAttachDoc(t, rt, id, `{"title":"album"}`)
+	_, cover, err := rt.PutAttachment(attachNS, id, bytes.NewReader([]byte("cover bytes")), embed.PutAttachmentOptions{Name: "cover.jpg", Mime: "image/jpeg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, anon, err := rt.PutAttachment(attachNS, id, bytes.NewReader([]byte("no name given")), embed.PutAttachmentOptions{Mime: "text/plain"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if anon.Name != anon.ID.String() {
+		t.Fatalf("an unnamed attachment is called %q, want its id %s", anon.Name, anon.ID)
+	}
+	given, _ := codec.UUIDFromString("0b6f3c1e-2a4d-4e8f-9a1b-3c5d7e9f1a2b")
+	_, notes, err := rt.PutAttachment(attachNS, id, bytes.NewReader([]byte("notes")), embed.PutAttachmentOptions{ID: given, Name: "notes.md"})
+	if err != nil || notes.ID != given {
+		t.Fatalf("a caller-chosen id: %+v %v", notes, err)
+	}
+	if n, _ := rt.CountAttachments(attachNS, id, codec.Hash{}); n != 3 {
+		t.Fatalf("count %d", n)
+	}
+	list, _ := rt.ListAttachments(attachNS, id, codec.Hash{})
+	if len(list) != 3 || list[0].Name > list[1].Name || list[1].Name > list[2].Name {
+		t.Fatalf("list not sorted by name: %+v", list)
+	}
+	// Found by name and by ID alike.
+	if b, _ := readNamed(t, rt, id, embed.AttachmentByName("cover.jpg"), codec.Hash{}); string(b) != "cover bytes" {
+		t.Fatal("by name")
+	}
+	if b, _ := readNamed(t, rt, id, embed.AttachmentByID(cover.ID), codec.Hash{}); string(b) != "cover bytes" {
+		t.Fatal("by id")
+	}
+	// Replacing by name keeps the ID and leaves the others.
+	beforeReplace, _ := rt.DAG.Head()
+	_, again, err := rt.PutAttachment(attachNS, id, bytes.NewReader([]byte("cover v2")), embed.PutAttachmentOptions{Name: "cover.jpg", Mime: "image/jpeg"})
+	if err != nil || again.ID != cover.ID {
+		t.Fatalf("replace by name: %+v %v", again, err)
+	}
+	if b, _ := readNamed(t, rt, id, embed.AttachmentByID(cover.ID), codec.Hash{}); string(b) != "cover v2" {
+		t.Fatal("replace did not take")
+	}
+	if b, _ := readNamed(t, rt, id, embed.AttachmentByID(cover.ID), beforeReplace); string(b) != "cover bytes" {
+		t.Fatal("the old version as of its commit")
+	}
+	if b, _ := readNamed(t, rt, id, embed.AttachmentByName("notes.md"), codec.Hash{}); string(b) != "notes" {
+		t.Fatal("replacing one attachment changed another")
+	}
+	// Rename keeps ID and bytes; the old name stops resolving; a taken name is refused.
+	if _, renamed, err := rt.RenameAttachment(attachNS, id, embed.AttachmentByID(cover.ID), "front.jpg"); err != nil || renamed.ID != cover.ID {
+		t.Fatalf("rename: %v", err)
+	}
+	if _, _, err := rt.GetAttachment(attachNS, id, embed.AttachmentByName("cover.jpg"), codec.Hash{}); !errors.Is(err, embed.ErrNoAttachment) {
+		t.Fatalf("old name after rename: %v", err)
+	}
+	if _, _, err := rt.RenameAttachment(attachNS, id, embed.AttachmentByID(cover.ID), "notes.md"); err == nil {
+		t.Fatal("renamed onto a name another attachment has")
+	}
+	if _, _, err := rt.PutAttachment(attachNS, id, bytes.NewReader([]byte("x")), embed.PutAttachmentOptions{ID: codec.UUID{MSB: 123}, Name: "notes.md"}); err == nil {
+		t.Fatal("a new attachment took a name another has")
+	}
+	// Deleting one leaves the others; the JSON never moved.
+	if _, err := rt.DeleteAttachment(attachNS, id, embed.AttachmentByName("notes.md")); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := rt.CountAttachments(attachNS, id, codec.Hash{}); n != 2 {
+		t.Fatalf("count after delete %d", n)
 	}
 }

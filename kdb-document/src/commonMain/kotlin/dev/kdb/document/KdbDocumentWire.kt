@@ -83,16 +83,19 @@ private fun buildRegistry(): KdbTypeRegistry {
             fields =
                 listOf(
                     FieldSchema(1, "docId", uuidTy),
-                    FieldSchema(2, "contentHash", hashRef),
-                    FieldSchema(3, "size", KdbType.Primitive(PhysicalKind.INT64)),
-                    FieldSchema(4, "mime", KdbType.Primitive(PhysicalKind.STRING)),
+                    FieldSchema(2, "attachmentId", uuidTy),
+                    FieldSchema(3, "name", KdbType.Primitive(PhysicalKind.STRING)),
+                    FieldSchema(4, "scheme", KdbType.Primitive(PhysicalKind.INT32)),
+                    FieldSchema(5, "contentHash", hashRef),
+                    FieldSchema(6, "size", KdbType.Primitive(PhysicalKind.INT64)),
+                    FieldSchema(7, "mime", KdbType.Primitive(PhysicalKind.STRING)),
                 ),
         )
     val opAttachmentDelete =
         RecordSchema(
             name = "OpAttachmentDelete",
             namespace = DocFqn.NS,
-            fields = listOf(FieldSchema(1, "docId", uuidTy)),
+            fields = listOf(FieldSchema(1, "docId", uuidTy), FieldSchema(2, "attachmentId", uuidTy)),
         )
     reg.registerRecord(opWrite)
     reg.registerRecord(opDelete)
