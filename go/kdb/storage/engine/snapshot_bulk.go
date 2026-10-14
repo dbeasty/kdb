@@ -80,9 +80,18 @@ func (e *ServerEngine) ApplySnapshotBatch(namespaceID string, docs []document.Do
 	if err != nil {
 		return tree, err
 	}
-	e.maybeFlushMemtable()
+	// Flushed sooner than the ordinary budget: a snapshot passes the whole namespace through
+	// the memtable, so the generation it fills is never the working set a larger one is for -
+	// only memory the install holds, as much of it as the budget allows, for nothing.
+	if e.memTable.SizeBytes() >= min(e.memtableFlushBytes(), snapshotMemtableBytes) {
+		_, _ = e.memTable.Flush(0)
+	}
 	return tree, nil
 }
+
+// snapshotMemtableBytes is how much of a snapshot's bodies ApplySnapshotBatch lets the memtable
+// hold before flushing them.
+const snapshotMemtableBytes = 16 << 20
 
 func (e *ServerEngine) applySnapshotBatchLocked(docs []document.Document) (document.DocumentTree, error) {
 	hasher := contentHashers.Get().(*document.ContentHasher)
@@ -171,6 +180,8 @@ func (e *ServerEngine) snapshotBodiesCover(tree document.DocumentTree) bool {
 
 // StreamTreeBodies implements storage.TreeBodyStreamer: it reads the delta log front to back, one
 // frame at a time, and hands fn every write whose version is the one tree names for its document.
+// A frame it cannot read intact is skipped (see DeltaPayloadStreamer); its documents are among
+// those never handed over.
 // A version written more than once is handed over more than once; one tree does not name (an
 // overwritten or deleted version) is skipped; one the log does not hold - its segment truncated,
 // or a body that only ever reached the blob store - is simply never handed over.
@@ -183,16 +194,41 @@ func (e *ServerEngine) StreamTreeBodies(namespaceID string, tree document.Docume
 	if e.deltaLoader == nil {
 		return storage.ErrTreeBodiesUnsupported
 	}
-	streamer, ok := e.deltaLoader.reader.(storage.DeltaCommitStreamer)
-	if !ok {
-		return storage.ErrTreeBodiesUnsupported
-	}
 	segments, err := e.deltaLoader.reader.ListSegments()
 	if err != nil {
 		return err
 	}
 	hasher := contentHashers.Get().(*document.ContentHasher)
 	defer contentHashers.Put(hasher)
+	if payloads, ok := e.deltaLoader.reader.(storage.DeltaPayloadStreamer); ok {
+		// A frame at a time, and each write looked at where it lies in the payload: only the
+		// bodies the tree names become strings. Reading whole segments and decoding every
+		// commit was most of what building a snapshot's sorted copy allocated.
+		for _, seg := range segments {
+			err := payloads.StreamFramePayloads(seg, func(payload []byte, _ int64) error {
+				var fnErr error
+				// A payload the scanner will not walk is skipped like a damaged frame: its
+				// documents are read the ordinary way.
+				_ = document.ScanAllCommitWrites(payload, func(id codec.UUID, patch []byte) bool {
+					want, ok := tree.HashFor(id)
+					if !ok || hasher.HashBytes(id, patch) != want {
+						return true
+					}
+					fnErr = fn(id, string(patch))
+					return fnErr == nil
+				})
+				return fnErr
+			})
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	streamer, ok := e.deltaLoader.reader.(storage.DeltaCommitStreamer)
+	if !ok {
+		return storage.ErrTreeBodiesUnsupported
+	}
 	for _, seg := range segments {
 		err := streamer.StreamCommits(seg, func(c document.Commit, _ int64) error {
 			for _, op := range c.Operations {

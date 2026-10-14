@@ -76,6 +76,14 @@ type DeltaCommitStreamer interface {
 	ReadCommitAt(segment DeltaSegmentRef, frameOffset int64) (document.Commit, error)
 }
 
+// DeltaPayloadStreamer is implemented by readers that can walk a segment's frames one at a time,
+// handing over each decompressed CommitPayload (valid only during fn) rather than a decoded
+// commit. It stops quietly at a frame it cannot read whole and intact; see
+// delta.DefaultReader.StreamFramePayloads.
+type DeltaPayloadStreamer interface {
+	StreamFramePayloads(segment DeltaSegmentRef, fn func(payload []byte, frameOffset int64) error) error
+}
+
 // DeltaDocumentReader is implemented by readers that can read one document's writes out of a
 // framed commit without decoding the whole commit - the cold point read. fn sees the patch of each
 // write of docID in the commit at frameOffset, in operation order, until it returns false; the

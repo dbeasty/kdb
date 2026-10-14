@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -171,6 +172,13 @@ func measureSync(t *testing.T, sync func(*countingTransport) int) syncMeasure {
 				runtime.ReadMemStats(&ms)
 				if ms.HeapAlloc > peakLive.Load() {
 					peakLive.Store(ms.HeapAlloc)
+					// KDB_SYNC_PEAK_PROFILE: what is live at the peak, not at the end.
+					if path := os.Getenv("KDB_SYNC_PEAK_PROFILE"); path != "" {
+						if f, err := os.Create(path); err == nil {
+							_ = pprof.Lookup("heap").WriteTo(f, 0)
+							_ = f.Close()
+						}
+					}
 				}
 			}
 			select {

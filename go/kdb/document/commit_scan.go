@@ -34,6 +34,19 @@ import (
 //	op      = branch(u8) leb128(len) fields...   union of OpWrite (0), OpDelete, OpFileWrite, OpSchemaMigration
 //	OpWrite = leb128(1) tag(Fixed) uuid(16)  leb128(2) tag(String) leb128(len) patch
 func ScanCommitWrites(payload []byte, docID codec.UUID, fn func(patch []byte) bool) error {
+	return scanWrites(payload, func(id codec.UUID, patch []byte) bool {
+		return id != docID || fn(patch)
+	})
+}
+
+// ScanAllCommitWrites is ScanCommitWrites for every document: fn sees each OpWrite's document and
+// patch, in operation order, until it returns false. patch aliases payload, valid only during the
+// call. For reading a log front to back without building a commit per frame.
+func ScanAllCommitWrites(payload []byte, fn func(docID codec.UUID, patch []byte) bool) error {
+	return scanWrites(payload, fn)
+}
+
+func scanWrites(payload []byte, fn func(docID codec.UUID, patch []byte) bool) error {
 	var s commitScanner
 	s.raw = payload
 	slab, err := s.lenPrefixed("commit payload")
@@ -96,7 +109,7 @@ func ScanCommitWrites(payload []byte, docID codec.UUID, fn func(patch []byte) bo
 			if err := f.expectTag(tag, schema.PhysicalArray); err != nil {
 				return err
 			}
-			if err := f.scanOperations(docID, fn, &stopped); err != nil {
+			if err := f.scanOperations(fn, &stopped); err != nil {
 				return err
 			}
 		case 7: // documentTreeHash
@@ -155,10 +168,10 @@ func ScanCommitWrites(payload []byte, docID codec.UUID, fn func(patch []byte) bo
 	return nil
 }
 
-// scanOperations walks the operations array, calling fn for docID's writes until it returns
-// false (recorded in *stopped). The walk itself always finishes, so a payload is held to the same
+// scanOperations walks the operations array, calling fn for each write until it returns false
+// (recorded in *stopped). The walk itself always finishes, so a payload is held to the same
 // layout however early fn stops.
-func (s *commitScanner) scanOperations(docID codec.UUID, fn func([]byte) bool, stopped *bool) error {
+func (s *commitScanner) scanOperations(fn func(codec.UUID, []byte) bool, stopped *bool) error {
 	n, err := s.uvarint("operation count")
 	if err != nil {
 		return err
@@ -185,7 +198,7 @@ func (s *commitScanner) scanOperations(docID codec.UUID, fn func([]byte) bool, s
 		if err != nil {
 			return err
 		}
-		if id == docID && !fn(patch) {
+		if !fn(id, patch) {
 			*stopped = true
 		}
 	}

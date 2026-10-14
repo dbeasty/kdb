@@ -76,6 +76,17 @@ func (s *pageSpool) add(docID, body string) error {
 	return nil
 }
 
+// seal flushes what has been added and lets the write buffer go: for a spool that is complete and
+// will only be read from now on, kept open for a while (a sorted run), so that a hundred of them
+// do not each hold a write buffer they will never use again.
+func (s *pageSpool) seal() error {
+	if err := s.w.Flush(); err != nil {
+		return s.writeErr(err)
+	}
+	s.w = nil
+	return nil
+}
+
 func (s *pageSpool) writeErr(err error) error {
 	return fmt.Errorf("peer sync: writing the staging file: %w", err)
 }
@@ -110,7 +121,7 @@ func (s *pageSpool) reader(maxBytes, limit int) (func() ([]wire.SnapshotDoc, err
 // readerSized is reader with a read buffer of bufBytes: small for a reader that is one of many
 // open at once (a merge of sorted runs).
 func (s *pageSpool) readerSized(maxBytes, limit, bufBytes int) (func() ([]wire.SnapshotDoc, error), error) {
-	if s.w.Buffered() > 0 {
+	if s.w != nil && s.w.Buffered() > 0 {
 		if err := s.w.Flush(); err != nil {
 			return nil, s.writeErr(err)
 		}

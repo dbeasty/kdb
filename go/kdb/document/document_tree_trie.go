@@ -420,10 +420,8 @@ func trieWithAll(h *trieTree, items []trieItem) *trieTree {
 	}
 	e := getEdit(s.view())
 	// A batch makes a record per new leaf and node - a few per item - which an edit's own buffer
-	// (sized for one update, and dropped when large) would grow into by doubling, every batch.
-	if bp, _ := batchRecs.Get().(*[]editRec); bp != nil {
-		e.recs = *bp
-	}
+	// (sized for one update) would grow into by doubling. Sized once instead, and dropped after:
+	// not pooled, since a pool would keep a batch's worth alive between batches.
 	if want := 4*len(items) + 2*trieDepth + 4; len(e.recs) < want {
 		e.recs = make([]editRec, want)
 	}
@@ -433,16 +431,10 @@ func trieWithAll(h *trieTree, items []trieItem) *trieTree {
 		out = s.commit(e, nr, gen)
 		s.maybeRewrite(out)
 	}
-	recs := e.recs
-	e.recs = nil
-	putEdit(e)
-	batchRecs.Put(&recs)
+	putEdit(e) // drops a buffer this large
 	runtime.KeepAlive(h)
 	return out
 }
-
-// batchRecs keeps trieWithAll's record buffers between batches.
-var batchRecs sync.Pool
 
 // insertMany is insert for items sorted by key, no key twice: the subtree r at depth with all of
 // them set, built as inserting them one by one would build it (the shape below a node depends only
