@@ -269,6 +269,9 @@ type DefaultWriter struct {
 	pos     map[codec.Hash]int
 	// unique: the caller puts each key once (NewDefaultWriterUnique), so pos is not kept.
 	unique bool
+	// seq names the table (see tiering.go): its store's (LsmBlobStore.NewWriter), or, for a
+	// writer made without one, a sequence of its own that lists the namespace at Finish.
+	seq *Sequence
 }
 
 type kv struct {
@@ -370,7 +373,15 @@ func appendAll(shim storage.PlatformIOShim, segmentName string, b []byte) (int64
 const finishBufferBytes = 1 << 20
 
 func (w *DefaultWriter) Finish() (Handle, error) {
-	fileID, err := tableFileID(nextAge())
+	seq := w.seq
+	if seq == nil {
+		seq = NewSequence(w.io, w.namespaceID)
+	}
+	age, err := seq.Next()
+	if err != nil {
+		return Handle{}, err
+	}
+	fileID, err := tableFileID(age)
 	if err != nil {
 		return Handle{}, err
 	}

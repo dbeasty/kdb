@@ -163,6 +163,12 @@ public class DefaultSsTableWriter(
      * wrote CODEC_NONE.
      */
     codec: CompressionCodec = CompressionCodec.ZSTD,
+    /**
+     * Names the table (see [SsTableSequence]): its store's ([LsmBlobStore.sequence]) so the table
+     * sorts after every one the store holds. Without one the writer lists the namespace at
+     * [finish].
+     */
+    private val sequence: SsTableSequence = SsTableSequence(ioShim, namespaceId),
 ) : SsTableWriter {
     private val compress: Boolean = codec == CompressionCodec.ZSTD
 
@@ -184,7 +190,7 @@ public class DefaultSsTableWriter(
 
     override suspend fun finish(): SsTableHandle {
         val blocks = linkedMapOf<KdbHash, BlockHandle>()
-        val fileId = KdbUuid.random().toString()
+        val fileId = sequence.next() + "-" + KdbUuid.random().toString()
         val segmentName = SegmentNameBuilder.sstable(namespaceId, level, fileId)
         var offset = 0L
         for ((k, v) in entries) {

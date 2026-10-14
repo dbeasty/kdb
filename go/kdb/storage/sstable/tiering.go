@@ -1,12 +1,8 @@
 package sstable
 
 import (
-	"fmt"
 	"sort"
-	"strconv"
 	"strings"
-	"sync/atomic"
-	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/storage"
@@ -182,59 +178,27 @@ func pickWindow(runs []mergeRun, sized bool, trigger int) (lo, hi int, full bool
 	return best, best + width, width == m
 }
 
-// A table's file name starts with its age: 16 hex digits of nanoseconds, then a random UUID (and,
-// for a merge's table, its sequence in the run). Names sort by age, and that is what DiscoverTables
-// relies on to register a level's tables in the order they were written - the order a lookup
-// searches them in - because it registers them in that order (byAge).
+// A table's file name starts with its age: a sequence number in 16 hex digits, then a random UUID
+// (and, for a merge's table, its sequence in the run). Names sort by age, and that is what
+// DiscoverTables relies on to register a level's tables in the order they were written - the order
+// a lookup searches them in - because it registers them in that order (byAge).
 //
-// A flushed table's age is when it was written. A merge's tables take their oldest input's age,
-// so they sort where that input did: the place in the search order the merge gave them (see
+// A flushed table's age is the next number in its store's Sequence (sequence.go): one past the
+// highest age the namespace holds. No clock is involved, so no clock's resolution or steps can
+// make two tables tie or sort backwards. A merge's tables take their oldest input's age, so they
+// sort where that input did: the place in the search order the merge gave them (see
 // LsmBlobStore.CompactContextUpTo). Without it a window's output at level 0, and every flush
 // beside it, came back after a restart in an arbitrary order - harmless for values, which every
 // table holds identically, but not for a tombstone.
 //
-// Tables named before this (a bare UUID) have no age; they count as the oldest, which is what
-// they are, being older than anything this build writes. Kotlin names its tables that way too.
-// Their order among themselves is their names', the same on every open; a merge that takes one
-// takes every older one beside it (pastAgeless), so its output never ties with one.
+// Ages were once wall-clock nanoseconds. Those names still sort correctly: a sequence continues
+// from the highest age on disk, so a store written by such a build carries on above it.
 //
-// Ages are never equal. Two tables of one age sort by their UUIDs, which is to say at random, and
-// a wall clock alone does not keep ages apart: Windows' ticks are coarse enough that consecutive
-// flushes read the same time, and any clock can step back. So an age is the wall time or one past
-// the last age this process gave out or found on disk (noteAge), whichever is later.
-
-// lastAge is the newest age this process has given out or seen in a table's name.
-var lastAge atomic.Int64
-
-// nextAge is the age part of a name written now: later than every age before it.
-func nextAge() string {
-	now := time.Now().UnixNano()
-	for {
-		last := lastAge.Load()
-		age := now
-		if age <= last {
-			age = last + 1
-		}
-		if lastAge.CompareAndSwap(last, age) {
-			return fmt.Sprintf("%016x", age)
-		}
-	}
-}
-
-// noteAge makes every later nextAge newer than the table named segmentName, so tables written after
-// a restart sort after those written before it even when the clock has gone back since.
-func noteAge(segmentName string) {
-	age, err := strconv.ParseUint(ageOf(segmentName), 16, 64)
-	if err != nil || int64(age) <= 0 {
-		return
-	}
-	for {
-		last := lastAge.Load()
-		if int64(age) <= last || lastAge.CompareAndSwap(last, int64(age)) {
-			return
-		}
-	}
-}
+// Tables named before ages (a bare UUID) have none; they count as the oldest, which is what they
+// are, being older than anything this build writes. Kotlin builds before its own sequence names
+// wrote that way too. Their order among themselves is their names', the same on every open; a
+// merge that takes one takes every older one beside it (pastAgeless), so its output never ties
+// with one.
 
 // ageOf is the age part of a table's name, all zeros for a name without one.
 func ageOf(segmentName string) string {

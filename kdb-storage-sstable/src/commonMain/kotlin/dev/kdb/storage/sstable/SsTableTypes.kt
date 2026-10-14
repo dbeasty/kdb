@@ -1,6 +1,7 @@
 package dev.kdb.storage.sstable
 
 import dev.kdb.codec.KdbHash
+import dev.kdb.storage.CompressionCodec
 import dev.kdb.storage.PlatformIoShim
 
 /**
@@ -92,6 +93,15 @@ public class LsmBlobStore(
     private val cache: BlockCache,
     private val tables: MutableList<SsTableHandle> = mutableListOf(),
 ) {
+    /** Names the tables this store's writers finish, so each sorts after every one it holds. */
+    public val sequence: SsTableSequence = SsTableSequence(ioShim, namespaceId)
+
+    /** A writer for a table this store will hold, named with [sequence]. */
+    public fun newWriter(
+        level: Int,
+        codec: CompressionCodec = CompressionCodec.ZSTD,
+    ): DefaultSsTableWriter = DefaultSsTableWriter(ioShim, namespaceId, level, codec, sequence)
+
     public suspend fun put(key: KdbHash, value: ByteArray) {
         // in-memory overlay handled by memtable; tables updated on flush
     }

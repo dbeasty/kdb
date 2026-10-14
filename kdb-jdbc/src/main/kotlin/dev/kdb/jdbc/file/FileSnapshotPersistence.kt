@@ -7,6 +7,7 @@ import dev.kdb.embed.SnapshotPersistence
 import dev.kdb.embed.SnapshotState
 import dev.kdb.storage.PlatformIoShim
 import dev.kdb.storage.sstable.DefaultSsTableWriter
+import dev.kdb.storage.sstable.SsTableSequence
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -69,8 +70,10 @@ internal class FileSnapshotPersistence(
     ) {
         var writer: DefaultSsTableWriter? = null
         var bytes = 0L
+        // One sequence for every table, so they list the namespace once and number on from there.
+        val sequence = SsTableSequence(io, namespaceId)
         for (d in state.documents) {
-            val w = writer ?: DefaultSsTableWriter(io, namespaceId, 0).also { writer = it }
+            val w = writer ?: DefaultSsTableWriter(io, namespaceId, 0, sequence = sequence).also { writer = it }
             val body = d.json.encodeToByteArray()
             w.put(d.contentHash, body)
             bytes += body.size + 32
