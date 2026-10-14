@@ -42,7 +42,12 @@ private class EmbedPeerBlobStore(
     ) : PeerBlobReader {
         override val size: Long get() = r.size
 
-        override suspend fun chunkLeaf(index: Long): KdbHash = r.chunkLeaf(index)
+        override suspend fun chunkLeaf(index: Long): KdbHash =
+            try {
+                r.chunkLeaf(index)
+            } catch (e: AttachmentCorruptException) {
+                throw PeerBlobCorruptException(e.message ?: "corrupt blob ${r.contentHash.toHex()}", e)
+            }
 
         override suspend fun readAt(
             position: Long,
