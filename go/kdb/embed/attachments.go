@@ -178,10 +178,9 @@ func (rt *EmbeddedKdbRuntime) AttachmentStore(namespaceID string) *attachstore.S
 // server's, the driver's - not only PutAttachment's. Undone when the runtime closes.
 func (rt *EmbeddedKdbRuntime) registerAttachmentBlobs() {
 	store := rt.Storage
-	transaction.RegisterAttachmentBlobs(store, func(namespaceID string, h codec.Hash) (bool, error) {
-		return rt.AttachmentStore(namespaceID).Has(h)
-	})
-	rt.AddCloseHook(func() { transaction.RegisterAttachmentBlobs(store, nil) })
+	transaction.RegisterAttachmentBlobs(store, rt)
+	// Through the address only: the hook must not keep rt reachable either.
+	rt.AddCloseHook(func() { transaction.RegisterAttachmentBlobs[EmbeddedKdbRuntime](store, nil) })
 }
 
 // attachmentTables is the DAG capability attachments need.
