@@ -19,6 +19,10 @@ TREE=${TREE:-1}
 BOUNDED=${BOUNDED:-1}
 GRAPH=${GRAPH:-1}
 PHASES=${PHASES:-"build open reads fullread writes checkpoint"}
+# BOOTSTRAP=1 adds a peer bootstrap: an empty node installing a snapshot of a DOCS-document node
+# (replication TestSnapshotScale). Both nodes run in one process, so its peak heap covers host and
+# receiver together - stricter than either node alone.
+BOOTSTRAP=${BOOTSTRAP:-0}
 WORK=${WORK:-$(mktemp -d -t kdb-memacc)}
 KEEP=${KEEP:-0}
 # Phases have fixed costs (the writes phase always makes 20,000 updates), so a small namespace's
@@ -45,6 +49,14 @@ for p in $PHASES; do
 		grep -E 'PHASE|built|close [0-9]' || true
 done
 
+if [ "$BOOTSTRAP" = 1 ]; then
+	echo "--- phase bootstrap ($(date +%H:%M:%S))"
+	(cd "$repo/go" && go test -c -o "$WORK/replication.test" ./kdb/replication)
+	KDB_TREE_FILE=$TREE KDB_BOUNDED_LIVE_BODIES=$BOUNDED KDB_GRAPH_FILE=$GRAPH KDB_SNAPSHOT_SCALE=$DOCS \
+		"$WORK/replication.test" -test.run '^TestSnapshotScale$' -test.v -test.timeout 120m 2>&1 | tee -a "$log" |
+		grep -E 'seeded|snapshot +[0-9]' || true
+fi
+
 data_kb=$(du -sk "$data" | cut -f1)
 budget_mb=$((data_kb / 1024 / 4))
 if [ "$budget_mb" -lt "$MIN_BUDGET_MB" ]; then budget_mb=$MIN_BUDGET_MB; fi
@@ -65,6 +77,16 @@ while read -r line; do
 	fi
 	printf '%-11s %10s MB %10s MB %10s MB  %s\n' "$phase" "$peak" "$live" "$rss" "$verdict"
 done < <(grep -E 'PHASE [a-z]+ ' "$log")
+# The bootstrap row: "snapshot <docs> <recv> <requests> <peak heap+> ..." in MiB.
+while read -r line; do
+	peak=$(awk '{for (i = 1; i <= NF; i++) if ($i == "snapshot") { print $(i + 5); exit }}' <<<"$line")
+	verdict=ok
+	if awk -v p="$peak" -v b="$budget_mb" 'BEGIN{exit !(p > b)}'; then
+		verdict=OVER
+		fail=1
+	fi
+	printf '%-11s %10s MB %10s    %10s     %s\n' bootstrap "$peak" - - "$verdict (both nodes)"
+done < <(grep -E 'replication_test|snapshot_scale_test' "$log" | grep -E ' snapshot +[0-9]')
 grep -E 'sstables|merged' "$log" | sed 's/^/  note: /' | sort -u | head -5 || true
 if [ "$KEEP" != 1 ]; then rm -rf "$data"; fi
 echo "full log: $log"
