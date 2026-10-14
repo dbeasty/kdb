@@ -82,7 +82,7 @@ func TestDeltaRoundTrip(t *testing.T) {
 	}
 	for name, target := range cases {
 		var d []byte
-		if err := encodeDelta(memSource(base), memSource(target), func(b []byte) error {
+		if err := encodeDeltaV1(memSource(base), memSource(target), func(b []byte) error {
 			d = append(d, b...)
 			return nil
 		}); err != nil {
@@ -347,7 +347,7 @@ func TestPointerGenerationsAfterACrash(t *testing.T) {
 	s.mu.Unlock()
 	seg := s.prefix + "u-crash"
 	var d []byte
-	encodeDelta(memSource(v[1]), memSource(v[0]), func(b []byte) error { d = append(d, b...); return nil })
+	encodeDeltaV1(memSource(v[1]), memSource(v[0]), func(b []byte) error { d = append(d, b...); return nil })
 	shim.AppendToSegment(seg, d)
 	s.mu.Lock()
 	if _, err := s.writePointerLocked(oi.Hash, pointer{segment: seg, leaves: cur.leaves, size: int64(len(v[0])), delta: true, base: ni.Hash}); err != nil {

@@ -306,6 +306,7 @@ func (h *Host) openNamespace(
 		recovery:         recovery,
 	}
 	rt.attach.config.UploadGrace = opts.Storage.AttachmentUploadGrace
+	rt.attach.config.DeltaStepBytes = opts.Storage.AttachmentDeltaStepBytes
 	rt.registerAttachmentBlobs()
 	if persisting != nil {
 		persisting.SetAttachmentsCommitted(rt.attachmentsCommitted)
