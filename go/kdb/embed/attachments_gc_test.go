@@ -307,3 +307,83 @@ func TestAttachmentSetsSpillToTheBlobStore(t *testing.T) {
 		})
 	}
 }
+
+// A version only a deleted branch referenced is collected: the reference index's heads are no
+// longer all below the current ones, so the next pass rebuilds it from what is still reachable.
+func TestCollectionAfterABranchIsDeleted(t *testing.T) {
+	rt := openAttachRuntime(t, t.TempDir(), storage.HistoryModeFull)
+	defer rt.Close()
+	rt.SetAttachmentConfig(attachstore.Config{SmallMaxBytes: 1 << 10, UploadGrace: time.Nanosecond})
+	persisting, ok := rt.DAG.(*embed.PersistingCommitDAG)
+	if !ok {
+		t.Fatalf("DAG is %T", rt.DAG)
+	}
+	d := persisting.Delegate()
+	id := codec.UUID{MSB: 25}
+	putAttachDoc(t, rt, id, `{}`)
+	onMain := bytes.Repeat([]byte("m"), 50_000)
+	mainCommit := putVersion(t, rt, id, onMain)
+
+	// A side branch whose one commit attaches bytes nothing on main has.
+	onSide := bytes.Repeat([]byte("s"), 50_000)
+	h, size, err := rt.PutAttachmentBlob(attachNS, bytes.NewReader(onSide))
+	if err != nil {
+		t.Fatal(err)
+	}
+	txID, err := codec.RandomUUID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	attID, err := codec.RandomUUID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	side, err := d.AppendCommitDetached(document.Transaction{ID: txID, BaseVersion: mainCommit, Timestamp: codec.TimestampNow(),
+		Operations: []document.Op{document.AttachmentPutOp{DocID: id, AttachmentID: attID, Name: "side",
+			Scheme: document.AttachmentHashSchemeChunked1, ContentHash: h, Size: size, Mime: "x/y"}}},
+		mainCommit, document.EmptyDocumentTree(), nil, "side")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.CreateBranch("side", side.Hash); err != nil {
+		t.Fatal(err)
+	}
+	// Appending re-points main; put it back on its own line of history, beside the branch.
+	txID2, _ := codec.RandomUUID()
+	if _, err := d.AppendCommitDetached(document.Transaction{ID: txID2, BaseVersion: mainCommit, Timestamp: codec.TimestampNow(),
+		Operations: []document.Op{document.WriteOp{DocID: codec.UUID{MSB: 26}, Patch: `{}`}}},
+		mainCommit, document.EmptyDocumentTree(), nil, "main again"); err != nil {
+		t.Fatal(err)
+	}
+	if head, _ := d.Head(); head == side.Hash || d.IsAncestor(side.Hash, head) {
+		t.Fatal("main still has the side commit")
+	}
+	// Past the upload grace even on a coarse wall clock: only references keep blobs from here.
+	for start := time.Now().Round(0); !time.Now().Round(0).After(start); {
+		time.Sleep(time.Millisecond)
+	}
+	if res := compact(t, rt); res.Removed != 0 {
+		t.Fatalf("with the branch: %+v, want nothing removed", res)
+	}
+	if has, _ := rt.HasAttachmentBlob(attachNS, h); !has {
+		t.Fatal("the side branch's version was collected while the branch exists")
+	}
+
+	if err := d.DeleteBranch("side"); err != nil {
+		t.Fatal(err)
+	}
+	res := compact(t, rt)
+	if !res.Rebuilt || res.Removed != 1 {
+		t.Fatalf("after deleting the branch: %+v, want the index rebuilt and one blob removed", res)
+	}
+	if has, _ := rt.HasAttachmentBlob(attachNS, h); has {
+		t.Fatal("the deleted branch's version is still stored")
+	}
+	if got, _ := readAttachment(t, rt, id, codec.Hash{}); !bytes.Equal(got, onMain) {
+		t.Fatal("main's version reads back wrong")
+	}
+	// Nothing changed since: the rebuilt index is reused.
+	if res := compact(t, rt); res.Rebuilt || res.Scanned != 0 || res.Removed != 0 {
+		t.Fatalf("pass after the rebuild: %+v", res)
+	}
+}
