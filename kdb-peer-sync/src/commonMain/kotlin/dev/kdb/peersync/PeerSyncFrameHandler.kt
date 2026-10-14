@@ -9,27 +9,51 @@ import dev.kdb.codec.KdbHash
 import dev.kdb.dag.CommitDag
 import dev.kdb.dag.TraversalEntry
 import dev.kdb.document.KdbCommit
-import dev.kdb.error.ConflictReport
 import dev.kdb.storage.StorageAdapter
 import dev.kdb.wire.*
+
+/** BLOB_FETCH 0x42 and ATTACHMENT_UPLOAD 0x44: attachment frames a v2 sync session carries. */
+private val V2_ATTACHMENT_FRAMES = setOf(0x42, 0x44)
 
 internal class PeerSyncFrameHandler(
     private val wire: WireCodec,
     private val dag: CommitDag,
     private val storage: StorageAdapter,
     private val cfg: PeerHostConfig,
-    auth: AuthEngine = AllowAllAuth,
-    connectionContext: ConnectionContext = ConnectionContext.EMPTY,
+    private val auth: AuthEngine = AllowAllAuth,
+    private val connectionContext: ConnectionContext = ConnectionContext.EMPTY,
 ) {
     private val connectionAuth = ConnectionAuthSupport(auth, connectionContext)
 
-    suspend fun handleFrame(frame: ByteArray): ByteArray? =
-        when (val msg = wire.decode(frame)) {
+    /** The connection's v2 session, from its first v2 frame on. */
+    private var v2: SyncV2HostSession? = null
+
+    suspend fun handleFrame(frame: ByteArray): ByteArray? {
+        val code = frameTypeCode(frame)
+        if (SyncV2.isSyncFrame(code) || code in V2_ATTACHMENT_FRAMES) {
+            val session =
+                v2 ?: SyncV2HostSession(
+                    wire,
+                    PeerSyncNamespace(cfg.namespaceId, dag, storage, cfg.blobs, cfg.materializeCommit, cfg.conflictPolicy),
+                    cfg.nodeId,
+                    auth,
+                    connectionContext,
+                ).also { v2 = it }
+            return session.handleFrame(frame)
+        }
+        return when (val msg = wire.decode(frame)) {
             is WireMessage.Handshake -> handleHandshake(msg)
             is WireMessage.CommitFetch -> handleCommitFetch(msg)
             is WireMessage.CommitPush -> handleCommitPush(msg)
             else -> null
         }
+    }
+
+    /** Releases what the connection's v2 session holds (unfinished uploads). */
+    fun close() {
+        v2?.close()
+        v2 = null
+    }
 
     private suspend fun handleHandshake(msg: WireMessage.Handshake): ByteArray {
         if (msg.request.clientMode != WireClientMode.FULL_PEER) {
@@ -135,19 +159,6 @@ internal class PeerSyncFrameHandler(
                 emptyList(),
             )
         return wire.encode(ack)
-    }
-
-    private fun encodeConflictReport(report: ConflictReport): ByteArray {
-        val items =
-            report.conflicts.joinToString(",") { item ->
-                val local = item.localDoc ?: "null"
-                val incoming = item.incomingDoc ?: "null"
-                """{"documentId":"${item.documentId}","operationType":"${item.operationType}","localDoc":$local,"incomingDoc":$incoming}"""
-            }
-        return (
-            """{"transactionId":"${report.transactionId}","baseHash":"${report.baseHash}",""" +
-                """"targetHash":"${report.targetHash}","conflicts":[$items]}"""
-        ).encodeToByteArray()
     }
 
     private suspend fun authorizePeerSync() {

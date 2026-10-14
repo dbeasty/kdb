@@ -19,6 +19,10 @@ public data class PeerHostConfig(
      * Disjoint-document divergence always auto-merges regardless of this value (see
      * [resolveDivergence]'s doc comment); this only affects the same-document-conflict case. */
     val conflictPolicy: ConflictPolicy = ConflictPolicy.STRICT,
+    /** The namespace's attachment blobs, served to v2 peers (BLOB_FETCH) and taken from them
+     * (ATTACHMENT_UPLOAD). Null: this node advertises no attachment support, and a peer whose
+     * commits carry attachments is refused them. */
+    val blobs: PeerBlobStore? = null,
 )
 
 public data class PeerClientConfig(
@@ -29,6 +33,15 @@ public data class PeerClientConfig(
     val tls: TransportTlsSettings? = null,
     /** Same as [PeerHostConfig.conflictPolicy], applied when this side is the one pulling. */
     val conflictPolicy: ConflictPolicy = ConflictPolicy.STRICT,
+    /** The namespace's attachment blobs: a v2 pull fetches what its commits attach into it, a v2
+     * push uploads from it. Null: no attachment support is advertised. */
+    val blobs: PeerBlobStore? = null,
+    /** Applies each commit a pull moves main onto to live state; null leaves that to the caller. */
+    val materializeCommit: CommitMaterializer? = null,
+    /** Speak protocol v2 (falling back to v1 against a v1-only peer). False: v1 only. */
+    val protocolV2: Boolean = true,
+    /** How long a request waits for its reply. */
+    val requestTimeoutMillis: Long = 30_000,
 )
 
 public data class DagSyncPlan(

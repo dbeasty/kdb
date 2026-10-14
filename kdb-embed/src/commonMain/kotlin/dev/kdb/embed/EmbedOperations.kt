@@ -128,7 +128,9 @@ private suspend fun materializeSingleCommit(
         runtime.indexManager.registryFor(namespaceId),
         runtime.storage,
         schema,
-    )
+    )    // A synced commit's blobs arrived (BLOB_FETCH, or a peer's upload) before it: it references
+    // them now, so their upload hold ends, as a local commit's does.
+    runtime.attachmentsCommitted(namespaceId, commit)
 }
 
 public suspend fun putJson(

@@ -47,7 +47,7 @@ internal class ConnectionPeerSyncHost(
         error("ConnectionPeerSyncHost does not support in-memory hub start")
     }
 
-    override suspend fun stop() = Unit
+    override suspend fun stop() = handler.close()
 
     override suspend fun handleFrame(frame: ByteArray): ByteArray? = handler.handleFrame(frame)
 }
@@ -87,6 +87,7 @@ internal class DefaultPeerSyncHost(
         val cfg = config ?: return
         InMemoryWireTransportHub.hub(cfg.transportHub).serverHandler = null
         this.config = null
+        handler?.close()
         handler = null
     }
 
