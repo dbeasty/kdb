@@ -211,6 +211,70 @@ class Layer5SqlIntegrationTest {
             assertTrue(containsIndexScan(plan.plan))
         }
 
+    /**
+     * An OR whose disjuncts all have an index scan is served by their union, and returns what the
+     * same query returns with no index at all; one disjunct without an index leaves the OR to a
+     * scan (go/kdb/server/or_index_union_test.go is the Go counterpart).
+     */
+    @Test
+    fun orIsServedFromAUnionOfIndexScans() =
+        runTest {
+            fun fields(indexed: Boolean) =
+                listOf(
+                    SchemaField("userId", KdbFieldType.StringType, required = true, indexed = indexed),
+                    SchemaField("status", KdbFieldType.StringType, required = true, indexed = indexed),
+                    SchemaField("rank", KdbFieldType.Int64Type, required = true, indexed = indexed),
+                    SchemaField("note", KdbFieldType.StringType, required = false, indexed = false),
+                )
+            val docs =
+                (0 until 40).map { i ->
+                    """{"userId":"u${i % 7}","status":"s${i % 3}","rank":$i,"note":"n${i % 5}"}"""
+                }
+            val indexed = seededFixture(fields(true), docs.first())
+            val plain = seededFixture(fields(false), docs.first())
+            for (d in docs.drop(1)) {
+                indexed.commitDoc(d)
+                plain.commitDoc(d)
+            }
+            suspend fun ranks(
+                fx: SqlFixture,
+                where: String,
+            ) = rankList(fx, "SELECT rank FROM users WHERE $where")
+
+            val unioned =
+                listOf(
+                    "userId = 'u1' OR userId = 'u2'",
+                    "userId = 'u1' OR status = 's2' OR rank IN (3, 4, 5)",
+                    "(userId = 'u3' AND rank > 10) OR status = 's1'",
+                    "rank < 5 OR rank BETWEEN 20 AND 22 OR rank >= 38",
+                    "status = 's0' AND (userId = 'u4' OR userId = 'u5')",
+                    "(status = 's2' AND (userId = 'u1' OR userId = 'u6')) OR rank = 0",
+                    "userId = 'u1' OR userId = 'u1' OR rank = 1",
+                )
+            for (where in unioned) {
+                val plan = indexed.engine.explain("SELECT rank FROM users WHERE $where", QueryContext(namespaceId = indexed.ns, schema = indexed.schema))
+                // Without costs the first servable conjunct wins: an indexed AND conjunct ahead of the OR.
+                val want = if (where.startsWith("status = 's0' AND")) "IndexScan(status" else "UnionScan("
+                assertTrue(plan.accessPath.startsWith(want), "$where: ${plan.accessPath}")
+                assertEquals(ranks(plain, where), ranks(indexed, where), where)
+            }
+            val scanned = "userId = 'u1' OR note = 'n2'"
+            val plan = indexed.engine.explain("SELECT rank FROM users WHERE $scanned", QueryContext(namespaceId = indexed.ns, schema = indexed.schema))
+            assertTrue(plan.accessPath.startsWith("FullTableScan"), plan.accessPath)
+            assertEquals(ranks(plain, scanned), ranks(indexed, scanned))
+            assertTrue(ranks(indexed, unioned[1]).size > ranks(indexed, unioned[0]).size)
+        }
+
+    private suspend fun rankList(
+        fx: SqlFixture,
+        sql: String,
+    ): List<Long> =
+        fx.engine
+            .execute(sql, QueryContext(namespaceId = fx.ns, schema = fx.schema))
+            .rows
+            .map { (it.values[0] as SqlCell.LongVal).value }
+            .sorted()
+
     @Test
     fun unknownColumnThrows() =
         runTest {

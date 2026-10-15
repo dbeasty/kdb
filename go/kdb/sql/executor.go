@@ -627,6 +627,15 @@ func (e *Executor) chooseIndexPath(where Expr, orderBy []OrderItem, env *evalEnv
 			}
 		}
 	}
+	return e.conjunctPath(where, env, ctx, true)
+}
+
+// conjunctPath serves where from the cheapest of its top-level AND conjuncts that a ranking, key
+// or index can serve; found=false when none can. allowSearch says whether a search conjunct
+// (MATCH, SIMILARITY) may serve: a ranking holds only as many hits as the search's depth, which
+// is fine for a conjunct the residual re-checks but not for one disjunct of an OR, where the
+// hits it leaves out are matches the other disjuncts' lookups do not find either.
+func (e *Executor) conjunctPath(where Expr, env *evalEnv, ctx QueryContext, allowSearch bool) ([]codec.UUID, string, bool, error) {
 	var (
 		best      []codec.UUID
 		bestLabel string
@@ -639,6 +648,9 @@ func (e *Executor) chooseIndexPath(where Expr, orderBy []OrderItem, env *evalEnv
 	var cands []candidate
 	for _, conj := range conjuncts(where) {
 		if isSearchExpr(conj) {
+			if !allowSearch {
+				continue
+			}
 			if hits := env.scores[searchKey(conj)]; hits != nil {
 				return rankedIDs(hits), hits.label, true, nil
 			}
@@ -649,7 +661,8 @@ func (e *Executor) chooseIndexPath(where Expr, orderBy []OrderItem, env *evalEnv
 		if ids, ok := keyLookup(conj, env); ok {
 			return ids, "keylookup", true, nil
 		}
-		if e.IndexProvider == nil {
+		// An OR may still be served without a provider when every disjunct is a key lookup.
+		if e.IndexProvider == nil && !isOr(conj) {
 			continue
 		}
 		cands = append(cands, candidate{conj: conj, est: e.estimateConjunct(conj, env, ctx)})
@@ -683,12 +696,75 @@ func (e *Executor) chooseIndexPath(where Expr, orderBy []OrderItem, env *evalEnv
 	return best, bestLabel, found, nil
 }
 
+// isOr reports whether x is an OR.
+func isOr(x Expr) bool {
+	b, ok := x.(ExprBinary)
+	return ok && b.Op == BinaryOpOr
+}
+
+// disjuncts flattens the top-level OR tree of an expression.
+func disjuncts(e Expr) []Expr {
+	if b, ok := e.(ExprBinary); ok && b.Op == BinaryOpOr {
+		return append(disjuncts(b.Left), disjuncts(b.Right)...)
+	}
+	return []Expr{e}
+}
+
+// orLookup serves an OR as the union of its disjuncts' access paths, when every disjunct has one
+// (a disjunct that is an AND is served by its cheapest servable conjunct, and one that holds a
+// nested OR by that OR's own union). Each disjunct's ids are a superset of the documents that
+// satisfy it, so their union is a superset of the documents that satisfy the OR; the residual
+// WHERE re-checks every candidate, as it does for any index path. One disjunct with no path makes
+// the whole OR unservable: any document might satisfy that disjunct, so only a scan finds them.
+//
+// The union is deduplicated and in document id order, so a document matched by several
+// disjuncts is fetched once and the order does not depend on which disjunct found it first.
+func (e *Executor) orLookup(or Expr, env *evalEnv, ctx QueryContext) ([]codec.UUID, string, bool, error) {
+	ds := disjuncts(or)
+	labels := make([]string, 0, len(ds))
+	seen := map[codec.UUID]struct{}{}
+	var union []codec.UUID
+	for _, d := range ds {
+		ids, label, ok, err := e.conjunctPath(d, env, ctx, false)
+		if err != nil || !ok {
+			return nil, "", false, err
+		}
+		labels = append(labels, strings.TrimPrefix(label, "index:"))
+		for _, id := range ids {
+			if _, dup := seen[id]; !dup {
+				seen[id] = struct{}{}
+				union = append(union, id)
+			}
+		}
+	}
+	sort.Slice(union, func(i, j int) bool { return bytes.Compare(union[i].Bytes(), union[j].Bytes()) < 0 })
+	return union, "index:or(" + strings.Join(labels, "|") + ")", true, nil
+}
+
 // estimateConjunct is how many ids serving conj from an index would return, or -1 when that is
-// not known without fetching them.
+// not known without fetching them. An OR's estimate is the sum of its disjuncts' (an upper bound
+// on its union), known only when every disjunct's is.
 func (e *Executor) estimateConjunct(conj Expr, env *evalEnv, ctx QueryContext) int {
+	if isOr(conj) {
+		total := 0
+		for _, d := range disjuncts(conj) {
+			n := e.estimatePredicate(d, env, ctx)
+			if n < 0 {
+				return -1
+			}
+			total += n
+		}
+		return total
+	}
+	if ids, ok := keyLookup(conj, env); ok {
+		return len(ids)
+	}
 	counter, ok := e.IndexProvider.(ExactCounter)
 	if !ok {
 		return -1
+	}
+	if in, ok := conj.(ExprIn); ok {
+		return e.estimateIn(in, counter, env, ctx)
 	}
 	b, ok := conj.(ExprBinary)
 	if !ok || b.Op != BinaryOpEQ {
@@ -722,6 +798,53 @@ func (e *Executor) estimateConjunct(conj Expr, env *evalEnv, ctx QueryContext) i
 	return n
 }
 
+// estimatePredicate is estimateConjunct for an AND of conjuncts: the smallest known estimate
+// among them (conjunctPath fetches the cheapest known conjunct first, and keeps a later one only
+// if it is smaller still), or -1 when none is known.
+func (e *Executor) estimatePredicate(where Expr, env *evalEnv, ctx QueryContext) int {
+	best := -1
+	for _, c := range conjuncts(where) {
+		if isSearchExpr(c) {
+			continue
+		}
+		if n := e.estimateConjunct(c, env, ctx); n >= 0 && (best < 0 || n < best) {
+			best = n
+		}
+	}
+	return best
+}
+
+// estimateIn is the sum of the exact counts of an IN list's values (an upper bound on the union
+// indexLookup serves it with), or -1 when any of them is unknown.
+func (e *Executor) estimateIn(in ExprIn, counter ExactCounter, env *evalEnv, ctx QueryContext) int {
+	ref, ok := in.Expr.(ExprColumnRef)
+	if !ok {
+		return -1
+	}
+	name := env.columnName(ref.Name)
+	if isReservedColumn(name) {
+		return -1
+	}
+	total := 0
+	for _, v := range in.Values {
+		switch v.(type) {
+		case ExprLiteral, ExprParameter:
+		default:
+			return -1
+		}
+		value := env.cell(v, newEvalDoc(emptyDoc))
+		if isNullCell(value) {
+			continue
+		}
+		n, ok, err := counter.ExactCount(ctx, name, value)
+		if err != nil || !ok {
+			return -1
+		}
+		total += n
+	}
+	return total
+}
+
 // rankedIDs lists a ranking's documents best-first. It is not cut: the residual WHERE still runs
 // over these, so cutting here (at MaxRows, as this once did) dropped every match ranked below the
 // cut. How many candidates a ranking holds is the search's depth (searchDepth), which the spec
@@ -750,8 +873,12 @@ func conjuncts(e Expr) []Expr {
 	return []Expr{e}
 }
 
-// indexLookup tries to serve one conjunct from the provider.
+// indexLookup tries to serve one conjunct from the provider (an OR, from the union of its
+// disjuncts' paths: see orLookup).
 func (e *Executor) indexLookup(conj Expr, env *evalEnv, ctx QueryContext) ([]codec.UUID, string, bool, error) {
+	if isOr(conj) {
+		return e.orLookup(conj, env, ctx)
+	}
 	isConst := func(x Expr) bool {
 		switch x.(type) {
 		case ExprLiteral, ExprParameter:

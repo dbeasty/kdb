@@ -338,6 +338,14 @@ public sealed class PhysicalPlan {
 
     public data class Limit(val limit: Int, val offset: Int, val input: PhysicalPlan) : PhysicalPlan()
 
+    /**
+     * An OR served as the union of its disjuncts' access paths, one [arms] entry per disjunct
+     * (Go labels this plan `index:or(...)`). Every disjunct must have a path: each arm's ids are
+     * a superset of the documents satisfying that disjunct, so the deduplicated union is a
+     * superset of the OR's matches, and the OR stays in the residual filter to re-check them.
+     */
+    public data class UnionScan(val arms: List<PhysicalPlan>) : PhysicalPlan()
+
     public data class InListScan(
         val fieldName: String,
         val indexType: IndexType,
@@ -401,6 +409,7 @@ public fun describeAccessPath(plan: PhysicalPlan): String =
         is PhysicalPlan.Filter -> describeAccessPath(plan.input)
         is PhysicalPlan.FullTableScan -> "FullTableScan(${plan.reason})"
         is PhysicalPlan.KeyLookup -> "KeyLookup(${plan.ids.size} ids)"
+        is PhysicalPlan.UnionScan -> "UnionScan(" + plan.arms.joinToString(" | ") { describeAccessPath(it) } + ")"
         is PhysicalPlan.InListScan -> "InListScan(${plan.fieldName} ${plan.indexType} ${plan.keys.size} keys)"
         is PhysicalPlan.IndexScan -> describeIndexScan(plan)
         is PhysicalPlan.ScoredScan ->

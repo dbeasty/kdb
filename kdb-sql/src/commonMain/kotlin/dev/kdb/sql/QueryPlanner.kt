@@ -148,6 +148,7 @@ public class DefaultQueryPlanner : QueryPlanner {
         env: EvalEnv,
     ): ScanCandidate? {
         keyLookup(expr, env)?.let { return ScanCandidate(PhysicalPlan.KeyLookup(it), subsumesConjunct = false) }
+        if (expr is SqlExpr.Binary && expr.op == BinaryOp.OR) return unionScan(expr, context, env)
         return when (expr) {
             is SqlExpr.Match -> ScanCandidate(scoredScan(expr, context, Int.MAX_VALUE), subsumesConjunct = true)
             is SqlExpr.Between -> matchBetween(expr, context.schema, env)
@@ -155,6 +156,28 @@ public class DefaultQueryPlanner : QueryPlanner {
             is SqlExpr.InList -> matchInList(expr, context.schema, env)
             else -> null
         }
+    }
+
+    /**
+     * An OR served as the union of its disjuncts' scans, when every disjunct has one: a disjunct
+     * that is an AND is served by its first servable conjunct, one holding a nested OR by that
+     * OR's own union. One disjunct without a scan leaves the OR to the residual filter over
+     * whatever else serves the query (any document might satisfy that disjunct). The OR always
+     * stays in the residual filter, which re-checks every candidate the union fetched. A MATCH
+     * disjunct is not used: a ranking is an access path for the query, not a lookup to union.
+     */
+    private fun unionScan(
+        expr: SqlExpr.Binary,
+        context: QueryContext,
+        env: EvalEnv,
+    ): ScanCandidate? {
+        val arms =
+            orDisjuncts(expr).map { disjunct ->
+                andConjuncts(disjunct).firstNotNullOfOrNull { c ->
+                    if (c is SqlExpr.Match) null else findIndexScan(c, context, env)?.plan
+                } ?: return null
+            }
+        return ScanCandidate(PhysicalPlan.UnionScan(arms), subsumesConjunct = false)
     }
 
     /**

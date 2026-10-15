@@ -408,6 +408,7 @@ internal class SqlExecutor(
                     .keys.toList()
             is PhysicalPlan.FullTableScan -> fullScan(context, commitDag)
             is PhysicalPlan.KeyLookup -> plan.ids
+            is PhysicalPlan.UnionScan -> plan.arms.flatMap { resolveDocIds(it, context, env, commitDag) }.distinct()
         }
 
     private suspend fun inListScan(
