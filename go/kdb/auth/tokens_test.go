@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -68,5 +69,42 @@ func TestAccessTokensAuthenticateAndRevoke(t *testing.T) {
 	}
 	if _, _, err := s.CreateToken("nobody", "", 0); err == nil {
 		t.Fatal("token issued for an unknown user")
+	}
+}
+
+// The token format pinned with fixed vectors, so the Kotlin registry store (kdb-auth-store
+// RegistryAuthStoreTokenTest) can share a registry with this one: the same record bytes under
+// the same document id, and the same token string accepted.
+func TestAccessTokenFixedVector(t *testing.T) {
+	const (
+		token  = "kdbt_0123456789abcdef_c2VjcmV0LXNlY3JldC1zZWNyZXQtc2VjcmV0LXNlY3I"
+		docID  = "7f6f4dd1-927f-28f6-317c-fc029e481bb9"
+		record = `{"kind":"token","tokenId":"0123456789abcdef","user":"svc","label":"qtask-api",` +
+			`"secretSha256":"2c4580586d9cf21dc4222d31dee8d845a7ed9bd9bf8a0937391bc96cb1a2c25a",` +
+			`"createdAt":"2026-10-15T10:00:00Z","expiresAt":"2099-01-01T00:00:00Z"}`
+	)
+	if got := tokenDocID("0123456789abcdef").String(); got != docID {
+		t.Fatalf("token doc id: %s", got)
+	}
+	id, secret, ok := parseToken(token)
+	if !ok || id != "0123456789abcdef" {
+		t.Fatalf("parse: %q %v", id, ok)
+	}
+	rec := TokenRecord{Kind: "token", TokenID: id, User: "svc", Label: "qtask-api", SecretSHA256: secretDigest(secret),
+		CreatedAt: "2026-10-15T10:00:00Z", ExpiresAt: "2099-01-01T00:00:00Z"}
+	body, err := json.Marshal(rec)
+	if err != nil || string(body) != record {
+		t.Fatalf("record bytes:\n%s\nwant\n%s (%v)", body, record, err)
+	}
+	s := newTestRegistryAuthStore(t)
+	if err := s.CreateUser("svc", "pw", []string{"reader"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.writeToken(rec); err != nil {
+		t.Fatal(err)
+	}
+	tok := token
+	if p, err := (registryAuthenticator{store: s}).Authenticate(context.Background(), Credentials{Token: &tok}); err != nil || p.ID != "svc" {
+		t.Fatalf("fixed token: %v %v", p, err)
 	}
 }

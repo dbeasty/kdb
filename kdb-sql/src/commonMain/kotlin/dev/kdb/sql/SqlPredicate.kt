@@ -275,6 +275,24 @@ internal object SqlPredicate {
     }
 
     /**
+     * Every value a column path reaches, a final array kept whole (Go's `columnValues(..., false)`):
+     * what `EXISTS` and `ALL_VALUES` inspect. The reserved columns always reach their value.
+     */
+    private fun valuesAt(
+        name: String,
+        doc: KdbDocument,
+        env: EvalEnv,
+    ): List<JsonValue> =
+        when (env.resolvePath(name)) {
+            KDB_ID -> listOf(JsonValue.JString(doc.id.toString()))
+            DOC -> listOfNotNull(env.root(doc))
+            else -> {
+                val root = env.root(doc)
+                if (root == null) emptyList() else SqlPaths.rawValues(root, SqlPaths.splitPath(env.resolvePath(name)))
+            }
+        }
+
+    /**
      * Widens a float32 score to a double through its shortest 32-bit round-trip (Layer 16 §5), so
      * `0.9f` becomes `0.9` and not `0.8999999761581421`, and Go and Kotlin print the same cell.
      */
@@ -312,6 +330,14 @@ internal object SqlPredicate {
                 val path = pathArg(call, 1)
                 val raw = rawValueOf(path, doc, env)
                 return if (raw is JsonValue.JArray) SqlCell.LongVal(raw.elements.size.toLong()) else SqlCell.Null
+            }
+            // The path reaches a value - JSON null included. An absent path reaches none.
+            "exists" -> return SqlCell.BoolVal(valuesAt(pathArg(call, 1), doc, env).isNotEmpty())
+            // Every value the path reaches, as one JSON array - a path through an array of objects
+            // (`subs.u`) projects each element's value, where a bare column projects the first.
+            "all_values" -> {
+                val values = valuesAt(pathArg(call, 1), doc, env)
+                return if (values.isEmpty()) SqlCell.Null else SqlCell.JsonVal(JsonValue.JArray(values).toJsonString())
             }
         }
         if (SqlAggregates.isAggregateFunction(call.name)) {

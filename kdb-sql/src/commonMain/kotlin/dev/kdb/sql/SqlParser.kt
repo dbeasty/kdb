@@ -558,7 +558,14 @@ internal class RecursiveDescentSqlParser : SqlParser {
         }
         if (negated) throw parseError("expected LIKE, ILIKE, IN, or BETWEEN after NOT")
         if (matchKeyword("IS")) {
-            if (matchKeyword("NOT")) {
+            val isNot = matchKeyword("NOT")
+            if (matchKeyword("MISSING")) {
+                // `x IS MISSING` / `x IS NOT MISSING`: whether the path is in the document at all,
+                // which IS NULL cannot say - an explicit null and an absent field both read NULL.
+                val exists = SqlExpr.FunctionCall("exists", listOf(left))
+                return if (isNot) exists else SqlExpr.Unary(UnaryOp.NOT, exists)
+            }
+            if (isNot) {
                 expectKeyword("NULL")
                 return SqlExpr.Unary(UnaryOp.NOT, SqlExpr.Unary(UnaryOp.IS_NULL, left))
             }
