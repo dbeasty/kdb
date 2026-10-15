@@ -124,14 +124,23 @@ after a re-run of its pushdown tests against the release.
 **Measured:** with the qtask store fixed to fetch only the documents it needs, KDB's CPU is still
 the bottleneck in the smoke benchmark (181% of 2 CPU at 8 users vs MongoDB 33%); task list p50
 88 ms vs 9 ms. Rehearsal: commits of 4 MiB made later reads 10-20x slower than 64 KiB commits.
-**Hypotheses** (profile first - `pprof` on `kdb-service` under `npm run bench:docker -- --scale
-small --backends kdb --profiles read-heavy`): (a) cold reads decompress a whole multi-document
-commit frame to return one document; (b) each returned document is parsed to evaluate the residual
-WHERE and re-encoded as a JSON string for the `_doc` cell; (c) per-row allocation in the executor.
+**Profiled (2026-10-15, 517k documents, expiry sweep disabled, qtask's task-list query driven
+through its store):** 88% of CPU under `Executor.materialize`, of which
+- **42% parsing whole documents to evaluate the WHERE or select a column**
+  (`evalEnv.predicate`/`columnValues` → `evalDoc.tree` → `json.ParseValue`), even for a lean
+  `SELECT kdb_id, _id, status, createdAt`: every candidate is fully parsed. Most of it was the
+  768-number embedding of each task (`strconv.ParseFloat` 17%, `parseArray` 40% cumulative);
+- **34% reading each candidate from the commit log** (`expiryHidingAdapter.GetDocument` →
+  `ServerEngine.documentFromLog` → `delta.ReadDocumentAt` → `withFramePayload`), i.e. decompressing
+  a commit frame (zstd 18%) per document read.
+qtask now stores embeddings packed as one string (its side of the 42%); KDB should still not parse
+fields a query does not reference.
 
-Do: whatever the profile says, in order of cost. Likely candidates: per-document addressable
-storage (or a block index) so one document is decompressed alone; evaluate residual predicates on
-the encoded document without a full parse; pass `_doc` through as stored bytes. Accept: qtask's
+Do, in order of cost: (1) lazy/partial parsing - evaluate predicates and select columns by
+scanning to the referenced paths and skipping the rest without materialising values (number
+parsing especially); (2) a document cache or per-document addressable storage so a hot document
+is not re-read and re-decompressed from its commit frame on every query; (3) pass `_doc` through as
+stored bytes. Accept: qtask's
 `read-heavy` cell at 8 users reaches at least half of MongoDB's actions/s on the same limits.
 
 ### U5. Fast open and restore - M/L
