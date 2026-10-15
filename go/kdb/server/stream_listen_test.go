@@ -1,6 +1,7 @@
 package server
 
 import (
+	"github.com/limidus/kdb/go/kdb/internal/testtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -69,7 +70,7 @@ func TestListenStreamPublishesRealWriteToReadOnlySubscriber(t *testing.T) {
 		t.Fatalf("upsert: %v", err)
 	}
 
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(testtime.Scale(2 * time.Second))
 	for {
 		select {
 		case ev := <-subscriber.Events():
@@ -189,7 +190,7 @@ func TestListenStreamRejectsSqlClientHandshake(t *testing.T) {
 	if err := conn.Send(frame); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testtime.Scale(2 * time.Second))
 	for time.Now().Before(deadline) {
 		if reply := conn.TryPoll(); reply != nil {
 			decoded, err := codecWire.Decode(reply)

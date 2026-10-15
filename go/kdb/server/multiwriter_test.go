@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"github.com/limidus/kdb/go/kdb/internal/testtime"
 	"sync"
 	"testing"
 	"time"
@@ -285,7 +286,7 @@ func (c *rawWireClient) lockRelease(t *testing.T, namespace, sessionID, docID st
 // eventually polls cond for up to two seconds. Used where the thing under test is the server
 // reacting to a closed socket, which has no synchronous completion signal to wait on.
 func eventually(cond func() bool) bool {
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testtime.Scale(2 * time.Second))
 	for time.Now().Before(deadline) {
 		if cond() {
 			return true

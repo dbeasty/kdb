@@ -3,6 +3,7 @@ package peersync
 import (
 	"encoding/json"
 	"errors"
+	"github.com/limidus/kdb/go/kdb/internal/testtime"
 	"sync"
 	"testing"
 	"time"
@@ -392,7 +393,7 @@ func pushWithin(t *testing.T, session Session, commits []document.Commit, within
 	select {
 	case o := <-done:
 		return o.applied, o.err
-	case <-time.After(within):
+	case <-time.After(testtime.Scale(within)):
 		t.Fatalf("PushCommits did not return within %s - the host owes a clean push an ack and never sent one", within)
 		return 0, nil
 	}

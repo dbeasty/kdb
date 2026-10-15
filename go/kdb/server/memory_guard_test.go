@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"github.com/limidus/kdb/go/kdb/internal/testtime"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -36,7 +37,7 @@ func TestMemoryGuardRejectsOnceOverBudget(t *testing.T) {
 	g := NewMemoryGuard(1, 0.85) // 1 byte * 0.85 - anything trips this immediately
 	defer g.Stop()
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testtime.Scale(2 * time.Second))
 	for time.Now().Before(deadline) {
 		if g.ShouldReject() {
 			return
