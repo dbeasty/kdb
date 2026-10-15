@@ -50,20 +50,33 @@ jobs:
           fi
 
   test-gate:
+    # The same shards, flags and setup as the nightly's full race run (e2e-nightly.yml
+    # go-race-full), which is what this release's code passed. One runner for the whole tree made
+    # every package compete for CPU under -race: v0.8.0's first two release runs failed there on
+    # timing alone (Go's 10m package limit, then a 5 s catch-up wait), never on a test the shards
+    # fail.
     needs: version-guard
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [embed, server, integration, storage, index, rest]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go/go.mod
-          cache-dependency-path: go/go.sum
-      - name: Go tests (race)
-        # The nightly's full race run (e2e-nightly.yml go-race-full) uses the same limit: under -race
-        # on a GitHub runner, embed and integration take past Go's default 10m per package, which
-        # killed v0.8.0's first release run before it built anything.
-        run: cd go && go test -race -timeout 45m ./...
+          cache-key: release-race-${{ matrix.shard }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Use the Gradle build cache in the interop tests' gradle runs
+        run: mkdir -p "${GRADLE_USER_HOME:-$HOME/.gradle}" && printf 'org.gradle.caching=true\norg.gradle.parallel=true\n' >> "${GRADLE_USER_HOME:-$HOME/.gradle}/gradle.properties"
+      - name: Go tests (race, ${{ matrix.shard }})
+        run: scripts/ci/go-test-shard.sh linux-race ${{ matrix.shard }} -count=1 -timeout 45m
       - name: Go vet + gofmt
+        if: matrix.shard == 'rest'
         run: cd go && go vet ./... && test -z "$(gofmt -l .)"
 
   artifacts:
