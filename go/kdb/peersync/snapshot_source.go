@@ -100,13 +100,15 @@ func sortedBodiesFor(env IngestEnv, commit codec.Hash, tree document.DocumentTre
 	}
 	s := &sortedBodies{key: key, done: make(chan struct{}), lastUsed: time.Now()}
 	snapshotSources.m[key] = s
-	go s.build(env, streamer, tree)
+	go s.build(env, streamer, tree, snapshotRunBytes)
 	time.AfterFunc(snapshotSourceIdle, s.expire)
 	return s
 }
 
-// build streams the tree's bodies out of storage into sorted runs.
-func (s *sortedBodies) build(env IngestEnv, streamer storage.TreeBodyStreamer, tree document.DocumentTree) {
+// build streams the tree's bodies out of storage into sorted runs of runBytes each. runBytes is
+// read by the caller: the build outlives the session that started it, so it must not read
+// package settings while it runs.
+func (s *sortedBodies) build(env IngestEnv, streamer storage.TreeBodyStreamer, tree document.DocumentTree, runBytes int) {
 	defer close(s.done)
 	var runs []*pageSpool
 	var recs []wire.SnapshotDoc
@@ -138,7 +140,7 @@ func (s *sortedBodies) build(env IngestEnv, streamer storage.TreeBodyStreamer, t
 			return errSourceClosed
 		}
 		recs = append(recs, wire.SnapshotDoc{DocID: id.String(), Body: body})
-		if size += len(body) + 64; size >= snapshotRunBytes {
+		if size += len(body) + 64; size >= runBytes {
 			return spill()
 		}
 		return nil
