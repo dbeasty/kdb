@@ -187,7 +187,9 @@ func TestTreeMemoryDoesNotFollowCommitCount(t *testing.T) {
 
 		re := tinyTreeBudgetRuntime(t, root, storage.HistoryStrategyObjects)
 		defer re.Close()
-		return liveHeapMB(re)
+		held := liveHeapMB()
+		runtime.KeepAlive(re)
+		return held
 	}
 	measure(100) // discard: one-off per-process costs
 
