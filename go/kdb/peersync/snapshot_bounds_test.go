@@ -456,8 +456,13 @@ func TestInstallSnapshotMemoryIsBounded(t *testing.T) {
 		if transfer > 2<<20 {
 			t.Fatalf("n=%d: transfer held %d KB live: more than a few pages", n, transfer>>10)
 		}
-		// The tree costs a few hundred bytes a document; a body is 2,000.
-		if installed > int64(n)*600 {
+		// What must not be live is the bodies: 2,000 bytes a document. The tree that is live costs a
+		// few hundred bytes a document at scale, but at n=2,000 its slab pools' doubling rounds it up
+		// to ~700 B/doc (+1.1 MB of slabs, measured with MemProfileRate=1). Until v0.8.1 that was
+		// hidden: the install freed the node's original graph, whose genesis held a full 1 MiB chunk,
+		// and the freed megabyte cancelled the tree's cost (#295 made that chunk small). Half a body
+		// per document still fails the moment bodies are held, without depending on slab rounding.
+		if installed > int64(n)*bodyLen/2 {
 			t.Fatalf("n=%d: %d B/doc live once installed: bodies are being held", n, installed/int64(n))
 		}
 	}
