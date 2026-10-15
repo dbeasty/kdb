@@ -122,6 +122,26 @@ func (e *Executor) executeSelect(query SelectQuery, plan PhysicalPlan, residual 
 	} else if ok {
 		return res, nil
 	}
+	if k, ok := topKEligible(query, idOrder); ok && !e.scanIDsOnly && !ctx.keyset {
+		docs, label, err := e.topKDocs(query, residual, env, ctx, k)
+		if err != nil {
+			return QueryResult{}, err
+		}
+		rows := applyLimitOffset(e.plainRows(query, env, docs), limit, offset)
+		if max := e.maxResultRows(ctx); len(rows) > max {
+			return QueryResult{}, &ResultRowLimitError{Limit: max}
+		}
+		for _, r := range rows {
+			ctx.Stats.addRetained(rowBytes(r))
+		}
+		if err := ctx.overRetainedLimit(); err != nil {
+			return QueryResult{}, err
+		}
+		if rows == nil {
+			rows = []QueryRow{}
+		}
+		return QueryResult{Columns: columnsFor(query, ctx.Schema), Rows: rows, Plan: label}, nil
+	}
 	src, err := e.chooseAccessPath(query.Where, query.OrderBy, env, ctx, stopAt, residual)
 	if err != nil {
 		if idOrder && !keysetIn && errors.Is(err, storage.ErrOrderedScanUnsupported) {

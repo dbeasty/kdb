@@ -63,6 +63,12 @@ func ShapeOfSelect(q SelectQuery) QueryShape {
 	}
 	// COUNT(*) alone is counted without holding the documents (tryCountOnly).
 	shape.CountOnly = isCountOnlyQuery(q)
+	// ORDER BY ... LIMIT keeps only the best LIMIT+OFFSET rows as it streams (topKDocs): it holds
+	// a LIMIT's worth of rows, not every match.
+	if _, ok := topKEligible(q, false); ok && shape.HasOrderBy {
+		shape.HasOrderBy = false
+		shape.Limit = *q.Limit + q.Offset
+	}
 	if q.Limit != nil {
 		shape.Limit = *q.Limit
 	}
