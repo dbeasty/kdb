@@ -278,6 +278,21 @@ whole run unless `v$(cat VERSION)` equals `$GITHUB_REF_NAME`, before anything el
 Cutting a release is still a manual `VERSION` bump + commit + `git tag -a vX.Y.Z && git push
 origin vX.Y.Z` — no `cut-release.sh` helper exists yet (open item, not blocking; see §7).
 
+**The version bump touches more than `VERSION`.** `@kdb/client` is published with the server's
+version, and `packages/kdb-client/test/version.test.ts` fails CI unless they match. One release
+commit changes all of:
+
+- `VERSION`
+- `packages/kdb-client/package.json` and `package-lock.json` (two `"version"` lines)
+- `packages/kdb-client/src/version.ts` (`CLIENT_VERSION`)
+- `packages/kdb-client/README.md` (the two version pins in "Versioning")
+- `packages/kdb-replica/package.json` and `package-lock.json` (the `@kdb/client` dependency; the
+  replica's own version is independent)
+- `docs/releases/vX.Y.Z.md`
+
+`git grep -n '<old version>' -- VERSION packages/*/package.json packages/*/package-lock.json
+packages/kdb-client/src/version.ts packages/kdb-client/README.md` should then print nothing.
+
 **Release notes** live in `docs/releases/vX.Y.Z.md`, written and reviewed in the same change as
 the `VERSION` bump. `release.yml` passes `generate_release_notes: true`, which produces only the
 commit and PR list, so the prose is pasted onto the GitHub release after the tag is pushed. The
