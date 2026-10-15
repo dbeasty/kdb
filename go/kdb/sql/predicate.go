@@ -219,9 +219,65 @@ func (env *evalEnv) cell(expr Expr, d *evalDoc) Cell {
 		return env.scoreCell(e, d)
 	case ExprBinary, ExprUnary, ExprIn, ExprBetween:
 		return CellBool{Value: env.predicate(expr, d)}
+	case ExprArith:
+		return arith(e.Op, env.cell(e.Left, d), env.cell(e.Right, d))
 	default:
 		return CellNull{}
 	}
+}
+
+// arith applies an ExprArith operator: integer arithmetic when both sides are integers (division
+// truncating toward zero), floating point when either is a double, NULL when either side is not
+// a number or a division is by zero.
+func arith(op byte, l, r Cell) Cell {
+	li, lInt := l.(CellLong)
+	ri, rInt := r.(CellLong)
+	if lInt && rInt {
+		a, b := li.Value, ri.Value
+		switch op {
+		case '+':
+			return CellLong{Value: a + b}
+		case '-':
+			return CellLong{Value: a - b}
+		case '*':
+			return CellLong{Value: a * b}
+		case '/':
+			if b == 0 {
+				return CellNull{}
+			}
+			return CellLong{Value: a / b}
+		}
+		return CellNull{}
+	}
+	a, aok := arithOperand(l)
+	b, bok := arithOperand(r)
+	if !aok || !bok {
+		return CellNull{}
+	}
+	switch op {
+	case '+':
+		return CellDouble{Value: a + b}
+	case '-':
+		return CellDouble{Value: a - b}
+	case '*':
+		return CellDouble{Value: a * b}
+	case '/':
+		if b == 0 {
+			return CellNull{}
+		}
+		return CellDouble{Value: a / b}
+	}
+	return CellNull{}
+}
+
+func arithOperand(c Cell) (float64, bool) {
+	switch v := c.(type) {
+	case CellLong:
+		return float64(v.Value), true
+	case CellDouble:
+		return v.Value, true
+	}
+	return 0, false
 }
 
 // predicate evaluates a boolean expression against one document (§4).

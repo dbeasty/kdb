@@ -145,6 +145,12 @@ func writeExprSkeleton(b *strings.Builder, e Expr) {
 		fmt.Fprintf(b, " %s ", binaryOpToken(ex.Op))
 		writeExprSkeleton(b, ex.Right)
 		b.WriteByte(')')
+	case ExprArith:
+		b.WriteByte('(')
+		writeExprSkeleton(b, ex.Left)
+		fmt.Fprintf(b, " %c ", ex.Op)
+		writeExprSkeleton(b, ex.Right)
+		b.WriteByte(')')
 	case ExprUnary:
 		fmt.Fprintf(b, "%s(", unaryOpToken(ex.Op))
 		writeExprSkeleton(b, ex.Expr)

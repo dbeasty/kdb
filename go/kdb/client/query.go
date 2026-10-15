@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
 
@@ -110,18 +111,56 @@ func typedCell(cell string, kind wire.CellKind) (any, error) {
 // It returns the number of rows the statement affected, so a DELETE that matched nothing is
 // distinguishable from one that removed a row. Concurrent calls on one namespace are safe.
 func (c *Client) Exec(ctx context.Context, ns string, sqlText string, args []any) (int, error) {
+	result, err := c.execAutoCommit(ctx, ns, sqlText, args)
+	return result.rowsAffected, err
+}
+
+// ExecReturning runs an UPDATE ... [ORDER BY ...] [LIMIT n] RETURNING ... and returns the rows
+// RETURNING produced - one per updated document, as it is after the update - with cells typed as
+// QueryValues types them. It is the atomic queue claim (MongoDB's findOneAndUpdate):
+//
+//	UPDATE docs SET status = 'processing', attempts = attempts + 1
+//	 WHERE _c = 'jobs' AND status = 'pending' AND attempts < 3
+//	 ORDER BY createdAt LIMIT 1 RETURNING kdb_id, _doc
+//
+// The server selects the documents and commits the update in one step under its write gate, so
+// concurrent claims never take the same document and never fail with a version conflict because
+// another claim committed first. No match returns no rows and writes nothing. The statement
+// commits on its own: it is refused while the session has an open transaction with pending
+// writes. Any other DML statement is run and auto-committed as Exec runs it, returning no rows.
+func (c *Client) ExecReturning(ctx context.Context, ns string, sqlText string, args []any) (columns []string, rows [][]any, err error) {
+	result, err := c.execAutoCommit(ctx, ns, sqlText, args)
+	if err != nil {
+		return nil, nil, err
+	}
+	rows, err = typedRows(result.Rows, result.cellKinds)
+	return result.Columns, rows, err
+}
+
+// execAutoCommit sends one statement and, when the server left writes pending on the session for
+// it, commits them.
+func (c *Client) execAutoCommit(ctx context.Context, ns string, sqlText string, args []any) (sqlExecResult, error) {
 	st, err := c.ensureNamespace(ctx, ns)
 	if err != nil {
-		return 0, err
+		return sqlExecResult{}, err
 	}
 	st.dml.Lock()
 	defer st.dml.Unlock()
 	result, err := c.execSqlOnSession(ctx, ns, st.sessionID, sqlText, args)
 	if err != nil {
-		return 0, err
+		return sqlExecResult{}, err
 	}
 	if !result.needsCommit {
-		return result.rowsAffected, nil
+		if result.rowsAffected > 0 && result.resolvedHex != "" {
+			// A write the server committed on its own (an UPDATE with ORDER BY, LIMIT or
+			// RETURNING): the commit it made is the head this client now knows.
+			if h, err := codec.HashFromHex(result.resolvedHex); err == nil {
+				st.mu.Lock()
+				st.head = h
+				st.mu.Unlock()
+			}
+		}
+		return result, nil
 	}
 	commitMsg := wire.TxCommitMessage{
 		H:         wire.Header{MessageType: wire.MsgTxCommit, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: c.nextCorrelation()},
@@ -130,19 +169,19 @@ func (c *Client) Exec(ctx context.Context, ns string, sqlText string, args []any
 	}
 	reply, err := c.request(ctx, commitMsg)
 	if err != nil {
-		return 0, err
+		return sqlExecResult{}, err
 	}
 	switch r := reply.(type) {
 	case wire.ConflictReportMessage:
-		return 0, decodeConflictError(r.ReportBytes, r.RetryAfterMs)
+		return sqlExecResult{}, decodeConflictError(r.ReportBytes, r.RetryAfterMs)
 	case wire.SqlResultMessage:
 		if r.Error != nil {
-			return 0, classifiedError(*r.Error, r.ErrorCode, r.RetryAfterMs)
+			return sqlExecResult{}, classifiedError(*r.Error, r.ErrorCode, r.RetryAfterMs)
 		}
 		// The statement's count, not the commit's: the commit reports operations applied.
-		return result.rowsAffected, nil
+		return result, nil
 	default:
-		return 0, fmt.Errorf("kdb: unexpected commit response %T", reply)
+		return sqlExecResult{}, fmt.Errorf("kdb: unexpected commit response %T", reply)
 	}
 }
 

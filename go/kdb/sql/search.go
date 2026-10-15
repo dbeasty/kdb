@@ -153,6 +153,9 @@ func forEachChild(e Expr, visit func(Expr)) {
 	case ExprBinary:
 		visit(ex.Left)
 		visit(ex.Right)
+	case ExprArith:
+		visit(ex.Left)
+		visit(ex.Right)
 	case ExprUnary:
 		visit(ex.Expr)
 	case ExprFunctionCall:

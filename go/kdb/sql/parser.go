@@ -449,14 +449,27 @@ func (p *rdParser) parseUpdate() (UpdateStatement, error) {
 			break
 		}
 	}
-	var where Expr
+	upd := UpdateStatement{Table: table, Assignments: assignments, Attachments: attachments}
 	if p.matchKeyword("WHERE") {
-		where, err = p.parseExpr()
+		upd.Where, err = p.parseExpr()
 		if err != nil {
 			return UpdateStatement{}, err
 		}
 	}
-	return UpdateStatement{Table: table, Assignments: assignments, Where: where, Attachments: attachments}, nil
+	// The claim clauses (UpdateStatement.Immediate): which matching documents to update, and
+	// what to hand back about them.
+	if upd.OrderBy, err = p.parseOrderBy(); err != nil {
+		return UpdateStatement{}, err
+	}
+	if upd.Limit, err = p.parseLimit(); err != nil {
+		return UpdateStatement{}, err
+	}
+	if p.matchKeyword("RETURNING") {
+		if upd.Returning, err = p.parseProjections(); err != nil {
+			return UpdateStatement{}, err
+		}
+	}
+	return upd, nil
 }
 
 func (p *rdParser) parseDelete() (DeleteStatement, error) {
@@ -518,40 +531,15 @@ func (p *rdParser) parseSelectQuery() (SelectQuery, error) {
 			}
 		}
 	}
-	var orderBy []OrderItem
-	if p.matchKeyword("ORDER") {
-		if err := p.expectKeyword("BY"); err != nil {
-			return SelectQuery{}, err
-		}
-		for {
-			expr, err := p.parseExpr()
-			if err != nil {
-				return SelectQuery{}, err
-			}
-			asc := true
-			if p.matchKeyword("DESC") {
-				asc = false
-			} else {
-				p.matchKeyword("ASC")
-			}
-			orderBy = append(orderBy, OrderItem{Expr: expr, Ascending: asc})
-			if !p.matchChar(',') {
-				break
-			}
-		}
+	orderBy, err := p.parseOrderBy()
+	if err != nil {
+		return SelectQuery{}, err
 	}
-	var limit *int
+	limit, err := p.parseLimit()
+	if err != nil {
+		return SelectQuery{}, err
+	}
 	offset := 0
-	if p.matchKeyword("LIMIT") {
-		n, err := p.readInt()
-		if err != nil {
-			return SelectQuery{}, err
-		}
-		if n < 0 {
-			return SelectQuery{}, p.parseError("LIMIT must not be negative")
-		}
-		limit = &n
-	}
 	if p.matchKeyword("OFFSET") {
 		n, err := p.readInt()
 		if err != nil {
@@ -566,6 +554,49 @@ func (p *rdParser) parseSelectQuery() (SelectQuery, error) {
 		Distinct: distinct, Projections: projections, From: table,
 		Where: where, GroupBy: groupBy, OrderBy: orderBy, Limit: limit, Offset: offset,
 	}, nil
+}
+
+// parseOrderBy reads an optional ORDER BY list.
+func (p *rdParser) parseOrderBy() ([]OrderItem, error) {
+	if !p.matchKeyword("ORDER") {
+		return nil, nil
+	}
+	if err := p.expectKeyword("BY"); err != nil {
+		return nil, err
+	}
+	var orderBy []OrderItem
+	for {
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		asc := true
+		if p.matchKeyword("DESC") {
+			asc = false
+		} else {
+			p.matchKeyword("ASC")
+		}
+		orderBy = append(orderBy, OrderItem{Expr: expr, Ascending: asc})
+		if !p.matchChar(',') {
+			break
+		}
+	}
+	return orderBy, nil
+}
+
+// parseLimit reads an optional LIMIT n.
+func (p *rdParser) parseLimit() (*int, error) {
+	if !p.matchKeyword("LIMIT") {
+		return nil, nil
+	}
+	n, err := p.readInt()
+	if err != nil {
+		return nil, err
+	}
+	if n < 0 {
+		return nil, p.parseError("LIMIT must not be negative")
+	}
+	return &n, nil
 }
 
 // parseTableRef reads "name [AS] [alias]". A bare word after the table name is an alias unless
@@ -602,7 +633,7 @@ var clauseKeywords = map[string]bool{
 	"FROM": true, "HAVING": true, "ON": true, "USING": true, "WITH": true, "AND": true,
 	"OR": true, "NOT": true, "AS": true, "VALUES": true, "INTO": true, "BY": true,
 	"ASC": true, "DESC": true, "JOIN": true, "INNER": true, "LEFT": true, "UNION": true,
-	"IS": true, "IN": true, "LIKE": true, "ILIKE": true, "BETWEEN": true,
+	"IS": true, "IN": true, "LIKE": true, "ILIKE": true, "BETWEEN": true, "RETURNING": true,
 }
 
 func (p *rdParser) peekIdentifierIsAlias() bool {
@@ -702,7 +733,7 @@ func (p *rdParser) parseNot() (Expr, error) {
 }
 
 func (p *rdParser) parseComparison() (Expr, error) {
-	left, err := p.parsePrimary()
+	left, err := p.parseAdditive()
 	if err != nil {
 		return nil, err
 	}
@@ -792,11 +823,53 @@ func (p *rdParser) parseComparison() (Expr, error) {
 	default:
 		return left, nil
 	}
-	right, err := p.parsePrimary()
+	right, err := p.parseAdditive()
 	if err != nil {
 		return nil, err
 	}
 	return ExprBinary{Op: op, Left: left, Right: right}, nil
+}
+
+// parseAdditive reads `a + b` and `a - b`, left-associative, over parseMultiplicative.
+func (p *rdParser) parseAdditive() (Expr, error) {
+	left, err := p.parseMultiplicative()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		p.skipWS()
+		op := p.peek()
+		if op != '+' && op != '-' {
+			return left, nil
+		}
+		p.consume()
+		right, err := p.parseMultiplicative()
+		if err != nil {
+			return nil, err
+		}
+		left = ExprArith{Op: op, Left: left, Right: right}
+	}
+}
+
+// parseMultiplicative reads `a * b` and `a / b`, left-associative, over parsePrimary.
+func (p *rdParser) parseMultiplicative() (Expr, error) {
+	left, err := p.parsePrimary()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		p.skipWS()
+		op := p.peek()
+		if op != '*' && op != '/' {
+			return left, nil
+		}
+		p.consume()
+		right, err := p.parsePrimary()
+		if err != nil {
+			return nil, err
+		}
+		left = ExprArith{Op: op, Left: left, Right: right}
+	}
 }
 
 func negate(negated bool, e Expr) Expr {

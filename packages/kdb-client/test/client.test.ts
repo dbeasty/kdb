@@ -601,6 +601,35 @@ describe("SQL", () => {
     assert.equal(server.requests.filter((r) => r.kind === "txCommit").length, 1);
   });
 
+  it("returns typed RETURNING rows from execReturning without a commit of its own", async () => {
+    const HEAD_CLAIM = "22".repeat(32);
+    const server = new FakeServer((request) => {
+      if (request.kind === "sessionBegin") return sessionAck(NS);
+      if (request.kind === "sqlExec") {
+        // The server committed the claim itself: readOnly, with the commit it made.
+        return {
+          kind: "sqlResult" as const,
+          payload: {
+            namespace: NS, sessionId: "sess-1", columns: ["kdb_id", "_doc", "attempts"],
+            rows: [["j1", '{"status":"processing","attempts":1}', "1"]], cellKinds: "052",
+            rowsAffected: 1, resolvedCommitHex: HEAD_CLAIM, readOnly: true, generatedIds: [],
+          },
+        };
+      }
+      return sqlOk(NS, HEAD_ONE);
+    });
+    const client = new Client(server);
+    const result = await client.execReturning(NS, "UPDATE docs SET status = 'processing' ORDER BY createdAt LIMIT 1 RETURNING kdb_id, _doc, attempts");
+    assert.deepEqual(result.columns, ["kdb_id", "_doc", "attempts"]);
+    assert.deepEqual(result.rows, [["j1", { status: "processing", attempts: 1 }, 1]]);
+    assert.equal(result.rowsAffected, 1);
+    assert.equal(server.requests.filter((r) => r.kind === "txCommit").length, 0);
+    // The cached head follows the claim's commit, so the next putJSON anchors on it.
+    await client.putJSON(NS, "00000000-0000-4000-8000-000000000001", { a: 1 });
+    const commit = server.requests.find((r) => r.kind === "txCommit");
+    assert.equal(decodeTx(commit!).baseVersionHex, HEAD_CLAIM);
+  });
+
   it("returns the rows a statement affected, and 0 for a delete that matched nothing", async () => {
     const server = new FakeServer((request) => {
       if (request.kind === "sessionBegin") return sessionAck(NS);

@@ -70,7 +70,7 @@ func main() {
 	fs.Int64Var(&c.seed, "seed", 1, "dataset seed")
 	fs.IntVar(&c.dims, "dims", 768, "embedding length (0: none)")
 	fs.IntVar(&c.batch, "batch", 200, "documents per load commit")
-	fs.StringVar(&c.profile, "profile", "mixed", "bench profile: mixed, read-heavy, write-heavy, claim")
+	fs.StringVar(&c.profile, "profile", "mixed", "bench profile: mixed, read-heavy, write-heavy, claim, claim-atomic")
 	fs.IntVar(&c.sessions, "users", 8, "concurrent simulated users (bench)")
 	fs.DurationVar(&c.duration, "duration", 30*time.Second, "measured window (bench)")
 	fs.DurationVar(&c.warmup, "warmup", 5*time.Second, "warmup before the window (bench)")
@@ -432,6 +432,9 @@ type sim struct {
 	d  *dataset
 	cl *client.Client
 	r  *rand.Rand
+	// won counts claims that took a job (a claim profile's action can also lose a race, or find
+	// the queue empty, and still succeed).
+	won *atomic.Int64
 }
 
 const leanPageRows = 5000
@@ -666,12 +669,46 @@ func (s *sim) claim(ctx context.Context) error {
 	}
 	m["status"] = "processing"
 	nb, _ := json.Marshal(m)
-	if _, err := s.cl.ReplaceIf(ctx, s.c.namespace, id, nb, hash); err != nil && !strings.Contains(strings.ToLower(err.Error()), "precondition") {
-		return err
+	if _, err := s.cl.ReplaceIf(ctx, s.c.namespace, id, nb, hash); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "precondition") {
+			return err
+		}
+		return nil // lost the race: nothing taken, nothing to requeue
 	}
+	s.won.Add(1)
 	// Requeue so the queue never drains.
 	m["status"] = "pending"
 	nb, _ = json.Marshal(m)
+	_, err = s.cl.ReplaceJSON(ctx, s.c.namespace, id, nb)
+	return err
+}
+
+// claimAtomic is the same claim as one statement: the server picks the oldest pending job and
+// takes it under its write gate (UPDATE ... ORDER BY ... LIMIT 1 RETURNING), so there is no race
+// to lose. The requeue is the same whole-document replace as claim's.
+func (s *sim) claimAtomic(ctx context.Context) error {
+	_, rows, err := s.cl.ExecReturning(ctx, s.c.namespace, `UPDATE docs SET status = 'processing', attempts = attempts + 1
+		WHERE _c = ? AND status = ? AND attempts < ? ORDER BY createdAt LIMIT 1 RETURNING kdb_id, _doc`,
+		[]any{"embeddingJobs", "pending", 3})
+	if err != nil || len(rows) == 0 {
+		return err
+	}
+	s.won.Add(1)
+	id := fmt.Sprint(rows[0][0])
+	raw, ok := rows[0][1].(json.RawMessage)
+	if !ok {
+		return fmt.Errorf("claim-atomic: _doc is %T", rows[0][1])
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return err
+	}
+	// Requeue as it was, so the queue never drains.
+	m["status"] = "pending"
+	if a, ok := m["attempts"].(float64); ok {
+		m["attempts"] = a - 1
+	}
+	nb, _ := json.Marshal(m)
 	_, err = s.cl.ReplaceJSON(ctx, s.c.namespace, id, nb)
 	return err
 }
@@ -752,24 +789,27 @@ func bench(c config, d *dataset) error {
 	}
 	stats := &opStats{lat: map[string][]time.Duration{}, errs: map[string]int{}, last: map[string]string{}}
 	var measuring atomic.Bool
-	var total atomic.Int64
+	var total, won atomic.Int64
+	var wonAtStart int64
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	for i := 0; i < c.sessions; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			s := &sim{c: c, d: d, cl: clients[i], r: rand.New(rand.NewSource(c.seed*1000 + int64(i)))}
+			s := &sim{c: c, d: d, cl: clients[i], r: rand.New(rand.NewSource(c.seed*1000 + int64(i))), won: &won}
 			for {
 				select {
 				case <-stop:
 					return
 				default:
 				}
-				name := "claim"
+				name := c.profile
 				var run func(context.Context) error
 				if c.profile == "claim" {
 					run = s.claim
+				} else if c.profile == "claim-atomic" {
+					run = s.claimAtomic
 				} else {
 					x := s.r.Float64() * acc
 					a := actions[sort.SearchFloat64s(cum, x)]
@@ -792,14 +832,19 @@ func bench(c config, d *dataset) error {
 		}(i)
 	}
 	time.Sleep(c.warmup)
+	wonAtStart = won.Load()
 	measuring.Store(true)
 	t0 := time.Now()
 	time.Sleep(c.duration)
 	measuring.Store(false)
+	wonInWindow := won.Load() - wonAtStart
 	window := time.Since(t0)
 	close(stop)
 	wg.Wait()
 	fmt.Printf("profile %s, %d users, %v: %.1f actions/s\n", c.profile, c.sessions, window.Round(time.Second), float64(total.Load())/window.Seconds())
+	if strings.HasPrefix(c.profile, "claim") {
+		fmt.Printf("jobs claimed: %.1f/s\n", float64(wonInWindow)/window.Seconds())
+	}
 	names := make([]string, 0, len(stats.lat))
 	for n := range stats.lat {
 		names = append(names, n)
@@ -835,7 +880,7 @@ func probe(c config, d *dataset) error {
 		return err
 	}
 	defer cl.Close()
-	s := &sim{c: c, d: d, cl: cl, r: rand.New(rand.NewSource(c.seed))}
+	s := &sim{c: c, d: d, cl: cl, r: rand.New(rand.NewSource(c.seed)), won: new(atomic.Int64)}
 	ctx := context.Background()
 	u := 0
 	where, args := s.accessFilter(u)

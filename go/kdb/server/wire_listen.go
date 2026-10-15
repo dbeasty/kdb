@@ -682,7 +682,78 @@ func (h *sqlWireConnHandler) handleSqlExec(msg wire.SqlExecMessage) wire.Message
 	if isSelect || isDDL {
 		return h.execRead(msg, sess, target, params, stmt)
 	}
+	if upd, ok := sql.ImmediateUpdate(stmt); ok {
+		return h.execImmediateUpdate(msg, sess, target, params, upd)
+	}
 	return h.execDML(msg, sess, target, params)
+}
+
+// execImmediateUpdate runs an UPDATE with ORDER BY, LIMIT or RETURNING - a queue claim - as its
+// own statement: selected, written and committed in one step under the write gate
+// (KdbServerRuntime.ExecImmediateUpdate), not buffered on the session. The reply carries the
+// RETURNING rows and the commit, and is ReadOnly like a DDL statement's, because there is nothing
+// left for the client to commit: a client that auto-commits after a write (Exec) must not send a
+// TX_COMMIT for it.
+func (h *sqlWireConnHandler) execImmediateUpdate(msg wire.SqlExecMessage, sess *KdbSession, target sqlTarget, params []sql.Parameter, upd sql.UpdateStatement) wire.Message {
+	if !target.own {
+		return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID,
+			"UPDATE with ORDER BY, LIMIT or RETURNING runs only on the session's own namespace")
+	}
+	if sess.hasPendingWrites() {
+		// It commits on its own, and it cannot take the open transaction's writes with it.
+		return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID,
+			"UPDATE with ORDER BY, LIMIT or RETURNING commits on its own; COMMIT or ROLLBACK the open transaction first")
+	}
+	rt := target.rt
+	qctx := sql.QueryContext{
+		NamespaceID: sess.NamespaceID,
+		Schema:      rt.Schema(),
+		Parameters:  params,
+		MaxRows:     rt.MaxResultRows(),
+		RowBudget:   int(rt.admission.ScanRowBudget()),
+	}
+	// Refused before it commits, not after: a claim whose reply cannot be sent must not take
+	// the documents.
+	check := func(res sql.DMLResult) error {
+		if max := rt.MaxResultRows(); max > 0 && len(res.Rows) > max {
+			return &sql.ResultRowLimitError{Limit: max}
+		}
+		rows, _ := rowsToStrings(res.Rows)
+		if fit, _ := boundResultRows(rows, rt.MaxResultBytes()); fit < len(rows) {
+			total := 0
+			for _, row := range rows {
+				total += rowEncodedBytes(row)
+			}
+			return &ReplyTooLargeError{Bytes: total, Limit: rt.MaxResultBytes(), What: "result",
+				Remedy: "add a LIMIT or return fewer columns"}
+		}
+		return nil
+	}
+	out, err := rt.ExecImmediateUpdate(upd, qctx, sess.Principal, sess.ID.Value, check)
+	if err != nil {
+		var conflictErr *ConflictError
+		if asError(err, &conflictErr) {
+			return conflictReport(msg.H.CorrelationID, msg.Namespace, conflictErr)
+		}
+		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
+	}
+	if out.Committed {
+		// As after any commit of this session's: the next transaction anchors on - and a
+		// SNAPSHOT session reads at - the commit just made.
+		sess.startTransactionAt(out.Commit.Hash)
+	}
+	rows, kinds := rowsToStrings(out.DML.Rows)
+	return wire.SqlResultMessage{
+		H:                 header(msg.H.CorrelationID, wire.MsgSqlResult),
+		Namespace:         msg.Namespace,
+		SessionID:         msg.SessionID,
+		Columns:           columnNames(out.DML.Columns),
+		Rows:              rows,
+		CellKinds:         kinds,
+		RowsAffected:      out.DML.RowsAffected,
+		ResolvedCommitHex: out.Head.Hex(),
+		ReadOnly:          true,
+	}
 }
 
 // classifyStatement sorts a parsed statement into the three paths handleSqlExec has: a SELECT

@@ -59,8 +59,21 @@ func (d *DMLExecutor) ExecuteInsert(insert InsertStatement, ctx QueryContext) ([
 // ExecuteUpdate returns one Write op per matching document with the SET assignments applied.
 // Values are evaluated against the pre-update document; `_doc` replaces the whole body.
 func (d *DMLExecutor) ExecuteUpdate(upd UpdateStatement, ctx QueryContext) ([]document.Op, error) {
+	res, err := d.ExecuteUpdateAmong(upd, ctx, nil)
+	return res.Operations, err
+}
+
+// ExecuteUpdateAmong is ExecuteUpdate over the documents in among only (nil: every document at
+// ctx.AtCommit), with the claim clauses applied: WHERE filters, ORDER BY orders, LIMIT keeps the
+// first n, and RETURNING projects each updated document as it is after the update into the
+// result's Columns and Rows (in ORDER BY order).
+//
+// among is how the server keeps an immediate UPDATE's work under its write gate small: it names
+// the candidates found before the gate (UpdateCandidates) plus whatever changed since, and this
+// re-checks every one of them at the live head.
+func (d *DMLExecutor) ExecuteUpdateAmong(upd UpdateStatement, ctx QueryContext, among []codec.UUID) (DMLResult, error) {
 	if len(upd.Assignments) == 0 && len(upd.Attachments) == 0 {
-		return nil, NewPlanningError("UPDATE needs at least one assignment", "")
+		return DMLResult{}, NewPlanningError("UPDATE needs at least one assignment", "")
 	}
 	env := newEvalEnv(ctx.Schema, ctx.Parameters, upd.Table)
 	env.attach = ctx.attach
@@ -68,48 +81,163 @@ func (d *DMLExecutor) ExecuteUpdate(upd UpdateStatement, ctx QueryContext) ([]do
 	for _, a := range upd.Assignments {
 		path := stripTableAlias(a.Path, upd.Table)
 		if path == colKdbID {
-			return nil, NewPlanningError("kdb_id cannot be assigned", "")
+			return DMLResult{}, NewPlanningError("kdb_id cannot be assigned", "")
 		}
 		if path != colDoc && !ctx.Schema.IsSchemaless() && !ctx.Schema.HasField(rootSegment(path)) {
-			return nil, NewPlanningError("unknown column: "+path, "")
+			return DMLResult{}, NewPlanningError("unknown column: "+path, "")
 		}
 		if err := v.check(a.Value, false, false); err != nil {
-			return nil, err
+			return DMLResult{}, err
 		}
 	}
-	docs, _, err := d.Executor.matchingDocs(upd.Where, upd.Table, ctx)
+	if err := validateClaimClauses(upd, ctx.Schema); err != nil {
+		return DMLResult{}, err
+	}
+	docs, err := d.updateTargets(upd, ctx, env, among)
 	if err != nil {
-		return nil, err
+		return DMLResult{}, err
 	}
 	var writer *attachmentWriter
 	if len(upd.Attachments) > 0 {
 		writer = newAttachmentWriter(d.Executor, ctx.NamespaceID)
 	}
-	var ops []document.Op
+	var res DMLResult
+	if len(upd.Returning) > 0 {
+		res.Columns = columnsFor(SelectQuery{Projections: upd.Returning, From: upd.Table}, ctx.Schema)
+		res.Rows = []QueryRow{}
+	}
 	for _, ed := range docs {
+		after := ed
 		if writer != nil {
 			attachOps, err := writer.updateAttachmentOps(env, upd.Attachments, ed, ctx.attach.set(ed.doc.ID))
 			if err != nil {
-				return nil, err
+				return DMLResult{}, err
 			}
-			ops = append(ops, attachOps...)
-			if len(upd.Assignments) == 0 {
-				continue
-			}
+			res.Operations = append(res.Operations, attachOps...)
 		}
-		jsonText := ed.doc.JSON
-		for _, a := range upd.Assignments {
-			jsonText, err = assignPath(jsonText, stripTableAlias(a.Path, upd.Table), env.cell(a.Value, ed))
-			if err != nil {
-				return nil, err
+		if len(upd.Assignments) > 0 {
+			jsonText := ed.doc.JSON
+			for _, a := range upd.Assignments {
+				jsonText, err = assignPath(jsonText, stripTableAlias(a.Path, upd.Table), env.cell(a.Value, ed))
+				if err != nil {
+					return DMLResult{}, err
+				}
 			}
+			if err := validateJSON(ed.doc.ID, jsonText, ctx.Schema); err != nil {
+				return DMLResult{}, err
+			}
+			res.Operations = append(res.Operations, document.WriteOp{DocID: ed.doc.ID, Patch: jsonText})
+			after = newEvalDoc(document.Document{ID: ed.doc.ID, JSON: jsonText})
 		}
-		if err := validateJSON(ed.doc.ID, jsonText, ctx.Schema); err != nil {
+		if len(upd.Returning) > 0 {
+			res.Rows = append(res.Rows, QueryRow{Values: projectRow(upd.Returning, env, after)})
+		}
+	}
+	res.RowsAffected = rowsAffected(res.Operations)
+	if len(upd.Returning) > 0 || upd.Immediate() {
+		// Documents updated, not operations: an attachment change is still one row.
+		res.RowsAffected = len(docs)
+	}
+	return res, nil
+}
+
+// validateClaimClauses checks an UPDATE's ORDER BY and RETURNING the way a SELECT's are checked,
+// and refuses aggregates in them: there is one returned row per updated document.
+func validateClaimClauses(upd UpdateStatement, sch schema.KdbSchema) error {
+	if !upd.Immediate() {
+		return nil
+	}
+	projections := upd.Returning
+	if len(projections) == 0 {
+		projections = []Projection{ProjStar{}}
+	}
+	q := SelectQuery{Projections: projections, From: upd.Table, Where: upd.Where, OrderBy: upd.OrderBy, Limit: upd.Limit}
+	if isGroupedQuery(q) {
+		return NewPlanningError("RETURNING and ORDER BY of an UPDATE cannot use aggregates", "")
+	}
+	return validateSelect(q, sch)
+}
+
+// updateTargets resolves the documents an UPDATE writes, in the order it writes them.
+func (d *DMLExecutor) updateTargets(upd UpdateStatement, ctx QueryContext, env *evalEnv, among []codec.UUID) ([]*evalDoc, error) {
+	var docs []*evalDoc
+	var err error
+	q := SelectQuery{Projections: []Projection{ProjStar{}}, From: upd.Table, Where: upd.Where, OrderBy: upd.OrderBy, Limit: upd.Limit}
+	switch {
+	case among != nil:
+		if err := d.Executor.resolveSearches(q, env, ctx); err != nil {
 			return nil, err
 		}
-		ops = append(ops, document.WriteOp{DocID: ed.doc.ID, Patch: jsonText})
+		docs, err = d.Executor.materialize(among, upd.Where, env, ctx)
+	case upd.Limit != nil && len(upd.OrderBy) > 0 && *upd.Limit <= maxTopK:
+		// Only the best LIMIT rows are kept as the candidates stream (topk.go).
+		if err := d.Executor.resolveSearches(q, env, ctx); err != nil {
+			return nil, err
+		}
+		docs, _, err = d.Executor.topKDocs(q, upd.Where, env, ctx, *upd.Limit)
+	default:
+		docs, _, err = d.Executor.matchingDocs(upd.Where, upd.Table, ctx)
 	}
-	return ops, nil
+	if err != nil {
+		return nil, err
+	}
+	if len(upd.OrderBy) > 0 {
+		keys := make([][]Cell, len(docs))
+		for i, ed := range docs {
+			k := make([]Cell, len(upd.OrderBy))
+			for j, o := range upd.OrderBy {
+				k[j] = env.cell(o.Expr, ed)
+			}
+			keys[i] = k
+		}
+		docs = sortByKeys(docs, keys, upd.OrderBy)
+	}
+	if upd.Limit != nil && len(docs) > *upd.Limit {
+		docs = docs[:*upd.Limit]
+	}
+	return docs, nil
+}
+
+// UpdateCandidates returns the ids of the first k documents an immediate UPDATE would pick at
+// ctx.AtCommit, in its ORDER BY order (any order without one), and complete=true when fewer than
+// k documents match - so the list is every match. It reads, never writes: the server calls it
+// before its write gate, and re-checks the ids under the gate with ExecuteUpdateAmong.
+func (d *DMLExecutor) UpdateCandidates(upd UpdateStatement, ctx QueryContext, k int) (ids []codec.UUID, complete bool, err error) {
+	if err := validateClaimClauses(upd, ctx.Schema); err != nil {
+		return nil, false, err
+	}
+	q := SelectQuery{
+		Projections: []Projection{ProjColumn{Name: colKdbID}},
+		From:        upd.Table, Where: upd.Where, OrderBy: upd.OrderBy, Limit: &k,
+	}
+	plan, residual, err := DefaultPlanner{}.PlanSelect(q, ctx.Schema)
+	if err != nil {
+		return nil, false, err
+	}
+	ctx.Page = nil
+	if ctx.MaxRows <= 0 || ctx.MaxRows < k {
+		ctx.MaxRows = k
+	}
+	res, err := d.Executor.ExecuteSelect(q, plan, residual, ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	ids = make([]codec.UUID, 0, len(res.Rows))
+	for _, row := range res.Rows {
+		if len(row.Values) == 0 {
+			continue
+		}
+		s, ok := row.Values[0].(CellString)
+		if !ok {
+			continue
+		}
+		id, err := codec.ParseUUID(s.Value)
+		if err != nil {
+			return nil, false, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, len(ids) < k, nil
 }
 
 // ExecuteDelete returns one Delete op per matching document.

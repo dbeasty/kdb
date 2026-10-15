@@ -295,6 +295,56 @@ for (const jsonOnly of [false, true]) describe(`live interop against the Go serv
     assert.ok(owner === "p1" || owner === "p2");
   });
 
+  // Before "runs SQL": that case's CREATE TABLE gives the namespace a schema these jobs would not
+  // satisfy. The jobs are deleted at the end, so later cases see the namespace as before.
+  it("claims each queued job exactly once with execReturning, across concurrent clients", async () => {
+    const jobs = 40;
+    const kind = `jobs-${randomUuid()}`;
+    for (let n = 0; n < jobs; n++) {
+      await client.putJSON(NS, randomUuid(), {
+        _c: kind, status: "pending", attempts: 0, createdAt: `t${String(n).padStart(4, "0")}`, n,
+      });
+    }
+    const claim = `UPDATE docs SET status = 'processing', attempts = attempts + 1
+      WHERE _c = ? AND status = 'pending' AND attempts < 3
+      ORDER BY createdAt LIMIT 1 RETURNING kdb_id, _doc, attempts`;
+
+    // One claim on its own first: the oldest job, returned as it is after the update.
+    const first = await client.execReturning(NS, claim, [kind]);
+    assert.deepEqual(first.columns, ["kdb_id", "_doc", "attempts"]);
+    assert.equal(first.rows.length, 1);
+    const doc = first.rows[0]![1] as { status: string; attempts: number; n: number };
+    assert.equal(doc.status, "processing");
+    assert.equal(doc.attempts, 1);
+    assert.equal(doc.n, 0);
+    assert.equal(first.rows[0]![2], 1);
+
+    const workers = await Promise.all(
+      Array.from({ length: 6 }, () => connect(serverUri, { requestTimeoutMs: 15_000, jsonOnly })),
+    );
+    try {
+      const claimed: number[] = [doc.n];
+      await Promise.all(
+        workers.map(async (worker) => {
+          for (;;) {
+            const { rows } = await worker.execReturning(NS, claim, [kind]);
+            if (rows.length === 0) return;
+            claimed.push((rows[0]![1] as { n: number }).n);
+          }
+        }),
+      );
+      assert.equal(claimed.length, jobs, "every job claimed, none twice");
+      assert.deepEqual([...claimed].sort((a, b) => a - b), Array.from({ length: jobs }, (_, i) => i));
+    } finally {
+      await Promise.all(workers.map((w) => w.close()));
+    }
+    // An empty queue returns no rows and is not an error; exec runs the claim without a commit
+    // round trip of its own.
+    assert.equal((await client.execReturning(NS, claim, [kind])).rows.length, 0);
+    assert.equal(await client.exec(NS, claim, [kind]), 0);
+    assert.equal(await client.exec(NS, "DELETE FROM docs WHERE _c = ?", [kind]), jobs);
+  });
+
   it("runs SQL over the same connection", async () => {
     // Real statements against a real table: KDB's SQL requires a FROM clause, so `SELECT 1` is
     // not a usable smoke test here (see the next case for what it does do).
