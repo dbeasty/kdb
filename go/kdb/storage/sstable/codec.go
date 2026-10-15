@@ -681,8 +681,23 @@ func (r *DefaultReader) readFooterIndexLen(size int64) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return readInt(tail, 0), nil
+	if len(tail) != footerTrailerSize {
+		return 0, fmt.Errorf("%w: %s: short read of the footer trailer", ErrCorruptTable, r.handle.SegmentName)
+	}
+	indexLen := readInt(tail, 0)
+	// A footer is magic(4) indexLen(4) index fileHash(32) trailer(4): it cannot be longer than the
+	// file. A length past that is a damaged table, and must not reach the callers that size an
+	// allocation or a read from it (a compaction would try to hold a 450 MB "index" and never finish).
+	if indexLen < 0 || int64(indexLen) > size-40-footerTrailerSize {
+		return 0, fmt.Errorf("%w: %s: footer declares a %d-byte index in a %d-byte table", ErrCorruptTable, r.handle.SegmentName, indexLen, size)
+	}
+	return indexLen, nil
 }
+
+// ErrCorruptTable marks an sstable whose structure is damaged (its footer cannot be right). It is
+// a verdict about the file, not the I/O: retrying will not help, and the table needs repair or
+// replacement from a peer or backup.
+var ErrCorruptTable = errors.New("sstable: corrupt table")
 
 func writeInt(arr []byte, off, v int) {
 	arr[off] = byte(v >> 24)

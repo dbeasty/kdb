@@ -305,6 +305,7 @@ func graphSettingsFromEnv() dag.GraphSettings {
 		FileEnabled:     envBoolDefault("KDB_GRAPH_FILE", true),
 		RebuildCommits:  envInt("KDB_GRAPH_REBUILD_COMMITS"),
 		MaxSegments:     envInt("KDB_GRAPH_MAX_SEGMENTS"),
+		ChunkBytes:      envInt("KDB_GRAPH_CHUNK_BYTES"),
 		AnchorInterval:  envInt("KDB_HISTORY_ANCHOR_INTERVAL"),
 		Memory:          envGraphMemory(),
 	}
