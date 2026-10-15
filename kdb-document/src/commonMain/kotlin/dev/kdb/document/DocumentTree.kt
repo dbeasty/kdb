@@ -44,6 +44,20 @@ public data class DocumentTree(
 
     public fun hashFor(docId: KdbUuid): KdbHash? = entries[docId]
 
+    /**
+     * The ids in canonical order (UUID byte order, the order of their lowercase strings), from the
+     * first id after [after], or from the first id when it is null. A paging reader resumes from its
+     * cursor in O(depth + page) through the trie instead of sorting every id per page.
+     */
+    public fun idsAfter(after: KdbUuid?): Iterator<KdbUuid> {
+        val leaves = TrieLeafIterator(trieRoot, after)
+        return object : Iterator<KdbUuid> {
+            override fun hasNext(): Boolean = leaves.hasNext()
+
+            override fun next(): KdbUuid = leaves.next().uuid
+        }
+    }
+
     public fun with(
         docId: KdbUuid,
         contentHash: KdbHash,
