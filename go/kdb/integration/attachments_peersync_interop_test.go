@@ -74,7 +74,7 @@ func kotlinCLIErr(repo string, args ...string) (string, error) {
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	err := cmd.Run()
-	return out.String(), err
+	return strings.ReplaceAll(out.String(), "\r\n", "\n"), err
 }
 
 func writeTemp(t *testing.T, name string, data []byte) string {

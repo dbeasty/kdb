@@ -39,14 +39,25 @@ func openHeapPerCommit(t *testing.T, commits int) float64 {
 	}
 	rt.Close()
 
+	// What the open adds, not the whole process's heap: the package's earlier tests leave state
+	// behind (about 5 MB in a full run), which would otherwise count as this namespace's cost and
+	// made the figure depend on which tests ran first.
+	heap := func() uint64 {
+		runtime.GC()
+		runtime.GC()
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		return m.HeapAlloc
+	}
+	before := heap()
 	re := open()
-	runtime.GC()
-	runtime.GC()
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
+	after := heap()
 	runtime.KeepAlive(re)
 	re.Close()
-	return float64(m.HeapAlloc) / float64(commits)
+	if after < before {
+		return 0
+	}
+	return float64(after-before) / float64(commits)
 }
 
 // TestOpenCostPerCommitDoesNotGrow guards the shape of what holding a

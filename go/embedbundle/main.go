@@ -258,10 +258,17 @@ func copyDir(src, dst, modulePath string, inClosure map[string]bool) error {
 		return err
 	}
 	for _, e := range entries {
+		name := e.Name()
 		if e.IsDir() {
+			// A package's own testdata (fixtures its tests open by relative path) comes along;
+			// any other subdirectory is a separate package with its own copyDir call, if reachable.
+			if name == "testdata" {
+				if err := copyTree(filepath.Join(src, name), filepath.Join(dst, name)); err != nil {
+					return err
+				}
+			}
 			continue
 		}
-		name := e.Name()
 		srcPath := filepath.Join(src, name)
 		if strings.HasSuffix(name, "_test.go") {
 			skip, err := testFileNeedsOutOfScopeImport(srcPath, modulePath, inClosure)
@@ -322,7 +329,11 @@ func copyTestdata(moduleDir, stageRoot string) error {
 	if _, err := os.Stat(src); os.IsNotExist(err) {
 		return nil
 	}
-	dst := filepath.Join(stageRoot, "testdata")
+	return copyTree(src, filepath.Join(stageRoot, "testdata"))
+}
+
+// copyTree copies the directory tree at src to dst verbatim.
+func copyTree(src, dst string) error {
 	return filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
