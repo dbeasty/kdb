@@ -271,9 +271,10 @@ type ScanEstimateInput struct {
 	// holds one page.
 	PageSize int
 	// Candidates is how many documents the query's index access path yields
-	// (sql.CandidateEstimator), or -1 when unknown (a full scan). No plan holds more documents
-	// than its candidates, whatever the namespace's size.
-	Candidates int
+	// (sql.CandidateEstimator), when CandidatesKnown. No plan holds more documents than its
+	// candidates, whatever the namespace's size. Unknown (the zero value) for a full scan.
+	Candidates      int
+	CandidatesKnown bool
 }
 
 // EstimateScan sizes a SELECT before it runs: learned cell when reliable, structural otherwise.
@@ -315,7 +316,7 @@ func (m *CostModel) structuralScanLocked(in ScanEstimateInput) int64 {
 		return m.base[ClassScan]
 	}
 	rows := int64(in.TreeSize)
-	if in.Candidates >= 0 && int64(in.Candidates) < rows {
+	if in.CandidatesKnown && in.Candidates >= 0 && int64(in.Candidates) < rows {
 		rows = int64(in.Candidates)
 	}
 	if in.Shape.HasOrderBy || in.Shape.HasAggregate {

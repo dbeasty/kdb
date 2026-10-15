@@ -758,12 +758,11 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 	adm := rt.admission
 	if sel, ok := stmt.(sql.StmtSelect); ok && adm != nil {
 		scanIn = ScanEstimateInput{
-			Namespace:  namespaceID,
-			Shape:      sql.ShapeOfSelect(sel.Query),
-			TreeSize:   rt.treeSizeAt(*head),
-			MaxRows:    rt.MaxResultRows(),
-			RowBudget:  int(adm.ScanRowBudget()),
-			Candidates: -1,
+			Namespace: namespaceID,
+			Shape:     sql.ShapeOfSelect(sel.Query),
+			TreeSize:  rt.treeSizeAt(*head),
+			MaxRows:   rt.MaxResultRows(),
+			RowBudget: int(adm.ScanRowBudget()),
 		}
 		if page != nil {
 			scanIn.PageSize = page.Size
@@ -772,6 +771,7 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 			scanIn.Candidates = est.EstimateCandidates(sel.Query, sql.QueryContext{
 				NamespaceID: namespaceID, Schema: rt.Schema(), AtCommit: head, Parameters: params,
 			})
+			scanIn.CandidatesKnown = scanIn.Candidates >= 0
 		}
 		estimate = adm.Costs().EstimateScan(scanIn)
 		grantBytes := estimate

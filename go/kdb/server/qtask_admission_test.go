@@ -27,10 +27,10 @@ func TestScanEstimateIsBoundedByThePlan(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		m.ObserveDocSize("ns", 16<<10)
 	}
-	ordered := ScanEstimateInput{Namespace: "ns", TreeSize: 552_000, MaxRows: 10000, RowBudget: 1_000_000, Candidates: -1,
+	ordered := ScanEstimateInput{Namespace: "ns", TreeSize: 552_000, MaxRows: 10000, RowBudget: 1_000_000,
 		Shape: shapeOf(t, `SELECT kdb_id, _doc FROM docs WHERE userId = ? ORDER BY createdAt`)}
 	whole := m.EstimateScan(ordered)
-	ordered.Candidates = 8136
+	ordered.Candidates, ordered.CandidatesKnown = 8136, true
 	byIndex := m.EstimateScan(ordered)
 	if byIndex >= whole/50 {
 		t.Fatalf("indexed ORDER BY estimate %d, whole-namespace %d: candidates did not bound it", byIndex, whole)
@@ -39,7 +39,7 @@ func TestScanEstimateIsBoundedByThePlan(t *testing.T) {
 		t.Fatalf("indexed estimate %d is below what the candidates hold", byIndex)
 	}
 
-	lean := ScanEstimateInput{Namespace: "ns", TreeSize: 552_000, MaxRows: 10000, RowBudget: 1_000_000, Candidates: -1,
+	lean := ScanEstimateInput{Namespace: "ns", TreeSize: 552_000, MaxRows: 10000, RowBudget: 1_000_000,
 		Shape: shapeOf(t, `SELECT kdb_id, status FROM docs WHERE _c = ? AND kdb_id > ? ORDER BY kdb_id LIMIT 5000`)}
 	if lean.Shape.HasOrderBy {
 		t.Fatal("ORDER BY kdb_id is served as an id-ordered stream, not a sort")
@@ -48,7 +48,7 @@ func TestScanEstimateIsBoundedByThePlan(t *testing.T) {
 		t.Fatalf("ORDER BY kdb_id LIMIT 5000 estimated %d, above a 5000-row stream (%d)", got, max)
 	}
 
-	paged := ScanEstimateInput{Namespace: "ns", TreeSize: 552_000, MaxRows: 10000, Candidates: -1, PageSize: 200,
+	paged := ScanEstimateInput{Namespace: "ns", TreeSize: 552_000, MaxRows: 10000, PageSize: 200,
 		Shape: shapeOf(t, `SELECT kdb_id, _doc FROM docs WHERE _c = ?`)}
 	unpaged := paged
 	unpaged.PageSize = 0
@@ -56,7 +56,7 @@ func TestScanEstimateIsBoundedByThePlan(t *testing.T) {
 		t.Fatalf("a 200-row page estimated %d against %d unpaged", p, u)
 	}
 
-	count := ScanEstimateInput{Namespace: "ns", TreeSize: 552_000, MaxRows: 10000, RowBudget: 1_000_000, Candidates: -1,
+	count := ScanEstimateInput{Namespace: "ns", TreeSize: 552_000, MaxRows: 10000, RowBudget: 1_000_000,
 		Shape: shapeOf(t, `SELECT COUNT(*) FROM docs WHERE _c = ? AND status = ?`)}
 	if got := m.EstimateScan(count); got > 1<<20 {
 		t.Fatalf("COUNT(*) estimated %d; it holds no documents", got)
