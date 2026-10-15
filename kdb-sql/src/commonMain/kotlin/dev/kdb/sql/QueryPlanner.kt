@@ -424,7 +424,17 @@ internal object SqlColumnValidation {
                 checkExpr(expr.right, env, allowAlias)
             }
             is SqlExpr.Unary -> checkExpr(expr.expr, env, allowAlias)
-            is SqlExpr.FunctionCall -> expr.args.forEach { checkExpr(it, env, allowAlias) }
+            is SqlExpr.FunctionCall -> {
+                val name = expr.name.lowercase()
+                if (name == "exists" || name == "all_values") {
+                    if (expr.args.size != 1) throw SqlPlanningException("${name.uppercase()} takes exactly one path", "")
+                    val arg = expr.args[0]
+                    if (arg !is SqlExpr.ColumnRef && arg !is SqlExpr.QualifiedColumn) {
+                        throw SqlPlanningException("${name.uppercase()} takes a path, not an expression", "")
+                    }
+                }
+                expr.args.forEach { checkExpr(it, env, allowAlias) }
+            }
             is SqlExpr.Between -> {
                 checkColumn(expr.column, env, allowAlias = false)
                 checkExpr(expr.low, env, allowAlias)

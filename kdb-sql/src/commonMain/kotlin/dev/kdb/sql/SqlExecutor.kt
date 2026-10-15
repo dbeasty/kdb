@@ -37,8 +37,14 @@ internal class SqlExecutor(
         val deferLimit = query.orderBy.isNotEmpty() || query.distinct
         val stripped = if (deferLimit) stripLimit(plan) else null
         val docIds = resolveDocIds(stripped?.inner ?: plan, context, env)
-        var pairs = materialize(docIds, context, dag)
-        if (query.orderBy.isNotEmpty()) {
+        val topK = if (query.orderBy.isNotEmpty() && !query.distinct && stripped != null) topKBound(stripped) else null
+        var pairs =
+            if (topK != null) {
+                topKPairs(docIds, context, query.orderBy, env, topK)
+            } else {
+                materialize(docIds, context, dag)
+            }
+        if (query.orderBy.isNotEmpty() && topK == null) {
             pairs = sortPairs(pairs, query.orderBy, env)
         }
         var rows = pairs.map { (_, doc) -> QueryRow(projectRow(query.projections, doc, env)) }
@@ -352,6 +358,44 @@ internal class SqlExecutor(
         }
     }
 
+    /** LIMIT + OFFSET when a bounded top-k can serve it, else null (the ordinary sort runs). */
+    private fun topKBound(stripped: StrippedLimit): Int? {
+        val (_, limit, offset) = stripped
+        if (limit < 0 || offset < 0 || limit > SqlTopK.MAX_K || offset > SqlTopK.MAX_K - limit) return null
+        return limit + offset
+    }
+
+    /**
+     * ORDER BY ... LIMIT without materializing every candidate (Go `topKDocs`): documents are read
+     * one at a time and only the best [k] under the ORDER BY are held, each with its sort keys
+     * evaluated once. Returned in final order - exactly the stable full sort's first [k] rows.
+     */
+    private suspend fun topKPairs(
+        docIds: List<KdbUuid>,
+        context: QueryContext,
+        orderBy: List<OrderItem>,
+        env: EvalEnv,
+        k: Int,
+    ): List<Pair<KdbUuid, KdbDocument>> {
+        if (k == 0) return emptyList()
+        val resolved = orderBy.map { resolveAlias(it.expr, env) }
+        val top =
+            SqlTopK<Pair<Pair<KdbUuid, KdbDocument>, List<SqlCell>>>(k) { (_, ka), (_, kb) ->
+                for (i in orderBy.indices) {
+                    val cmp = SqlPredicate.compareTotal(ka[i], kb[i])
+                    if (cmp != 0) return@SqlTopK if (orderBy[i].ascending) cmp else -cmp
+                }
+                0
+            }
+        val atCommit = context.atCommit ?: dag.head()
+        val treeHash = dag.getCommitOrThrow(atCommit).documentTreeHash
+        for (id in docIds) {
+            val doc = storage.getDocument(context.namespaceId, id, treeHash) ?: continue
+            top.offer((id to doc) to resolved.map { SqlPredicate.evalCell(it, doc, env) })
+        }
+        return top.sorted().map { it.first }
+    }
+
     private fun projectRow(
         projections: List<SelectProjection>,
         doc: KdbDocument,
@@ -527,6 +571,7 @@ internal class SqlExecutor(
             isScoreExpr(expr) -> "DOUBLE"
             expr is SqlExpr.FunctionCall && expr.name.lowercase() == "array_length" -> "BIGINT"
             expr is SqlExpr.FunctionCall && expr.name.lowercase().startsWith("array_contains") -> "BOOLEAN"
+            expr is SqlExpr.FunctionCall && expr.name.lowercase() == "exists" -> "BOOLEAN"
             expr is SqlExpr.FunctionCall && expr.name.lowercase() == "count" -> "BIGINT"
             else -> "JSON"
         }
