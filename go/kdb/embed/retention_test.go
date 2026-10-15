@@ -3,7 +3,9 @@ package embed_test
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"testing"
 
@@ -202,22 +204,40 @@ func TestWalkWithOperationsLoadsEvictedOperations(t *testing.T) {
 // Asserted as a ratio between two histories of the same live document
 // rather than as an absolute figure, so it is not a tuning tripwire.
 // Before this work the same comparison was linear in the rewrite count -
-// 8x the history cost 8x the memory. The threshold is 4x rather than
-// something tighter because at these sizes the measurement is dominated by
-// per-runtime fixed costs that have nothing to do with history: a heap
-// profile of the larger case attributes roughly 5MB to the zstd encoder,
-// goroutine stacks and the commit-log writer's buffers, against a live
-// document of 50KB.
+// 8x the history cost 8x the memory - and making open hold every version
+// again still reads 7.8x here.
+//
+// What is measured is the heap one reopen adds over the heap just before
+// it, not the process's whole heap. The whole heap was a few MB of
+// process-wide fixed costs (the zstd encoder, goroutine stacks, the
+// commit-log writer's buffers) against a 50KB live document, and how much
+// of that was resident at the instant it was read depended on the
+// collector and on goroutines left over from earlier runtimes - on loaded
+// machines the ratio crossed 4x about one run in ten with nothing wrong.
+// The per-open delta leaves those costs out; it read 1.54-1.63x over 90
+// runs at GOMAXPROCS 1, 2 and 4 with load averages up to 27. Each history
+// is still reopened several times and the smallest reading kept, as a
+// backstop against a stray allocation landing inside one measurement
+// window: history the runtime retains is in every reading, so the minimum
+// cannot hide it.
 func TestOpenMemoryIsBoundedByLiveData(t *testing.T) {
+	const reopens = 5
 	measure := func(rewrites int) float64 {
 		root := t.TempDir()
 		rt := smallBudgetRuntime(t, root)
 		writeVersions(t, rt, rewrites)
 		rt.Close()
 
-		reopened := smallBudgetRuntime(t, root)
-		defer reopened.Close()
-		return liveHeapMB(reopened)
+		least := math.Inf(1)
+		for i := 0; i < reopens; i++ {
+			before := liveHeapMB()
+			reopened := smallBudgetRuntime(t, root)
+			cost := liveHeapMB() - before
+			runtime.KeepAlive(reopened)
+			reopened.Close()
+			least = math.Min(least, cost)
+		}
+		return least
 	}
 	// Discarded: the first runtime in the process pays one-time costs
 	// (compressor state, goroutine stacks) that would otherwise land
@@ -229,20 +249,25 @@ func TestOpenMemoryIsBoundedByLiveData(t *testing.T) {
 	if short <= 0 {
 		t.Skip("could not measure heap")
 	}
-	if ratio := long / short; ratio > 4 {
+	ratio := long / short
+	t.Logf("open cost: 30 rewrites %.2f MB, 240 rewrites %.2f MB (%.2fx)", short, long, ratio)
+	if ratio > 4 {
 		t.Fatalf("8x the history cost %.1fx the memory (%.2f MB -> %.2f MB); "+
 			"retention is tracking history again rather than live data", ratio, short, long)
 	}
 }
 
-// liveHeapMB is the heap still held with rt reachable, measured after a
-// collection so it reports retention rather than whatever the allocator
-// had not yet swept.
-func liveHeapMB(rt *embed.EmbeddedKdbRuntime) float64 {
+// liveHeapMB is the heap the process still holds, measured after
+// collections so it reports retention rather than whatever the allocator
+// had not yet swept. Two cycles because finalizers queued by the first can
+// only release their objects to the second; FreeOSMemory then forces a
+// third and finishes sweeping before the figure is read.
+func liveHeapMB() float64 {
 	runtime.GC()
+	runtime.GC()
+	debug.FreeOSMemory()
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
-	runtime.KeepAlive(rt)
 	return float64(m.HeapAlloc) / (1024 * 1024)
 }
 
