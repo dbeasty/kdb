@@ -67,6 +67,28 @@ jobs:
           path: ${{ steps.go.outputs.paths }}
           key: ${{ steps.go.outputs.key }}
 
+  # The embeddable Go source bundle (go/embedbundle), unzipped and compiled with nothing but what
+  # the zip carries. Before this the release was the only place that built it, and v0.9.0's
+  # release failed there: a test-only package was left out, which dropped test files whose
+  # helpers other tests use. --compile-only skips the bundle's tests (~5 min) but go vet still
+  # type-checks every test file, which is what that failure needed. The full gate (with go test)
+  # still runs in release.yml.
+  bundle-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: go
+        uses: ./.github/actions/setup-go-cached
+        with:
+          cache-key: bundle
+      - name: Build the bundle and compile it standalone
+        run: make bundle-check
+      - if: env.SAVE_GO_CACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.paths }}
+          key: ${{ steps.go.outputs.key }}
+
   # The Go suite under the race detector, as shards balanced by measured duration - see
   # scripts/ci/go-test-shard.sh for what each shard runs (`go-test-shard.sh list linux-race`).
   # -short: heavy tests skip or scale down here and run in full nightly. Results come from Go's

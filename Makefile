@@ -1,5 +1,5 @@
 .PHONY: test-go test-kotlin test-cross test-physical-golden build-go build-kotlin build-prev-service bench bench-write print-version \
-        release release-go release-bundle bundle-verify release-binaries release-kotlin \
+        release release-go release-bundle bundle-verify bundle-check release-binaries release-kotlin \
         release-checksums release-all release-verify release-clean
 
 # Single version source (see go/kdb/version). Release tags override: make build-go VERSION=v1.2.3
@@ -142,6 +142,11 @@ release-bundle:
 # with nothing but what's inside the zip (docs/kdb-release-plan.md §2.5/R2).
 bundle-verify: release-bundle
 	./scripts/verify-bundle.sh $(DIST)/bundle/kdb-go-embed-$(VERSION).zip
+
+# The same gate without running the bundle's tests (they still get vetted, so they must compile).
+# What PR CI runs; a minute instead of ~5.
+bundle-check: release-bundle
+	./scripts/verify-bundle.sh --compile-only $(DIST)/bundle/kdb-go-embed-$(VERSION).zip
 
 # Cross-compiled binaries for every RELEASE_PLATFORMS entry. -trimpath strips the builder's
 # absolute source paths out of the binary; -buildid= (in RELEASE_LDFLAGS) strips the path-derived
