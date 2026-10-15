@@ -11,107 +11,14 @@ internal expect fun sha256Digest(message: ByteArray): ByteArray
  * chains, `and`/`xor` must be grouped explicitly — Kotlin does not match Java `&`/`^`
  * precedence for the infix `and`/`xor` spellings.
  */
-internal fun sha256DigestPortable(message: ByteArray): ByteArray {
-    val msgLen = message.size.toLong()
-    val bitLen = msgLen * 8L
-    val padLen = (56 - (message.size + 1) % 64 + 64) % 64
-    val totalLen = (msgLen + 1 + padLen + 8).toInt()
-    val padded = ByteArray(totalLen)
-    message.copyInto(padded)
-    padded[msgLen.toInt()] = 0x80.toByte()
-    var bl = bitLen
-    var i = padded.size - 8
-    repeat(8) {
-        padded[i + 7 - it] = (bl and 0xFF).toInt().toByte()
-        bl = bl ushr 8
-    }
+internal fun sha256DigestPortable(message: ByteArray): ByteArray = sha256Resume(SHA256_H0.copyOf(), 0L, message, 0)
 
-    val k = SHA256_K
-
-    // Parentheses required: `ushr`/`shl` bind tighter than `or`.
-    fun rotr(x: Int, n: Int): Int = ((x ushr n) or (x shl (32 - n)))
-
-    val h0 =
-        intArrayOf(
-            i32(0x6a09e667u),
-            i32(0xbb67ae85u),
-            i32(0x3c6ef372u),
-            i32(0xa54ff53au),
-            i32(0x510e527fu),
-            i32(0x9b05688cu),
-            i32(0x1f83d9abu),
-            i32(0x5be0cd19u),
-        )
-    val w = IntArray(64)
-    var offset = 0
-    while (offset < padded.size) {
-        for (t in 0 until 16) {
-            w[t] =
-                ((padded[offset + t * 4].toInt() and 0xFF) shl 24) or
-                    ((padded[offset + t * 4 + 1].toInt() and 0xFF) shl 16) or
-                    ((padded[offset + t * 4 + 2].toInt() and 0xFF) shl 8) or
-                    (padded[offset + t * 4 + 3].toInt() and 0xFF)
-        }
-        for (t in 16 until 64) {
-            val wp15 = w[t - 15]
-            val s0 = (rotr(wp15, 7) xor rotr(wp15, 18)) xor (wp15 ushr 3)
-            val wp2 = w[t - 2]
-            val s1 = (rotr(wp2, 17) xor rotr(wp2, 19)) xor (wp2 ushr 10)
-            w[t] = w[t - 16] + s0 + w[t - 7] + s1
-        }
-
-        var a = h0[0]
-        var b = h0[1]
-        var c = h0[2]
-        var d = h0[3]
-        var e = h0[4]
-        var f = h0[5]
-        var g = h0[6]
-        var h = h0[7]
-
-        for (t in 0 until 64) {
-            val s1r = (rotr(e, 6) xor rotr(e, 11)) xor rotr(e, 25)
-            val ch = ((e and f) xor ((e.inv()) and g))
-            val t1 = h + s1r + ch + k[t] + w[t]
-            val s0a = (rotr(a, 2) xor rotr(a, 13)) xor rotr(a, 22)
-            val maj = ((a and b) xor (a and c)) xor (b and c)
-            val t2 = s0a + maj
-            h = g
-            g = f
-            f = e
-            e = d + t1
-            d = c
-            c = b
-            b = a
-            a = t1 + t2
-        }
-
-        h0[0] += a
-        h0[1] += b
-        h0[2] += c
-        h0[3] += d
-        h0[4] += e
-        h0[5] += f
-        h0[6] += g
-        h0[7] += h
-        offset += 64
-    }
-
-    val out = ByteArray(32)
-    for (i in 0 until 8) {
-        val v = h0[i]
-        out[i * 4] = (v ushr 24).toByte()
-        out[i * 4 + 1] = (v ushr 16).toByte()
-        out[i * 4 + 2] = (v ushr 8).toByte()
-        out[i * 4 + 3] = v.toByte()
-    }
-    return out
-}
+/** SHA-256's block size in bytes. */
+internal const val SHA256_BLOCK: Int = 64
 
 private fun i32(u: UInt): Int = u.toInt()
 
-// Round constants, built once rather than on every digest.
-private val SHA256_K =
+private val SHA256_K: IntArray =
     intArrayOf(
         i32(0x428a2f98u),
         i32(0x71374491u),
@@ -178,3 +85,125 @@ private val SHA256_K =
         i32(0xbef9a3f7u),
         i32(0xc67178f2u),
     )
+
+internal val SHA256_H0: IntArray =
+    intArrayOf(
+        i32(0x6a09e667u),
+        i32(0xbb67ae85u),
+        i32(0x3c6ef372u),
+        i32(0xa54ff53au),
+        i32(0x510e527fu),
+        i32(0x9b05688cu),
+        i32(0x1f83d9abu),
+        i32(0x5be0cd19u),
+    )
+
+/** Compresses the 64-byte block at [off] of [block] into [state], using [w] as scratch. */
+internal fun sha256Compress(
+    state: IntArray,
+    block: ByteArray,
+    off: Int,
+    w: IntArray,
+) {
+    // Locals, not top-level declarations: Kotlin/JS starts every top-level function of a file with
+    // top-level properties with that file's lazy-initialisation check, and runs a top-level
+    // property read through it too; in the round loop that made the digest ~8x slower.
+    val k = SHA256_K
+
+    // Parentheses required: `ushr`/`shl` bind tighter than `or`.
+    fun rotr(
+        x: Int,
+        n: Int,
+    ): Int = ((x ushr n) or (x shl (32 - n)))
+    for (t in 0 until 16) {
+        val o = off + t * 4
+        w[t] =
+            ((block[o].toInt() and 0xFF) shl 24) or
+            ((block[o + 1].toInt() and 0xFF) shl 16) or
+            ((block[o + 2].toInt() and 0xFF) shl 8) or
+            (block[o + 3].toInt() and 0xFF)
+    }
+    for (t in 16 until 64) {
+        val wp15 = w[t - 15]
+        val s0 = (rotr(wp15, 7) xor rotr(wp15, 18)) xor (wp15 ushr 3)
+        val wp2 = w[t - 2]
+        val s1 = (rotr(wp2, 17) xor rotr(wp2, 19)) xor (wp2 ushr 10)
+        w[t] = w[t - 16] + s0 + w[t - 7] + s1
+    }
+    var a = state[0]
+    var b = state[1]
+    var c = state[2]
+    var d = state[3]
+    var e = state[4]
+    var f = state[5]
+    var g = state[6]
+    var h = state[7]
+    for (t in 0 until 64) {
+        val s1r = (rotr(e, 6) xor rotr(e, 11)) xor rotr(e, 25)
+        val ch = ((e and f) xor ((e.inv()) and g))
+        val t1 = h + s1r + ch + k[t] + w[t]
+        val s0a = (rotr(a, 2) xor rotr(a, 13)) xor rotr(a, 22)
+        val maj = ((a and b) xor (a and c)) xor (b and c)
+        val t2 = s0a + maj
+        h = g
+        g = f
+        f = e
+        e = d + t1
+        d = c
+        c = b
+        b = a
+        a = t1 + t2
+    }
+    state[0] += a
+    state[1] += b
+    state[2] += c
+    state[3] += d
+    state[4] += e
+    state[5] += f
+    state[6] += g
+    state[7] += h
+}
+
+/**
+ * Finishes a SHA-256 whose first [prefixLen] bytes (a whole number of blocks) are already folded
+ * into [state] (modified in place), with [message] from [from] as the rest of the input. With the
+ * initial state and no prefix this is the plain digest; with a precomputed midstate it hashes a
+ * long constant-prefixed input without redoing the prefix's blocks.
+ */
+internal fun sha256Resume(
+    state: IntArray,
+    prefixLen: Long,
+    message: ByteArray,
+    from: Int,
+): ByteArray {
+    val w = IntArray(64)
+    var off = from
+    while (message.size - off >= SHA256_BLOCK) {
+        sha256Compress(state, message, off, w)
+        off += SHA256_BLOCK
+    }
+    // The tail: what is left of the message, 0x80, zeros, and the 64-bit bit length.
+    val rest = message.size - off
+    val tail = ByteArray(if (rest + 9 <= SHA256_BLOCK) SHA256_BLOCK else 2 * SHA256_BLOCK)
+    message.copyInto(tail, 0, off, message.size)
+    tail[rest] = 0x80.toByte()
+    var bl = (prefixLen + message.size - from) * 8L
+    for (i in tail.size - 1 downTo tail.size - 8) {
+        tail[i] = (bl and 0xFF).toInt().toByte()
+        bl = bl ushr 8
+    }
+    var t = 0
+    while (t < tail.size) {
+        sha256Compress(state, tail, t, w)
+        t += SHA256_BLOCK
+    }
+    val out = ByteArray(32)
+    for (i in 0 until 8) {
+        val v = state[i]
+        out[i * 4] = (v ushr 24).toByte()
+        out[i * 4 + 1] = (v ushr 16).toByte()
+        out[i * 4 + 2] = (v ushr 8).toByte()
+        out[i * 4 + 3] = v.toByte()
+    }
+    return out
+}

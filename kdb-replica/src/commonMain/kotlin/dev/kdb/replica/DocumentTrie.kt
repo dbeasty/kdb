@@ -1,6 +1,7 @@
 package dev.kdb.replica
 
 import dev.kdb.document.kdbSha256
+import dev.kdb.document.kdbTrieFoldLeaf
 
 /**
  * The document tree: KDB's 16-ary Merkle trie over document-id nibbles
@@ -45,25 +46,8 @@ private fun nibble(id: ByteArray, depth: Int): Int {
     return if (depth and 1 == 1) b and 0x0f else b shr 4
 }
 
-internal fun leafHash(id: ByteArray, content: ByteArray): ByteArray {
-    val buf = ByteArray(49)
-    id.copyInto(buf, 1)
-    content.copyInto(buf, 17)
-    return kdbSha256(buf)
-}
-
 /** The hash of the subtree at [depth] that holds only (id, content). */
-internal fun foldLeaf(id: ByteArray, content: ByteArray, depth: Int): ByteArray {
-    var h = leafHash(id, content)
-    val buf = ByteArray(1 + 16 * 32)
-    for (d in 31 downTo depth) {
-        buf.fill(0)
-        buf[0] = 0x01
-        h.copyInto(buf, 1 + nibble(id, d) * 32)
-        h = kdbSha256(buf)
-    }
-    return h
-}
+internal fun foldLeaf(id: ByteArray, content: ByteArray, depth: Int): ByteArray = kdbTrieFoldLeaf(id, content, depth)
 
 private fun internalHash(children: ByteArray): ByteArray {
     val buf = ByteArray(1 + 16 * 32)

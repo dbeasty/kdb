@@ -22,7 +22,7 @@
  */
 
 import { bytesEqual, toHex, uuidBytes, uuidString, ZERO32 } from "./bytes.ts";
-import { sha256 } from "./sha256.ts";
+import { onlyChildHash, sha256 } from "./sha256.ts";
 import type { Batch, KvStore } from "./store.ts";
 
 export type TrieRecord =
@@ -44,18 +44,10 @@ export function leafHash(id: Uint8Array, content: Uint8Array): Uint8Array {
   return sha256(buf);
 }
 
-const onlyChildBuf = new Uint8Array(1 + 16 * 32);
-
 /** The hash of the subtree at depth that holds only (id, content). */
 export function foldLeaf(id: Uint8Array, content: Uint8Array, depth: number): Uint8Array {
   let h = leafHash(id, content);
-  for (let d = 31; d >= depth; d--) {
-    const nib = nibble(id, d);
-    onlyChildBuf.fill(0);
-    onlyChildBuf[0] = 0x01;
-    onlyChildBuf.set(h, 1 + nib * 32);
-    h = sha256(onlyChildBuf);
-  }
+  for (let d = 31; d >= depth; d--) h = onlyChildHash(nibble(id, d), h);
   return h;
 }
 
