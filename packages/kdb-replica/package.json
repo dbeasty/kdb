@@ -31,6 +31,6 @@
     "@kdb/client": "file:../kdb-client"
   },
   "dependencies": {
-    "@kdb/client": "^0.8.1"
+    "@kdb/client": "^0.8.2"
   }
 }
