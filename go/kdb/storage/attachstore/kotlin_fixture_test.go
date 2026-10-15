@@ -252,6 +252,10 @@ func TestGoFixtureForKotlin(t *testing.T) {
 	if os.Getenv("KDB_WRITE_FIXTURES") == "1" {
 		dumpSegments(t, buildFixture(t), path)
 	}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		// The fixture lives in the Kotlin tree, outside go/: not there in the embeddable bundle.
+		t.Skipf("%s is not here (outside the Go module, e.g. in the embeddable bundle)", path)
+	}
 	checkFixture(t, loadDump(t, path), true) // what Kotlin reads stays readable here
 }
 
