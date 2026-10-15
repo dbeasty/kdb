@@ -75,7 +75,7 @@ func (r *Registry) Add(desc Descriptor) (Store, error) {
 		if n := desc.IndexName(); n != "" && e.desc.IndexName() == n {
 			return nil, fmt.Errorf("index name %q already registered", n)
 		}
-		if e.desc.Type == desc.Type && e.desc.FirstField() == desc.FirstField() {
+		if e.desc.Type == desc.Type && e.desc.FirstField() == desc.FirstField() && e.desc.IsSystem() == desc.IsSystem() {
 			return nil, fmt.Errorf("a %s index on %s already exists", desc.Type, desc.FirstField())
 		}
 	}
@@ -146,12 +146,13 @@ func (r *Registry) ByName(name string) (Store, bool) {
 	return nil, false
 }
 
-// ByField finds the index of type typ whose first field is field.
+// ByField finds the index of type typ whose first field is field. System indexes are never
+// returned: their keys are typed for the server's own use, not for a user's predicate.
 func (r *Registry) ByField(field string, typ IndexType) (Store, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for _, e := range r.entries {
-		if e.desc.Type == typ && e.desc.FirstField() == field {
+		if e.desc.Type == typ && e.desc.FirstField() == field && !e.desc.IsSystem() {
 			return e.store, true
 		}
 	}

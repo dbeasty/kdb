@@ -78,9 +78,10 @@ func TestCountStarIsAnsweredWithoutReadingDocuments(t *testing.T) {
 		t.Fatalf("COUNT(col) = %s via %s", n, plan)
 	}
 
-	// While expiry hides documents the tree size over-counts what a read returns: decline.
+	// While expiry hides documents the tree size over-counts what a read returns; the expiry
+	// index says which are hidden, so the count still reads nothing.
 	srv.SetDocumentExpiry(&policy.DocumentExpiryPolicy{FieldPath: "expiresAt", GraceMillis: 0, SweepIntervalMillis: 60000})
-	if n, plan := countOf(t, srv, `SELECT COUNT(*) FROM docs`, 0); n != "200" || plan == "count:tree" {
-		t.Fatalf("with expiry on, COUNT(*) = %s via %s, want 200 by reading", n, plan)
+	if n, plan := countOf(t, srv, `SELECT COUNT(*) FROM docs`, 10); n != "200" || plan != "count:tree" {
+		t.Fatalf("with expiry on, COUNT(*) = %s via %s, want 200 via count:tree", n, plan)
 	}
 }

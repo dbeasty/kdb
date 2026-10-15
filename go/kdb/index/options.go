@@ -16,7 +16,16 @@ const (
 	OptionEfConstruction = "ef_construction"
 	OptionEfSearch       = "ef_search"
 	OptionFieldType      = "field_type"
+	// OptionSystem marks an index the server keeps for itself (the document expiry index): it
+	// is never chosen for a user query by field (ByField), and it may share a field and type with
+	// a user index. Value "true".
+	OptionSystem = "system"
 )
+
+// IsSystem reports whether the index is one the server keeps for itself (OptionSystem).
+func (d Descriptor) IsSystem() bool {
+	return d.Options != nil && d.Options[OptionSystem] == "true"
+}
 
 // IndexName returns Options["index_name"], or "" when the index is unnamed.
 func (d Descriptor) IndexName() string {

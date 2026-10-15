@@ -115,6 +115,10 @@ type StorageOptions struct {
 	// BoundedLiveBodies: see storage.StorageEngineConfig.BoundedLiveBodies. FileRuntimeOptionsFromEnv
 	// turns it on unless KDB_BOUNDED_LIVE_BODIES=off; the zero value here is off.
 	BoundedLiveBodies bool
+	// LargeCommitBodyBytes: see storage.StorageEngineConfig.LargeCommitBodyBytes. Zero is the
+	// default threshold (64 KiB); negative turns filing bodies by value off.
+	// FileRuntimeOptionsFromEnv reads KDB_LARGE_COMMIT_BODY_BYTES.
+	LargeCommitBodyBytes int64
 	// CommitOpsBytes caps how many bytes of commit operations the DAG
 	// keeps resident. Zero takes a quarter of the hot-tier budget.
 	CommitOpsBytes int64
@@ -274,6 +278,11 @@ func FileRuntimeOptionsFromEnv() FileRuntimeOptions {
 	// live data larger than memory is the point, and with second-chance eviction bounded bodies
 	// read as fast as pinned ones. KDB_BOUNDED_LIVE_BODIES=off keeps every live version resident.
 	opts.Storage.BoundedLiveBodies = envBoolDefault("KDB_BOUNDED_LIVE_BODIES", true)
+	if v, ok := os.LookupEnv("KDB_LARGE_COMMIT_BODY_BYTES"); ok {
+		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
+			opts.Storage.LargeCommitBodyBytes = n
+		}
+	}
 	opts.Storage.CommitOpsBytes = envBytes("KDB_COMMIT_OPS_BYTES")
 	opts.Storage.HistoryTreeCacheBytes = envBytes("KDB_HISTORY_TREE_CACHE_BYTES")
 	opts.Storage.PreallocateSegments = envBool("KDB_PREALLOCATE_SEGMENTS")

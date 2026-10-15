@@ -107,6 +107,9 @@ func (s *KdbServerRuntime) OpenIndexes(opts stores.Options) (*RegistryIndexProvi
 
 	s.SetSQLIndexProvider(provider)
 	s.SetSearchProvider(provider)
+	// An expiry policy set before the indexes opened (kdb-service sets it first) gets its index
+	// now; one set later builds it in SetDocumentExpiry.
+	s.ensureExpiryIndex()
 	return provider, nil
 }
 

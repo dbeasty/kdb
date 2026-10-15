@@ -511,6 +511,9 @@ func (e *ServerEngine) documentFromObject(docID codec.UUID, contentHash codec.Ha
 		return document.Document{}, false
 	}
 	if seq, offset, ok := decodeDocumentLocation(raw); ok {
+		if doc, found, handled := e.documentFromLargeFrame(docID, contentHash, seq, offset); handled {
+			return doc, found
+		}
 		return e.documentFromLog(docID, contentHash, seq, offset)
 	}
 	return verifiedDocument(docID, string(raw), contentHash)
@@ -790,6 +793,9 @@ func (e *ServerEngine) RecordCommitLocation(treeHash codec.Hash, segmentSeq, fra
 	}
 	e.pendingMu.Unlock()
 	if !ok {
+		return
+	}
+	if e.fileBodiesOfLargeCommit(changed) {
 		return
 	}
 	for _, c := range changed {

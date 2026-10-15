@@ -258,16 +258,20 @@ func (e *Executor) keysetEligible(query SelectQuery, page PageRequest) bool {
 	return ok
 }
 
-// tryCountOnly answers `SELECT COUNT(*) [, COUNT(*) ...] FROM t [WHERE col = const]` from counters
-// instead of reading documents, so counting a large namespace costs the same as counting a small
-// one and is not subject to the scan row budget (nothing is scanned).
+// tryCountOnly answers `SELECT COUNT(*) [, COUNT(*) ...] FROM t [WHERE ...]` without holding the
+// documents it counts, so counting a large namespace never materializes it.
 //
-// It declines - leaving the ordinary path to run - unless the answer is provably the one reading
-// the documents would give: the projections are all bare COUNT(*) with no grouping or DISTINCT;
-// the storage can count the tree without reading it and says every document in it is visible
-// (storage.DocumentCounter, which declines while expiry hides documents); and the WHERE is either
-// absent or a single equality on a string or boolean constant that an index serves exactly (the
-// index count and a re-check of the predicate agree for those).
+// It declines - leaving the ordinary path to run - unless the projections are all bare COUNT(*)
+// with no grouping or DISTINCT. Then, cheapest first:
+//
+//   - from counters, reading nothing: the storage counts the tree without reading it
+//     (storage.DocumentCounter, which subtracts what expiry hides when the expiry index can say)
+//     and the WHERE is absent or an AND of equalities / IN lists on string or boolean constants
+//     that indexes serve exactly (an index count and a re-check of the predicate agree for those);
+//     documents the storage hides from reads but an index still holds are listed
+//     (storage.HiddenDocumentLister) and taken back out;
+//   - otherwise by streaming: the documents the access path yields are checked against the WHERE
+//     one at a time and counted, never retained. Subject to the scan row budget like any scan.
 func (e *Executor) tryCountOnly(query SelectQuery, env *evalEnv, ctx QueryContext) (QueryResult, bool, error) {
 	if query.Distinct || len(query.GroupBy) > 0 || len(query.Projections) == 0 || query.Offset > 0 {
 		return QueryResult{}, false, nil
@@ -281,10 +285,6 @@ func (e *Executor) tryCountOnly(query SelectQuery, env *evalEnv, ctx QueryContex
 			return QueryResult{}, false, nil
 		}
 	}
-	counter, ok := e.Storage.(storage.DocumentCounter)
-	if !ok {
-		return QueryResult{}, false, nil
-	}
 	atCommit, err := e.atCommit(ctx)
 	if err != nil {
 		return QueryResult{}, false, err
@@ -293,23 +293,118 @@ func (e *Executor) tryCountOnly(query SelectQuery, env *evalEnv, ctx QueryContex
 	if err != nil {
 		return QueryResult{}, false, err
 	}
-	total, ok, err := counter.CountDocuments(ctx.NamespaceID, commit.DocumentTreeHash)
-	if err != nil || !ok {
+	n, label, ok, err := e.countFromCounters(query.Where, env, ctx, commit.DocumentTreeHash)
+	if err != nil {
 		return QueryResult{}, false, err
 	}
-	n, label := total, "count:tree"
-	if query.Where != nil {
-		got, ok := e.countByIndex(query.Where, env, ctx)
-		if !ok {
-			return QueryResult{}, false, nil
+	if !ok {
+		if n, label, err = e.countByStreaming(query.Where, env, ctx); err != nil {
+			return QueryResult{}, false, err
 		}
-		n, label = got, "count:index"
 	}
 	row := QueryRow{Values: make([]Cell, len(query.Projections))}
 	for i := range row.Values {
 		row.Values[i] = CellLong{Value: int64(n)}
 	}
 	return QueryResult{Columns: columnsFor(query, ctx.Schema), Rows: []QueryRow{row}, Plan: label}, true, nil
+}
+
+// countFromCounters is tryCountOnly's no-read tier; ok=false when it cannot vouch for the answer.
+func (e *Executor) countFromCounters(where Expr, env *evalEnv, ctx QueryContext, treeHash codec.Hash) (int, string, bool, error) {
+	counter, ok := e.Storage.(storage.DocumentCounter)
+	if !ok {
+		return 0, "", false, nil
+	}
+	total, ok, err := counter.CountDocuments(ctx.NamespaceID, treeHash)
+	if err != nil || !ok {
+		return 0, "", false, err
+	}
+	if where == nil {
+		return total, "count:tree", true, nil
+	}
+	got, ok := e.countByIndex(where, env, ctx)
+	if !ok {
+		return 0, "", false, nil
+	}
+	if lister, isLister := e.Storage.(storage.HiddenDocumentLister); isLister {
+		hidden, ok, err := lister.HiddenDocuments(ctx.NamespaceID, treeHash)
+		if err != nil || !ok {
+			return 0, "", false, err
+		}
+		for _, d := range hidden {
+			if env.predicate(where, newEvalDoc(d)) {
+				got--
+			}
+		}
+	}
+	return got, "count:index", true, nil
+}
+
+// countByStreaming counts the documents where accepts, reading them through the access path the
+// query would use but keeping none: one document is live at a time, however many match.
+func (e *Executor) countByStreaming(where Expr, env *evalEnv, ctx QueryContext) (int, string, error) {
+	n := 0
+	if where != nil {
+		ids, label, found, err := e.chooseIndexPath(where, nil, env, ctx)
+		if err != nil {
+			return 0, "", err
+		}
+		if found {
+			atCommit, err := e.atCommit(ctx)
+			if err != nil {
+				return 0, "", err
+			}
+			commit, err := e.DAG.GetCommitOrThrow(atCommit)
+			if err != nil {
+				return 0, "", err
+			}
+			for i, id := range ids {
+				if ctx.RowBudget > 0 && i >= ctx.RowBudget {
+					return 0, "", &ScanRowBudgetExceededError{Budget: ctx.RowBudget}
+				}
+				doc, err := e.Storage.GetDocument(ctx.NamespaceID, id, commit.DocumentTreeHash)
+				if err != nil {
+					return 0, "", err
+				}
+				ctx.Stats.addExamined(1)
+				if doc == nil {
+					continue
+				}
+				ctx.Stats.addDocRead(len(doc.JSON))
+				if env.predicate(where, newEvalDoc(*doc)) {
+					n++
+				}
+			}
+			return n, label, nil
+		}
+	}
+	atCommit, err := e.atCommit(ctx)
+	if err != nil {
+		return 0, "", err
+	}
+	commit, err := e.DAG.GetCommitOrThrow(atCommit)
+	if err != nil {
+		return 0, "", err
+	}
+	examined := 0
+	err = e.Storage.ScanDocuments(ctx.NamespaceID, commit.DocumentTreeHash, 256, func(batch []document.Document) error {
+		for _, d := range batch {
+			examined++
+			ctx.Stats.addExamined(1)
+			if ctx.RowBudget > 0 && examined > ctx.RowBudget {
+				return &ScanRowBudgetExceededError{Budget: ctx.RowBudget}
+			}
+			ctx.Stats.addDocRead(len(d.JSON))
+			if where == nil || env.predicate(where, newEvalDoc(d)) {
+				n++
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, "", err
+	}
+	return n, "fullscan", nil
 }
 
 // isCountStar reports whether x is COUNT(*) (or COUNT with no argument).
@@ -325,45 +420,139 @@ func isCountStar(x Expr) bool {
 	return len(fc.Args) == 1 && ok && cr.Name == "*"
 }
 
-// countByIndex counts the documents a single `col = <string|bool constant>` WHERE selects, from
-// the index alone.
+// exactConjunct is one conjunct an index serves exactly: `col = v` or `col IN (v, ...)` on string
+// or boolean constants (NULLs in an IN list match nothing and are dropped).
+type exactConjunct struct {
+	field  string
+	values []Cell
+}
+
+// exactConjunctOf recognises an exactConjunct; ok=false for anything else.
+func exactConjunctOf(conj Expr, env *evalEnv) (exactConjunct, bool) {
+	constCell := func(x Expr) (Cell, bool) {
+		switch x.(type) {
+		case ExprLiteral, ExprParameter:
+		default:
+			return nil, false
+		}
+		v := env.cell(x, newEvalDoc(emptyDoc))
+		switch v.(type) {
+		case CellString, CellBool, CellNull:
+			return v, true
+		}
+		return nil, false
+	}
+	column := func(x Expr) (string, bool) {
+		ref, ok := x.(ExprColumnRef)
+		if !ok {
+			return "", false
+		}
+		name := env.columnName(ref.Name)
+		if isReservedColumn(name) {
+			return "", false
+		}
+		return name, true
+	}
+	switch c := conj.(type) {
+	case ExprBinary:
+		if c.Op != BinaryOpEQ {
+			return exactConjunct{}, false
+		}
+		field, ok := column(c.Left)
+		other := c.Right
+		if !ok {
+			if field, ok = column(c.Right); !ok {
+				return exactConjunct{}, false
+			}
+			other = c.Left
+		}
+		v, ok := constCell(other)
+		if !ok || isNullCell(v) {
+			return exactConjunct{}, false
+		}
+		return exactConjunct{field: field, values: []Cell{v}}, true
+	case ExprIn:
+		field, ok := column(c.Expr)
+		if !ok {
+			return exactConjunct{}, false
+		}
+		out := exactConjunct{field: field}
+		for _, x := range c.Values {
+			v, ok := constCell(x)
+			if !ok {
+				return exactConjunct{}, false
+			}
+			if !isNullCell(v) {
+				out.values = append(out.values, v)
+			}
+		}
+		return out, true
+	}
+	return exactConjunct{}, false
+}
+
+// countByIndex counts the documents an AND of exactConjuncts selects, from indexes alone: a single
+// equality by its index count, anything else by intersecting the conjuncts' id sets.
 func (e *Executor) countByIndex(where Expr, env *evalEnv, ctx QueryContext) (int, bool) {
 	counter, ok := e.IndexProvider.(ExactCounter)
 	if !ok || e.IndexProvider == nil {
 		return 0, false
 	}
-	b, ok := where.(ExprBinary)
-	if !ok || b.Op != BinaryOpEQ {
-		return 0, false
+	conjs := conjuncts(where)
+	parts := make([]exactConjunct, 0, len(conjs))
+	for _, c := range conjs {
+		p, ok := exactConjunctOf(c, env)
+		if !ok {
+			return 0, false
+		}
+		parts = append(parts, p)
 	}
-	col, other := b.Left, b.Right
-	if _, isCol := col.(ExprColumnRef); !isCol {
-		col, other = b.Right, b.Left
+	if len(parts) == 1 && len(parts[0].values) == 1 {
+		n, ok, err := counter.ExactCount(ctx, parts[0].field, parts[0].values[0])
+		if err != nil || !ok {
+			return 0, false
+		}
+		return n, true
 	}
-	ref, isCol := col.(ExprColumnRef)
-	if !isCol {
-		return 0, false
+	// Smallest conjunct first, so the running intersection starts as small as it can.
+	sizes := make([]int, len(parts))
+	for i, p := range parts {
+		for _, v := range p.values {
+			n, ok, err := counter.ExactCount(ctx, p.field, v)
+			if err != nil || !ok {
+				return 0, false
+			}
+			sizes[i] += n
+		}
 	}
-	switch other.(type) {
-	case ExprLiteral, ExprParameter:
-	default:
-		return 0, false
+	order := make([]int, len(parts))
+	for i := range order {
+		order[i] = i
 	}
-	name := env.columnName(ref.Name)
-	if isReservedColumn(name) {
-		return 0, false
+	sort.Slice(order, func(a, b int) bool { return sizes[order[a]] < sizes[order[b]] })
+	var acc map[codec.UUID]struct{}
+	for _, i := range order {
+		p := parts[i]
+		set := make(map[codec.UUID]struct{}, sizes[i])
+		for _, v := range p.values {
+			ids, ok, err := e.IndexProvider.ExactLookup(ctx, p.field, v)
+			if err != nil || !ok {
+				return 0, false
+			}
+			for _, id := range ids {
+				if acc == nil {
+					set[id] = struct{}{}
+				} else if _, in := acc[id]; in {
+					set[id] = struct{}{}
+				}
+			}
+		}
+		acc = set
+		if len(acc) == 0 {
+			return 0, true
+		}
 	}
-	value := env.cell(other, newEvalDoc(emptyDoc))
-	switch value.(type) {
-	case CellString, CellBool:
-	default:
-		return 0, false
-	}
-	n, ok, err := counter.ExactCount(ctx, name, value)
-	if err != nil || !ok {
-		return 0, false
-	}
-	return n, true
+	return len(acc), true
 }
 
 // plainRows sorts and projects a non-grouped result. Sort keys are computed once per row, not

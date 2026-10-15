@@ -120,6 +120,7 @@ func (h *Host) openNamespace(
 		Retain:                opts.Storage.Retain,
 		DocumentCacheBytes:    opts.Storage.DocumentCacheBytes,
 		BoundedLiveBodies:     opts.Storage.BoundedLiveBodies,
+		LargeCommitBodyBytes:  opts.Storage.LargeCommitBodyBytes,
 		CommitOpsBytes:        opts.Storage.CommitOpsBytes,
 		DeltaMaxSegmentBytes:  opts.Storage.DeltaMaxSegmentBytes,
 		TreeChainLimit:        opts.Storage.TreeChainLimit,

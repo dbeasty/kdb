@@ -180,3 +180,78 @@ func skipValue(s string, i int) (int, bool) {
 		return j, true
 	}
 }
+
+// TopLevelMember is one member of a JSON object: its key, decoded, and the bounds of its raw value
+// in the document.
+type TopLevelMember struct {
+	Key        string
+	Start, End int
+}
+
+// TopLevelMembers lists the members of the JSON object docJSON in document order, by scanning it
+// once without decoding any value - a reader that needs a few fields of a large document (one
+// holding an embedding, say) can then decode just those. A repeated key is listed each time; the
+// last occurrence is the one a decoder keeps. ok=false when docJSON is not an object this scan can
+// walk, and the caller decodes the whole document instead.
+func TopLevelMembers(docJSON string) ([]TopLevelMember, bool) {
+	s := docJSON
+	i := skipWS(s, 0)
+	if i >= len(s) || s[i] != '{' {
+		return nil, false
+	}
+	i = skipWS(s, i+1)
+	if i < len(s) && s[i] == '}' {
+		return nil, true
+	}
+	out := make([]TopLevelMember, 0, 16)
+	for {
+		if i >= len(s) || s[i] != '"' {
+			return nil, false
+		}
+		kEnd, ok := skipString(s, i)
+		if !ok {
+			return nil, false
+		}
+		key, ok := decodeKey(s[i:kEnd])
+		if !ok {
+			return nil, false
+		}
+		i = skipWS(s, kEnd)
+		if i >= len(s) || s[i] != ':' {
+			return nil, false
+		}
+		i = skipWS(s, i+1)
+		vEnd, ok := skipValue(s, i)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, TopLevelMember{Key: key, Start: i, End: vEnd})
+		i = skipWS(s, vEnd)
+		if i >= len(s) {
+			return nil, false
+		}
+		switch s[i] {
+		case ',':
+			i = skipWS(s, i+1)
+		case '}':
+			return out, true
+		default:
+			return nil, false
+		}
+	}
+}
+
+// decodeKey decodes a quoted JSON key: in place when plain ASCII, through encoding/json otherwise.
+func decodeKey(quoted string) (string, bool) {
+	inner := quoted[1 : len(quoted)-1]
+	for j := 0; j < len(inner); j++ {
+		if c := inner[j]; c == '\\' || c >= 0x80 {
+			var decoded string
+			if err := json.Unmarshal([]byte(quoted), &decoded); err != nil {
+				return "", false
+			}
+			return decoded, true
+		}
+	}
+	return inner, true
+}

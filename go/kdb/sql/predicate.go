@@ -37,9 +37,67 @@ type evalDoc struct {
 	doc    document.Document
 	root   kdbjson.Value
 	parsed bool
+
+	// Field-at-a-time decoding: members indexes the top-level members once (no value decoded),
+	// and fields holds the members decoded so far. A query that reads a few fields of a document
+	// carrying a 768-number embedding decodes those fields, not the embedding. membersBad means
+	// the scan could not walk the document, and tree() decides instead.
+	members        []schema.TopLevelMember
+	membersScanned bool
+	membersBad     bool
+	fields         map[string]kdbjson.Value
 }
 
 func newEvalDoc(doc document.Document) *evalDoc { return &evalDoc{doc: doc} }
+
+// member returns the decoded value of top-level member key (the last one, when repeated), found
+// reports whether the document has it, and usable=false means the document must be decoded whole
+// (tree) to answer. Once the whole tree is decoded it is used directly.
+func (d *evalDoc) member(key string) (v kdbjson.Value, found, usable bool) {
+	if d.parsed {
+		obj, ok := d.root.(kdbjson.ObjectValue)
+		if !ok {
+			return nil, false, d.root == nil
+		}
+		v, found = obj.Fields[key]
+		return v, found, true
+	}
+	if !d.membersScanned {
+		d.membersScanned = true
+		d.members, d.membersBad = nil, false
+		m, ok := schema.TopLevelMembers(d.doc.JSON)
+		if !ok {
+			d.membersBad = true
+		} else {
+			d.members = m
+		}
+	}
+	if d.membersBad {
+		return nil, false, false
+	}
+	if v, ok := d.fields[key]; ok {
+		return v, true, true
+	}
+	idx := -1
+	for i := range d.members {
+		if d.members[i].Key == key {
+			idx = i
+		}
+	}
+	if idx < 0 {
+		return nil, false, true
+	}
+	m := d.members[idx]
+	parsed, err := kdbjson.ParseValue(d.doc.JSON[m.Start:m.End])
+	if err != nil {
+		return nil, false, false
+	}
+	if d.fields == nil {
+		d.fields = make(map[string]kdbjson.Value, 4)
+	}
+	d.fields[key] = parsed
+	return parsed, true, true
+}
 
 func (d *evalDoc) tree() kdbjson.Value {
 	if !d.parsed {
@@ -102,11 +160,20 @@ func (env *evalEnv) columnValues(name string, d *evalDoc, expand bool) []kdbjson
 	case colAttachments:
 		return []kdbjson.Value{attachmentsJSON(env.attach.set(d.doc.ID))}
 	}
+	segs := kdbjson.SplitDotted(name)
+	if len(segs) > 0 {
+		if v, found, usable := d.member(segs[0]); usable {
+			if !found {
+				return nil
+			}
+			return kdbjson.CandidatesOf(v, segs[1:], expand)
+		}
+	}
 	root := d.tree()
 	if root == nil {
 		return nil
 	}
-	return kdbjson.CandidatesOf(root, kdbjson.SplitDotted(name), expand)
+	return kdbjson.CandidatesOf(root, segs, expand)
 }
 
 // candidates evaluates an operand to its candidate cells (§2): a column reference fans out over
