@@ -1,5 +1,5 @@
 /**
- * @kdb/replica - a client-side KDB replica (docs/kdb-client-replica-plan.md).
+ * @limidus/kdb-replica - a client-side KDB replica (docs/kdb-client-replica-plan.md).
  *
  * This first slice is the replica's core: the canonical commit codec, KDB's document trie, the
  * key-value stores, and a namespace that fast-forwards through commits and makes local ones.

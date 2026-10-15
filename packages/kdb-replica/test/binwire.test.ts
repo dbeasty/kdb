@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { encodeFrameBody } from "@kdb/client";
+import { encodeFrameBody } from "@limidus/kdb-client";
 import {
   chunkLeaf,
   decodeAttachmentUploadResult,

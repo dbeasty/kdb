@@ -70,6 +70,6 @@ export function randomUuid(): string {
     return uuidFromBytes(bytes);
   }
   throw new KdbError(
-    "kdb: no Web Crypto available - @kdb/client needs globalThis.crypto (Node 20+, browsers, Bun, Deno, Workers)",
+    "kdb: no Web Crypto available - @limidus/kdb-client needs globalThis.crypto (Node 20+, browsers, Bun, Deno, Workers)",
   );
 }

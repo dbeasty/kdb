@@ -1,9 +1,9 @@
 /**
  * The generated typed layer against a real Go server, over a real WebSocket.
- * Skipped without a Go toolchain, like @kdb/client's own interop test.
+ * Skipped without a Go toolchain, like @limidus/kdb-client's own interop test.
  */
 
-import { connect } from "@kdb/client";
+import { connect } from "@limidus/kdb-client";
 import { goAvailable, startGoServer } from "./server.ts";
 import { typedLayerSuite } from "./suite.ts";
 

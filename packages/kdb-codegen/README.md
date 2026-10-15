@@ -1,4 +1,4 @@
-# `@kdb/codegen`
+# `@limidus/kdb-codegen`
 
 Types generated from a KDB schema, plus a typed SQL builder over them. Implements
 [Component 63](../../docs/kdb-spec-layer12-component63-ts-client-sdk.md) Phase 2 (§10).
@@ -37,11 +37,11 @@ Types are `string|text`, `int32|integer`, `int64|bigint`, `float64|real|double`,
 
 ## Using it
 
-`bind` takes anything that implements `KdbOperations` — a `@kdb/client` connection or an
-`@kdb/embed` database — so the same application code runs against either.
+`bind` takes anything that implements `KdbOperations` — a `@limidus/kdb-client` connection or an
+`@limidus/kdb-embed` database — so the same application code runs against either.
 
 ```ts
-import { connect } from "@kdb/client";
+import { connect } from "@limidus/kdb-client";
 import { bind } from "./kdb.ts";
 
 const db = bind(await connect("ws://localhost:9090/kdb"));
@@ -73,7 +73,7 @@ await db.users.compareAndSwap(id, (cur) => (cur ? { ...cur, age: (cur.age ?? 0) 
 
 ## What the builder does about types
 
-`@kdb/client` returns every SQL value as a string and refuses to guess. With the schema in hand this
+`@limidus/kdb-client` returns every SQL value as a string and refuses to guess. With the schema in hand this
 layer can, and is strict about it:
 
 | Column | Row type | Notes |
@@ -94,7 +94,7 @@ Every caller-supplied value is a bound `?` parameter. Identifiers come from the 
 never from the caller. `update()`/`deleteFrom()` without a `WHERE` throw unless you say `.all()`.
 
 `create()` always runs `CREATE TABLE`; `ensure()` is the one to call on every start, because the engine does
-not restore a SQL-defined schema when a store is reopened (see `@kdb/embed`'s `persist`).
+not restore a SQL-defined schema when a store is reopened (see `@limidus/kdb-embed`'s `persist`).
 
 ## Limits
 

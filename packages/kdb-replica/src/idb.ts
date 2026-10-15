@@ -1,7 +1,7 @@
 /**
  * The IndexedDB store: one object store of string keys, one readwrite transaction per apply,
  * with `durability: "strict"` so a resolved apply has reached the disk. This is the discipline of
- * `@kdb/embed`'s IndexedDbBackend, without its whole-image load.
+ * `@limidus/kdb-embed`'s IndexedDbBackend, without its whole-image load.
  */
 
 import type { Batch, KvStore } from "./store.ts";

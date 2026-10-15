@@ -534,7 +534,7 @@ describe("backoffDelay", () => {
 
 describe("SQL", () => {
   it("maps rows onto column names, leaving values as the strings the wire carried", () => {
-    // No coercion here by design: the schema lives in @kdb/codegen, and a driver that parsed
+    // No coercion here by design: the schema lives in @limidus/kdb-codegen, and a driver that parsed
     // "0123" as 123 would corrupt data.
     const server = new FakeServer((request) =>
       request.kind === "sessionBegin"

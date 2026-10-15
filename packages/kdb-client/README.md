@@ -1,14 +1,14 @@
-# `@kdb/client`
+# `@limidus/kdb-client`
 
 The KDB network driver for TypeScript. Implements [Component 63](../../docs/kdb-spec-layer12-component63-ts-client-sdk.md)
 Phase 1: the wire codec, the transports, and the operation set that `go/kdb/client` exposes.
 
 Zero runtime dependencies. The main entry point touches no Node built-ins, so it loads unchanged
 in browsers, Bun, Deno and Workers-style runtimes; the TCP transport lives behind the
-`@kdb/client/tcp` subpath and is reached lazily.
+`@limidus/kdb-client/tcp` subpath and is reached lazily.
 
 ```ts
-import { connect } from "@kdb/client";
+import { connect } from "@limidus/kdb-client";
 
 const client = await connect("tcp://localhost:9090", { token: "alice:secret" });
 
@@ -115,7 +115,7 @@ Everything thrown extends `KdbError`, which carries the server's `code` and `ret
 it sent them.
 
 ```ts
-import { KdbConflictError, KdbNotFoundError, KdbPreconditionError } from "@kdb/client";
+import { KdbConflictError, KdbNotFoundError, KdbPreconditionError } from "@limidus/kdb-client";
 
 try {
   await client.replaceIf(ns, docId, body, expectedHash);
@@ -140,7 +140,7 @@ than becoming an opaque server failure.
 
 **SQL values come back as strings.** `sqlResult.rows` is `string[][]` on the wire and this layer
 does not guess at types — a driver that silently parsed `"0123"` as `123` would corrupt data.
-Typed coercion arrives with `@kdb/codegen` (Phase 2), which derives types from the KDB schema.
+Typed coercion arrives with `@limidus/kdb-codegen` (Phase 2), which derives types from the KDB schema.
 
 **Content hashes are computed locally.** `getWithHash` and `replaceIf` compare a hash defined as
 a pure function of `(documentId, json)`; it never crosses the wire. That is why those methods,
@@ -175,13 +175,13 @@ it is the first thing to re-run when a frame stops decoding.
 
 ## Versioning and compatibility
 
-`@kdb/client` is published once per KDB release **with the server's version number** (`0.9.0` of
+`@limidus/kdb-client` is published once per KDB release **with the server's version number** (`0.9.0` of
 the package speaks to `0.7.x` servers). The handshake enforces it: the server reports its release
 in `handshakeAck.serverVersion`, and `connect` fails with a `KdbProtocolError` when that is not a
 release this client was published for (same major; while the major is 0, same minor). A server
 that reports no version (older than 0.7.0, or the JVM engine) is refused too, and a from-source
 `0.0.0-dev` server is accepted. Pass `skipVersionCheck: true` to override deliberately.
 
-Pin the dependency to the server release you deploy (`"@kdb/client": "0.9.0"`); the release
+Pin the dependency to the server release you deploy (`"@limidus/kdb-client": "0.9.0"`); the release
 workflow refuses to publish a package whose version differs from the repo's `VERSION`, and
 attaches the tarball to the GitHub release as well as publishing it to npm.

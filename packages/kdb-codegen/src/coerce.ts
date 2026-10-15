@@ -1,5 +1,5 @@
 /**
- * Per-column coercion of SQL result strings - the part `@kdb/client` refuses to guess at.
+ * Per-column coercion of SQL result strings - the part `@limidus/kdb-client` refuses to guess at.
  *
  * Every function here fails loudly on a value that cannot be what the schema says it is. That is
  * deliberate: an empty value in a *required* column, or "abc" in an INTEGER column, means the

@@ -1,7 +1,7 @@
 // Command genfixtures emits the golden fixtures the TypeScript client's conformance tests
 // check themselves against.
 //
-// The point is differential testing, not documentation. @kdb/client is a third, hand-written
+// The point is differential testing, not documentation. @limidus/kdb-client is a third, hand-written
 // implementation of a wire format that already has two (go/kdb/wire and Kotlin's kdb-wire), and
 // "wire-compatible" is a claim that has to be proven rather than asserted. Every value below is
 // produced by the real Go encoder - the same code paths the Go client uses in production - so a
@@ -66,7 +66,7 @@ func main() {
 	replicaDir := flag.String(
 		"replica-out",
 		filepath.Join("..", "packages", "kdb-replica", "test", "golden"),
-		"directory to write @kdb/replica's fixture files into",
+		"directory to write @limidus/kdb-replica's fixture files into",
 	)
 	flag.Parse()
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {

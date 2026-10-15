@@ -1,5 +1,5 @@
 {
-  "name": "@kdb/codegen",
+  "name": "@limidus/kdb-codegen",
   "version": "0.1.0",
   "description": "Types generated from a KDB schema, plus a typed SQL builder over them.",
   "license": "AGPL-3.0-or-later",
@@ -32,10 +32,10 @@
     "pretypecheck": "npm run build"
   },
   "peerDependencies": {
-    "@kdb/client": "^0.1.0"
+    "@limidus/kdb-client": "^0.1.0"
   },
   "devDependencies": {
-    "@kdb/client": "file:../kdb-client",
+    "@limidus/kdb-client": "file:../kdb-client",
     "@types/node": "^22.10.2",
     "typescript": "^5.9.2"
   }

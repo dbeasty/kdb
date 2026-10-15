@@ -14,17 +14,17 @@ so this document is the first.
 
 | Piece | What it is | Consequence for the replica |
 |---|---|---|
-| `@kdb/embed` (`packages/kdb-embed`, `go/wasm/embed`) | **The Go engine compiled to WASM**, fronted by `server.FrameHost`. Durable through `PersistentFs` (`packages/kdb-embed/src/fs.ts`), a TS implementation of the `fs` object Go's js/wasm runtime calls, written behind to IndexedDB in 64 KiB chunks. | Its storage layer is a whole-file-tree image held in memory, so a native replica reuses its IndexedDB backend's transaction discipline, not its shape (§5). There is no TS commit codec, trie or DAG to reuse. |
+| `@limidus/kdb-embed` (`packages/kdb-embed`, `go/wasm/embed`) | **The Go engine compiled to WASM**, fronted by `server.FrameHost`. Durable through `PersistentFs` (`packages/kdb-embed/src/fs.ts`), a TS implementation of the `fs` object Go's js/wasm runtime calls, written behind to IndexedDB in 64 KiB chunks. | Its storage layer is a whole-file-tree image held in memory, so a native replica reuses its IndexedDB backend's transaction discipline, not its shape (§5). There is no TS commit codec, trie or DAG to reuse. |
 | `go/mobile/kdbsync` | A full Go node for gomobile (`bind -target=android|ios`): `embed.OpenFileHost` + `syncnode.Node`, peers over `ws://`/`wss://`/`tcp://`, bearer token, `SyncBoth`. | The same role, as a full Go node on device. It stays available for apps that accept gomobile; the Kotlin replica is the native alternative. |
 | peersync v2 (`peersync/`, `wire/sync_v2_ops.go`) | FETCH/PACK_PAGE with zstd packs, SNAPSHOT_FETCH, SQUASH_HEAD + TREE_NODES + OBJECT_FETCH, PROJECT_FETCH/PAGE/WRITE/WRITE_RESULT, REF_UPDATE, HOME_REQUEST. JSON envelope over TCP or WebSocket (`/kdb/sync`). | Everything a replica needs is already a peersync message, *including* filtered bootstrap and write-back (projections). |
 | `peersync.SyncProjection` + `server/writeback.go` | A KDB-SQL filter per namespace; host filters per commit and per principal (`DocumentReadAction`); local projection namespace `<ns>.projection-<hash>`; write-back with a content-hash precondition, idempotent tx ids, the projection's DAG as outbox. | Filtered replica + offline write queue + per-document read rights are built. Two host-side costs need fixing (§4.3). |
 | `replication.Replicator` / `syncnode.Node` | Peer config (`catchup=`, `Filter`, `WriteBack`, `PreferSnapshot`), interval sync, backoff, conflict queue. | The replica is a `syncnode.Node` with a client-shaped configuration, not a new loop. |
 | Kotlin `kdb-peer-sync` | **v1 only** (HANDSHAKE, COMMIT_FETCH, COMMIT_PUSH); Kotlin's replayer refuses `shallowRoots` (#209). No Android target in Gradle. | A Kotlin-native replica means writing a v2 client *and* shallow-root support in Kotlin's storage. See §10 D2. |
-| `@kdb/client` | Binary wire frames (#202), WS/TCP, zstd *decode* on Node only. | Not the replica: it stays the thin RPC client. The replica exposes the same `Client`/`KdbOperations` surface (§11.3 of Component 63). |
+| `@limidus/kdb-client` | Binary wire frames (#202), WS/TCP, zstd *decode* on Node only. | Not the replica: it stays the thin RPC client. The replica exposes the same `Client`/`KdbOperations` surface (§11.3 of Component 63). |
 
 **Route (owner, 2026-10-13): native replicas in TS and in Kotlin.** Both speak peersync v2 directly, with the
 same messages a Go node uses. Neither embeds the Go engine. That rules out the obvious shortcut (the Go engine
-already inside `@kdb/embed`'s WASM, or `kdbsync` via gomobile). In exchange, the browser bundle stays small, and
+already inside `@limidus/kdb-embed`'s WASM, or `kdbsync` via gomobile). In exchange, the browser bundle stays small, and
 neither platform depends on Go's runtime or a 31 MB WASM. The cost is a second (TS) and third (Kotlin) peersync
 client, so **parity is enforced by golden vectors generated from Go** and by live interop tests against a Go node
 in every PR.
@@ -52,18 +52,18 @@ A replica is deliberately **much less than a node**. That is what makes two nati
 - **It runs no SQL.** Local reads are get-by-id, ordered scans, id ranges and a predicate callback, with optional
   secondary indexes on JSON paths declared by the app. KDB-SQL stays on the server (open decision D10).
 
-### 3.1 Components (TS, new package `@kdb/replica`)
+### 3.1 Components (TS, new package `@limidus/kdb-replica`)
 
 | Component | Port of | Verified by |
 |---|---|---|
-| Canonical codec subset: `CommitPayload` encode/decode, ops (Write, Delete; attachment ops later), `DocumentBody` | `codec/wirecodec.go`, `document/wire.go`, `document/kdb_commit.go`; extends `@kdb/client`'s `wire/hash.ts` | Golden commit vectors from Go (`go/cmd/kdb-tsfixtures` gains `commits.json`): bytes and hash |
+| Canonical codec subset: `CommitPayload` encode/decode, ops (Write, Delete; attachment ops later), `DocumentBody` | `codec/wirecodec.go`, `document/wire.go`, `document/kdb_commit.go`; extends `@limidus/kdb-client`'s `wire/hash.ts` | Golden commit vectors from Go (`go/cmd/kdb-tsfixtures` gains `commits.json`): bytes and hash |
 | SHA-256, **synchronous**, pure TS | - | NIST vectors. WebCrypto is async per call, and the trie needs ~30 hashes per insert (leaf folding), so a promise per hash is too slow. Node uses `node:crypto` when present. |
 | Document trie: 16-ary nibble Merkle, leaf `0x00‖uuid‖contentHash`, internal `0x01‖16×32B`, single-entry subtrees folded | `document/document_tree_trie.go` | Golden tree vectors (sets of ids and content hashes → root); random differential test against a Go helper |
 | Persistent trie storage: nodes keyed by nibble prefix, written per commit, LRU-cached | - | Reopen tests; budget test |
 | peersync v2 client: SYNC_HELLO, REFS, FETCH/PACK_PAGE, SNAPSHOT_FETCH/PAGE, SQUASH_HEAD, TREE_NODES, OBJECT_FETCH, REF_UPDATE, PROJECT_*, PEER_ERROR; JSON envelope | `peersync/v2_client.go`, `squash.go`, `snapshot.go`, `projection.go` | Live interop against a Go node |
-| Framing and transports | Reuse `@kdb/client`'s `wire/frame.ts` and its WebSocket/TCP transports | Existing tests |
-| zstd **decode** for packs | Node: `zlib.zstdDecompressSync` (as `@kdb/client` does). Browser: a TS port of the pure-Kotlin decoder in `kdb-compression` (the "JS zstd" the plan names) | Go zstd golden vectors (`go/kdb/interop/zstd_physical_golden_test.go`). The replica advertises `zstd-pack` only when it has a decoder; pushes go uncompressed (the host accepts both). |
-| Replica store | Modelled on `@kdb/embed`'s `FsBackend` (atomic `apply` batch; IndexedDB backend with strict durability) but **key-value and paged**, not a whole-file-tree image | Crash and reload tests, as `persist.test.ts` does |
+| Framing and transports | Reuse `@limidus/kdb-client`'s `wire/frame.ts` and its WebSocket/TCP transports | Existing tests |
+| zstd **decode** for packs | Node: `zlib.zstdDecompressSync` (as `@limidus/kdb-client` does). Browser: a TS port of the pure-Kotlin decoder in `kdb-compression` (the "JS zstd" the plan names) | Go zstd golden vectors (`go/kdb/interop/zstd_physical_golden_test.go`). The replica advertises `zstd-pack` only when it has a decoder; pushes go uncompressed (the host accepts both). |
+| Replica store | Modelled on `@limidus/kdb-embed`'s `FsBackend` (atomic `apply` batch; IndexedDB backend with strict durability) but **key-value and paged**, not a whole-file-tree image | Crash and reload tests, as `persist.test.ts` does |
 | Replica engine: modes, bootstrap, catch-up, push, projections, write-back, conflict events, poll loop | `replication/replicator.go` behaviour | Live interop |
 
 ### 3.2 API
@@ -205,7 +205,7 @@ backend (tests), an IndexedDB backend (browser) and a file backend (Node; JVM/An
 
 - **Atomicity**: one apply (a pack page's fast-forward, a snapshot page, a projection page, a local write) is one
   backend transaction. The head moves in the same transaction as the documents and trie nodes. On IndexedDB this is
-  one `readwrite` transaction with `durability: "strict"`, as `@kdb/embed`'s backend does.
+  one `readwrite` transaction with `durability: "strict"`, as `@limidus/kdb-embed`'s backend does.
 - **Memory bound**: nothing is loaded whole. Two LRU caches (trie nodes and document bodies) share
   `memory.cacheBytes` (default 32 MiB). A fetch in progress holds at most one page (≤ 4 MiB, the FETCH default) plus
   the documents it touches. Snapshot install builds the trie bottom-up from id-ordered pages, so it never holds
@@ -398,7 +398,7 @@ changed after the first draft of this plan: a record has **several named attachm
   - a local write surviving a reload, then pushed;
   - write-back;
   - a second replica catching up by replay through a zstd pack decoded by the TS port.
-  The page is run by hand, as `@kdb/embed`'s browser pages are; CI runs the Node suites.
+  The page is run by hand, as `@limidus/kdb-embed`'s browser pages are; CI runs the Node suites.
 - The TS zstd decoder runs at about 150 to 280 MB/s, against about 1.1 GB/s for Node's native decoder, which
   Node keeps using. A 4 MiB page decodes in about 20 ms in a browser.
 
@@ -460,7 +460,7 @@ equal, conflicts reported, unreadable documents never sent.
 
 | PR | Scope | Tests |
 |---|---|---|
-| 1 | `@kdb/replica` core: codec subset, sync SHA-256, trie, KV store (memory + IndexedDB), fixture generator for commit and trie vectors | Golden commit/trie/content-hash vectors from Go; store atomicity; trie reopen |
+| 1 | `@limidus/kdb-replica` core: codec subset, sync SHA-256, trie, KV store (memory + IndexedDB), fixture generator for commit and trie vectors | Golden commit/trie/content-hash vectors from Go; store atomicity; trie reopen |
 | 2 | v2 client + full mode: hello/auth, snapshot bootstrap, FETCH/PACK_PAGE fast-forward, squash catch-up, `catchUp=auto`, local commits pushed by REF_UPDATE, poll loop, zstd on Node | Against `kdb-replicahost`: bootstrap; catch-up by replay and by squash (asserts which route ran); push + host merge + pull; reopen; bad token; two replicas converge; memory stays under budget on a namespace larger than it |
 | 3 | Filtered mode + write-back + conflicts + single-home, plus the projection host fixes (§4.3) | Filter and read rights; un-match deletes; id range; offline writes queue and apply on reconnect; conflict event and resolution; NOT_HOME keeps the write pending; host reset cost O(page) |
 | 4 | Browser: zstd decoder (D11), Chromium smoke page, `navigator.storage.persist` | Golden zstd vectors; browser page test |

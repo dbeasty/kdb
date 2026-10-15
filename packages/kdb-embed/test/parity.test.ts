@@ -12,7 +12,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { connect, type KdbOperations } from "@kdb/client";
+import { connect, type KdbOperations } from "@limidus/kdb-client";
 import { goAvailable, startGoServer } from "../../kdb-codegen/test/server.ts";
 import { openEmbedded } from "../src/index.ts";
 

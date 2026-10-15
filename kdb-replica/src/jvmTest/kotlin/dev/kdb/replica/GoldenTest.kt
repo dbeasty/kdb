@@ -44,7 +44,7 @@ class GoldenTest {
 
     @Test
     fun contentHashesMatchGos() {
-        // the hashes.json case @kdb/client checks too
+        // the hashes.json case @limidus/kdb-client checks too
         val f = File(repoRoot, "packages/kdb-client/test/golden/hashes.json")
         for (h in wireJson.parseToJsonElement(f.readText()).arr.map { it.obj }) {
             assertEquals(h.s("contentHash"), contentHash(h.s("docId"), h.s("json")))

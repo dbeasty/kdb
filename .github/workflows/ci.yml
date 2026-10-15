@@ -285,7 +285,7 @@ jobs:
           path: ${{ steps.go.outputs.paths }}
           key: ${{ steps.go.outputs.key }}
 
-  # @kdb/codegen (Component 63 phase 2). Needs the built @kdb/client (a file: dependency) and Go for
+  # @limidus/kdb-codegen (Component 63 phase 2). Needs the built @limidus/kdb-client (a file: dependency) and Go for
   # the end-to-end suite, which runs the generated typed layer against a real Go server. It builds
   # the client itself, so it does not wait for ts-client.
   ts-codegen:
@@ -302,7 +302,7 @@ jobs:
         uses: ./.github/actions/setup-go-cached
         with:
           cache-key: ts-codegen
-      - name: Build @kdb/client
+      - name: Build @limidus/kdb-client
         run: cd ../kdb-client && npm ci && npm run build
       - name: Install
         run: npm ci
@@ -316,7 +316,7 @@ jobs:
           path: ${{ steps.go.outputs.paths }}
           key: ${{ steps.go.outputs.key }}
 
-  # @kdb/embed (Component 63 phase 3): the Go engine compiled to WebAssembly, tested in Node against
+  # @limidus/kdb-embed (Component 63 phase 3): the Go engine compiled to WebAssembly, tested in Node against
   # the same typed suite and differentially against a real Go server.
   ts-embed:
     runs-on: ubuntu-latest
@@ -332,7 +332,7 @@ jobs:
         uses: ./.github/actions/setup-go-cached
         with:
           cache-key: ts-embed
-      - name: Build @kdb/client and @kdb/codegen
+      - name: Build @limidus/kdb-client and @limidus/kdb-codegen
         run: |
           (cd ../kdb-client && npm ci && npm run build)
           (cd ../kdb-codegen && npm ci && npm run build)
@@ -348,7 +348,7 @@ jobs:
           path: ${{ steps.go.outputs.paths }}
           key: ${{ steps.go.outputs.key }}
 
-  # @kdb/replica (docs/kdb-client-replica-plan.md): a native TS replica. Its commit codec and trie
+  # @limidus/kdb-replica (docs/kdb-client-replica-plan.md): a native TS replica. Its commit codec and trie
   # must be byte-identical to Go's, so the golden vectors are regenerated and diffed like the client's.
   ts-replica:
     runs-on: ubuntu-latest
@@ -364,8 +364,8 @@ jobs:
         uses: ./.github/actions/setup-go-cached
         with:
           cache-key: ts-replica
-      # The replica reuses @kdb/client's framing and transports (a file: dependency).
-      - name: Build @kdb/client
+      # The replica reuses @limidus/kdb-client's framing and transports (a file: dependency).
+      - name: Build @limidus/kdb-client
         run: cd ../kdb-client && npm ci && npm run build
       - name: Install
         run: npm ci

@@ -2,7 +2,7 @@
  * A peer sync v2 connection, from the client side: the same frames and messages a Go node's
  * v2 client sends (go/kdb/peersync/v2_client.go, go/kdb/wire/sync_v2_ops.go).
  *
- * v2 frames carry the JSON envelope (tag 1) in the 12-byte frame of @kdb/client's wire layer, and
+ * v2 frames carry the JSON envelope (tag 1) in the 12-byte frame of @limidus/kdb-client's wire layer, and
  * that framing is reused here. Two things differ from the client protocol, though:
  * - v2 is Go-only, so `[]byte` fields are standard base64 strings, not the integer arrays Kotlin
  *   needs;
@@ -10,7 +10,7 @@
  *   as silence.
  */
 
-import { connectWebSocket, decodeFrameBody, encodeFrame, encodeFrameBody, type Transport } from "@kdb/client";
+import { connectWebSocket, decodeFrameBody, encodeFrame, encodeFrameBody, type Transport } from "@limidus/kdb-client";
 import type { TreeAttachmentWire } from "./sync.ts";
 import {
   decodeAttachmentUploadResult,

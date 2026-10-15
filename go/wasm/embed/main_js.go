@@ -1,6 +1,6 @@
 //go:build js && wasm
 
-// Command embed is the in-process KDB engine for @kdb/embed (Component 63 §11, Phase 3).
+// Command embed is the in-process KDB engine for @limidus/kdb-embed (Component 63 §11, Phase 3).
 //
 // It is the same engine the Go server runs - the SQL planner, transaction engines, unique-key
 // registry, document locks - compiled to WebAssembly and fronted by server.FrameHost, the very

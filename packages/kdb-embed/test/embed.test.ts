@@ -6,7 +6,7 @@ import {
   KdbPreconditionError,
   KdbClosedError,
   type KdbOperations,
-} from "@kdb/client";
+} from "@limidus/kdb-client";
 import { openEmbedded, type EmbeddedKdb } from "../src/index.ts";
 import { compileEngine } from "../src/engine.ts";
 

@@ -1,5 +1,5 @@
 /**
- * @kdb/codegen - types generated from a KDB schema, plus a typed SQL builder over them.
+ * @limidus/kdb-codegen - types generated from a KDB schema, plus a typed SQL builder over them.
  *
  * Generated files import `defineTable` from here; applications import the generated file.
  */

@@ -1,5 +1,5 @@
 {
-  "name": "@kdb/client",
+  "name": "@limidus/kdb-client",
   "version": "0.9.0",
   "description": "TypeScript client for KDB - wire codec, transports and the document/SQL/lease operation set.",
   "license": "AGPL-3.0-or-later",

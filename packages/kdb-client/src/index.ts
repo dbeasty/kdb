@@ -1,8 +1,8 @@
 /**
- * @kdb/client - the KDB network driver.
+ * @limidus/kdb-client - the KDB network driver.
  *
  * This entry point touches no Node built-ins, so it loads unchanged in browsers, Bun, Deno and
- * Workers-style runtimes. The TCP transport lives behind the `@kdb/client/tcp` subpath and is
+ * Workers-style runtimes. The TCP transport lives behind the `@limidus/kdb-client/tcp` subpath and is
  * reached lazily by `connect` for a tcp:// or tcps:// URI.
  */
 
@@ -82,7 +82,7 @@ export {
 export type { ConflictDetail, ErrorCode } from "./errors.ts";
 
 // The wire layer is exported for tooling (kdb-inspect-style frame dumps, conformance tests)
-// and for @kdb/embed, which shares the transaction and content-hash encodings.
+// and for @limidus/kdb-embed, which shares the transaction and content-hash encodings.
 export { contentHash, encodeDocumentBody } from "./wire/hash.ts";
 export {
   decodeFrame,

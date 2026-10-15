@@ -38,9 +38,9 @@ jobs:
             echo "tag $GITHUB_REF_NAME does not match VERSION file (expected $want) - bump VERSION and retag" >&2
             exit 1
           fi
-      # @kdb/client is published at the server's version: its handshake refuses any other
+      # @limidus/kdb-client is published at the server's version: its handshake refuses any other
       # release, so a package that disagrees with VERSION would be refused by its own server.
-      - name: "@kdb/client must match VERSION"
+      - name: "@limidus/kdb-client must match VERSION"
         run: |
           got="$(node -p "require('./packages/kdb-client/package.json').version")"
           want="$(cat VERSION)"
@@ -115,8 +115,12 @@ jobs:
           generate_release_notes: true
 
   # The TypeScript client, published once per release at the server's own version. The tarball is
-  # always attached to the GitHub release; the registry publish needs an NPM_TOKEN secret (an
-  # automation token for the @kdb scope) and is skipped, loudly, without one.
+  # always attached to the GitHub release. The registry publish uses npm trusted publishing: this
+  # workflow proves its identity to npm with the job's OIDC token (id-token: write), so there is no
+  # NPM_TOKEN secret to store, renew or leak, and provenance is attached automatically. It needs
+  # npm 11.5.1+ and a trusted publisher registered on npmjs.com for @limidus/kdb-client
+  # (repository dbeasty/kdb, workflow release.yml), which npm only allows once the package exists -
+  # so the very first version is published by hand, and until then this step is skipped, loudly.
   npm-client:
     needs: test-gate
     runs-on: ubuntu-latest
@@ -147,16 +151,15 @@ jobs:
       - name: Attach the tarball to the release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ runner.temp }}/kdb-client-*.tgz
-      - name: Publish to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          files: ${{ runner.temp }}/limidus-kdb-client-*.tgz
+      - name: Publish to npm (trusted publishing)
         run: |
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "::warning::NPM_TOKEN is not set - @kdb/client was NOT published to the registry (the tarball is on the release)"
+          npm install -g npm@^11.5.1
+          if ! npm view @limidus/kdb-client name >/dev/null 2>&1; then
+            echo "::warning::@limidus/kdb-client is not on the registry yet - publish its first version by hand and register this workflow as its trusted publisher (docs/kdb-release-plan.md); it was NOT published (the tarball is on the release)"
             exit 0
           fi
-          npm publish --access public --provenance
+          npm publish --access public
 
   image:
     needs: test-gate

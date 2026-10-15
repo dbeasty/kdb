@@ -1,7 +1,7 @@
 {
-  "name": "@kdb/embed",
+  "name": "@limidus/kdb-embed",
   "version": "0.1.0",
-  "description": "The KDB engine running in-process - Go compiled to WebAssembly, behind the @kdb/client operation set.",
+  "description": "The KDB engine running in-process - Go compiled to WebAssembly, behind the @limidus/kdb-client operation set.",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "engines": {
@@ -28,11 +28,11 @@
     "test": "npm run build && node --test --test-force-exit test/*.test.ts"
   },
   "dependencies": {
-    "@kdb/client": "^0.1.0"
+    "@limidus/kdb-client": "^0.1.0"
   },
   "devDependencies": {
-    "@kdb/codegen": "file:../kdb-codegen",
-    "@kdb/client": "file:../kdb-client",
+    "@limidus/kdb-codegen": "file:../kdb-codegen",
+    "@limidus/kdb-client": "file:../kdb-client",
     "@types/node": "^22.10.2",
     "typescript": "^5.9.2"
   }

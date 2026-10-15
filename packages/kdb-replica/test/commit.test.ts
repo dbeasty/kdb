@@ -66,7 +66,7 @@ test("corrupt payloads are refused, not misread", () => {
 });
 
 test("content hashes match Go's", () => {
-  // the hashes.json case @kdb/client checks too
+  // the hashes.json case @limidus/kdb-client checks too
   const golden = JSON.parse(
     (globalThis as { process: { getBuiltinModule(id: string): { readFileSync(p: URL, e: string): string } } })
       .process.getBuiltinModule("node:fs")

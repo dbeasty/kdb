@@ -1,17 +1,17 @@
 /**
- * @kdb/embed - the KDB engine, running in-process.
+ * @limidus/kdb-embed - the KDB engine, running in-process.
  *
  * `openEmbedded` starts the same Go engine the server runs, compiled to WebAssembly, and returns
  * a `Client` over a loopback transport. There is no connection and no server: the data is local.
  * Because it is a `Client`, it is a `KdbOperations`, so code written against that interface -
- * including everything @kdb/codegen generates - runs unchanged against a server or against this.
+ * including everything @limidus/kdb-codegen generates - runs unchanged against a server or against this.
  *
  * Durability: the database is **in memory**. It lives as long as the returned client does and is
  * gone when the page reloads or the process exits. Persistence (IndexedDB/OPFS) is not part of
  * this release; saying otherwise would be dishonest.
  */
 
-import { Client, type ConnectOptions } from "@kdb/client";
+import { Client, type ConnectOptions } from "@limidus/kdb-client";
 import { compileEngine, startEngine, type WasmSource } from "./engine.ts";
 import { IndexedDbBackend, PersistentFs, type FsBackend } from "./fs.ts";
 

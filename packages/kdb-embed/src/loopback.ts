@@ -1,12 +1,12 @@
 /**
- * The loopback transport: wire frames between @kdb/client and the in-process engine.
+ * The loopback transport: wire frames between @limidus/kdb-client and the in-process engine.
  *
  * It carries exactly the frames a WebSocket would. That is the design (Component 63 §11): the
  * embedded engine is the Go server's own FrameHost, so the client above it and the handshake,
  * sessions, SQL and commit semantics below it are the networked ones, not lookalikes.
  */
 
-import { KdbTransportError, type Transport } from "@kdb/client";
+import { KdbTransportError, type Transport } from "@limidus/kdb-client";
 
 /** What the WASM module hands back from `KdbEmbed.open`. */
 export interface EngineHandle {

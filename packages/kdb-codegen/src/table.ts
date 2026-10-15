@@ -1,5 +1,5 @@
 /**
- * The typed handle: `@kdb/client`'s `unknown` bodies narrowed to the generated document type,
+ * The typed handle: `@limidus/kdb-client`'s `unknown` bodies narrowed to the generated document type,
  * and the SQL builder bound to one namespace.
  *
  * Commits and `baseVersion` stay visible rather than hidden behind an ORM's illusion of mutable
@@ -14,7 +14,7 @@ import type {
   CompareAndSwapOptions,
   KdbOperations,
   Precondition,
-} from "@kdb/client";
+} from "@limidus/kdb-client";
 import {
   CountQuery,
   DeleteQuery,
@@ -48,7 +48,7 @@ export class Table<Doc, Cols extends Columns> {
 
   /** Installs the schema on the namespace (`CREATE TABLE`). Run once, before the first write. */
   async create(options?: CallOptions): Promise<void> {
-    // @kdb/client's exec resolves to the rows affected; the declared result here is void.
+    // @limidus/kdb-client's exec resolves to the rows affected; the declared result here is void.
     await this.#ops.exec(this.meta.namespace, this.meta.createSql, [], options);
   }
 

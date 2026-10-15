@@ -1,6 +1,6 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>@kdb/embed persistence smoke</title>
+<title>@limidus/kdb-embed persistence smoke</title>
 <!--
   Proves persistence in a real browser, on real IndexedDB, across a real page reload.
     cd packages && python3 -m http.server 8123
@@ -9,7 +9,7 @@
   second load is recovering from an unclean shutdown. Add #reset to wipe the database first.
 -->
 <script type="importmap">
-  { "imports": { "@kdb/client": "/kdb-client/dist/index.js" } }
+  { "imports": { "@limidus/kdb-client": "/kdb-client/dist/index.js" } }
 </script>
 <pre id="result">running…</pre>
 <script type="module">

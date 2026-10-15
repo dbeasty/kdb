@@ -1,7 +1,7 @@
 /**
  * The package version, which is also the server release it speaks to.
  *
- * `@kdb/client` is published once per KDB release with the same version number as the server
+ * `@limidus/kdb-client` is published once per KDB release with the same version number as the server
  * (the repo's VERSION file); `test/version.test.ts` and the release workflow both fail if
  * package.json drifts from it. The client trusts that pairing only as far as the handshake
  * confirms it: see `checkServerCompatible`.
@@ -35,7 +35,7 @@ export function checkServerCompatible(
 ): string | undefined {
   if (!serverVersion) {
     return (
-      `the server did not report a version, so @kdb/client ${clientVersion} cannot confirm it ` +
+      `the server did not report a version, so @limidus/kdb-client ${clientVersion} cannot confirm it ` +
       "speaks this wire format (a server older than 0.7.0, or a non-Go engine)"
     );
   }
@@ -46,8 +46,8 @@ export function checkServerCompatible(
   if (server.dev) return undefined;
   if (server.major !== client.major || (client.major === 0 && server.minor !== client.minor)) {
     return (
-      `@kdb/client ${clientVersion} is not compatible with KDB server ${serverVersion}; ` +
-      `install the @kdb/client release that matches the server`
+      `@limidus/kdb-client ${clientVersion} is not compatible with KDB server ${serverVersion}; ` +
+      `install the @limidus/kdb-client release that matches the server`
     );
   }
   return undefined;
