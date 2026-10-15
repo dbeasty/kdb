@@ -68,7 +68,7 @@ func (s *KdbServerRuntime) OpenIndexes(opts stores.Options) (*RegistryIndexProvi
 	if dir == "" {
 		reg = index.NewRegistry(s.Runtime.DefaultNamespace, s.dag, stores.NewFactory(s.dag, opts))
 	} else {
-		reg, report, err = stores.Open(dir, s.Runtime.DefaultNamespace, s.dag, opts)
+		reg, report, err = stores.OpenWithLoadOptions(dir, s.Runtime.DefaultNamespace, s.dag, opts, index.LoadOptions{KeepBehind: true})
 		if err != nil {
 			return nil, err
 		}
@@ -85,12 +85,18 @@ func (s *KdbServerRuntime) OpenIndexes(opts stores.Options) (*RegistryIndexProvi
 	for _, d := range report.Fresh {
 		provider.saved[d.IndexID] = gens[d.IndexID]
 	}
-	if len(report.Stale) == 0 {
+	if len(report.Stale) == 0 && len(report.Behind) == 0 {
 		provider.savedHead, provider.hasSavedHead = reg.Head()
 	}
 
-	if len(report.Stale) > 0 {
-		if err := provider.rebuild(report.StaleIDs()); err != nil {
+	stale := report.StaleIDs()
+	if len(report.Behind) > 0 {
+		// Snapshots from before the last commits (an unclean stop): apply what changed since
+		// instead of rebuilding from every document. Whatever cannot be caught up is rebuilt.
+		stale = append(stale, provider.catchUp(report.Behind)...)
+	}
+	if len(stale) > 0 {
+		if err := provider.rebuild(stale); err != nil {
 			return nil, err
 		}
 	}
@@ -100,7 +106,7 @@ func (s *KdbServerRuntime) OpenIndexes(opts stores.Options) (*RegistryIndexProvi
 		// Written out while the directory is still ours, on every path that closes the
 		// namespace: Release, an idle close, the host's close.
 		s.Runtime.AddCloseHook(provider.Close)
-		if len(report.Stale) > 0 {
+		if len(report.Stale) > 0 || len(report.Behind) > 0 {
 			provider.kickFlush()
 		}
 	}

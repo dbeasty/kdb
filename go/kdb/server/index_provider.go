@@ -55,6 +55,8 @@ type RegistryIndexProvider struct {
 	hasSavedHead bool
 	closed       bool
 	flusher      *indexFlusher
+
+	catchUpCounter
 }
 
 // NewRegistryIndexProvider wires reg to rt. rt supplies the head commit, document bodies for

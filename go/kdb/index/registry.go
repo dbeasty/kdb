@@ -400,6 +400,82 @@ func (r *Registry) RebuildFromScan(scan ScanFunc, headCommit codec.Hash, only []
 	return stats, nil
 }
 
+// DocumentChange is one document a catch-up applies: its body at the target commit, or Deleted.
+type DocumentChange struct {
+	DocID    codec.UUID
+	JSONText string
+	Deleted  bool
+}
+
+// CatchUpStores brings the stores ids - restored from snapshots at an earlier commit (Behind) -
+// to headCommit by applying changes, the documents that differ between the commit their content
+// describes and headCommit, as of headCommit. Every entry is tagged headCommit and the stores'
+// history is dropped, as after a rebuild: the intermediate commits' states were never applied, so
+// a read at one of them reports ErrHistoryUnavailable rather than a wrong answer. Marks the
+// registry at headCommit, so every store must be at it once this returns (the Fresh ones are).
+//
+// This is what lets an open after an unclean stop cost the commits since the last snapshot
+// instead of a rebuild of every index from every document (qtask production plan U5).
+func (r *Registry) CatchUpStores(ids []codec.UUID, headCommit codec.Hash, changes func(yield func(DocumentChange) bool) error) (RebuildStats, error) {
+	r.mu.RLock()
+	var selected []*registryEntry
+	for _, e := range r.entries {
+		if containsID(ids, e.desc.IndexID) {
+			selected = append(selected, e)
+		}
+	}
+	r.mu.RUnlock()
+	var stats RebuildStats
+	for _, e := range selected {
+		r.touch(e)
+	}
+	var applyErr error
+	err := changes(func(c DocumentChange) bool {
+		stats.Documents++
+		for _, e := range selected {
+			if c.Deleted {
+				if err := e.store.Delete(c.DocID, headCommit); err != nil {
+					applyErr = err
+					return false
+				}
+				continue
+			}
+			p, err := e.store.PrepareDocument(c.DocID, c.JSONText)
+			if err != nil {
+				// As a rebuild does: a stored document the index cannot take is left out of it -
+				// and out means its previous entry goes too.
+				stats.Skipped++
+				if stats.FirstError == nil {
+					stats.FirstError = fmt.Errorf("index %s, document %s: %w", e.desc.IndexName(), c.DocID, err)
+				}
+				if err := e.store.Delete(c.DocID, headCommit); err != nil {
+					applyErr = err
+					return false
+				}
+				continue
+			}
+			if _, err := p.Apply(headCommit); err != nil {
+				applyErr = err
+				return false
+			}
+		}
+		return true
+	})
+	if err == nil {
+		err = applyErr
+	}
+	if err != nil {
+		return stats, err
+	}
+	for _, e := range selected {
+		if hf, ok := e.store.(historyForgetter); ok {
+			hf.ForgetHistory()
+		}
+	}
+	r.MarkCommit(headCommit)
+	return stats, nil
+}
+
 // historyForgetter is a store that keeps history and can be told its content has none.
 type historyForgetter interface{ ForgetHistory() }
 
@@ -554,6 +630,23 @@ type LoadReport struct {
 	// Stale stores had no snapshot, an unreadable one, or one taken at a different head; they
 	// are registered but empty and must be rebuilt (RebuildFromScan with StaleIDs()).
 	Stale []Descriptor
+	// Behind stores (LoadOptions.KeepBehind only) were restored from a snapshot taken at an
+	// earlier commit than the DAG head: they hold that commit's content and must be brought to
+	// the head (CatchUpStores) - or cleared and rebuilt - before they are searched.
+	Behind []BehindStore
+}
+
+// BehindStore is a store restored at Head, a commit other than the DAG head.
+type BehindStore struct {
+	Descriptor Descriptor
+	Head       codec.Hash
+}
+
+// LoadOptions tunes LoadRegistryWithOptions.
+type LoadOptions struct {
+	// KeepBehind keeps a store whose snapshot was taken at another commit the DAG holds,
+	// reporting it Behind instead of clearing it as Stale. The caller must catch it up.
+	KeepBehind bool
 }
 
 // StaleIDs returns the ids of the stores that need RebuildFromScan.
@@ -570,6 +663,11 @@ func (l LoadReport) StaleIDs() []codec.UUID {
 // the snapshot's headCommitHex equals the DAG head. Anything else is reported Stale for the
 // caller to rebuild by scan (Layer 16 §6.5).
 func LoadRegistry(dir, namespaceID string, d *dag.InMemoryCommitDag, factory StoreFactory) (*Registry, LoadReport, error) {
+	return LoadRegistryWithOptions(dir, namespaceID, d, factory, LoadOptions{})
+}
+
+// LoadRegistryWithOptions is LoadRegistry with options (see LoadOptions).
+func LoadRegistryWithOptions(dir, namespaceID string, d *dag.InMemoryCommitDag, factory StoreFactory, opts LoadOptions) (*Registry, LoadReport, error) {
 	r := NewRegistry(namespaceID, d, factory)
 	var report LoadReport
 	cat, err := LoadCatalog(dir)
@@ -591,6 +689,13 @@ func LoadRegistry(dir, namespaceID string, d *dag.InMemoryCommitDag, factory Sto
 			return nil, report, err
 		}
 		m, err := LoadStoreSnapshot(IndexDir(dir, desc.IndexID), store)
+		if err == nil && m.HeadCommitHex != dagHead.Hex() && opts.KeepBehind {
+			if at, herr := codec.HashFromHex(m.HeadCommitHex); herr == nil && d.HasCommit(at) {
+				report.Behind = append(report.Behind, BehindStore{Descriptor: desc, Head: at})
+				allFresh = false
+				continue
+			}
+		}
 		if err != nil || m.HeadCommitHex != dagHead.Hex() {
 			_ = store.Clear()
 			report.Stale = append(report.Stale, desc)
