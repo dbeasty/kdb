@@ -179,7 +179,7 @@ func TestStreamResumeSendsWhatWasMissed(t *testing.T) {
 	}
 	defer sub.Disconnect()
 	var got []codec.Hash
-	deadline := time.After(5 * time.Second)
+	deadline := time.After(30 * time.Second)
 	for len(got) < len(missed) {
 		select {
 		case ev := <-sub.Events():

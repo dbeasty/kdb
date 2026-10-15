@@ -202,7 +202,7 @@ func serviceSpecs() []settingSpec {
 		{
 			key: "auth.rbac", flag: "rbac", env: "KDB_RBAC",
 			scope: ScopeProcess, mutability: MutabilityRestart,
-			help:   "enable RBAC (in-memory user/role registry)",
+			help:   "enable RBAC (durable user/role registry under --data-dir, in-memory without it; bootstrap with `kdb-service user create`)",
 			value:  yn(func(s ServiceSettings) bool { return s.RBAC }),
 			inFile: func(f *ServiceFile) bool { return f.RBAC != nil },
 		},

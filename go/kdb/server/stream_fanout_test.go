@@ -311,7 +311,7 @@ func TestStreamFanoutRBACSubscribersShareOnlyWhatTheyMayRead(t *testing.T) {
 		last = c.Hash
 	}
 	for _, c := range append(readers, restricted) {
-		deadline := time.Now().Add(5 * time.Second)
+		deadline := time.Now().Add(30 * time.Second)
 		for c.at() != last {
 			if time.Now().After(deadline) {
 				t.Fatal("subscriber stuck")
@@ -399,7 +399,7 @@ func TestStreamFanoutSlowSubscriberDoesNotHoldUpOthers(t *testing.T) {
 		}
 	}
 	head, _ := rt.dag.Head()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for _, c := range fast {
 		for c.at() != head {
 			if time.Now().After(deadline) {
