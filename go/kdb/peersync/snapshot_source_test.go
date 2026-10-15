@@ -125,6 +125,9 @@ func TestSnapshotServedFromSortedCopy(t *testing.T) {
 func TestSnapshotInstallFromSortedCopy(t *testing.T) {
 	defer func(docs, run int) { snapshotSortMinDocs, snapshotRunBytes = docs, run }(snapshotSortMinDocs, snapshotRunBytes)
 	snapshotSortMinDocs, snapshotRunBytes = 1, 8_000
+	// The host's copy is built in the background and can outlive the sync; let it finish before
+	// the test's directories go.
+	defer waitSnapshotBuilds()
 
 	ns := "app/snap-sorted-install"
 	remote := newTestNamespaces(t, ns)
@@ -141,5 +144,18 @@ func TestSnapshotInstallFromSortedCopy(t *testing.T) {
 	}
 	if mustHead(t, local.side(ns)) != mustHead(t, r) {
 		t.Fatal("local main is not the host's head")
+	}
+}
+
+// waitSnapshotBuilds waits for every sorted copy being built to finish.
+func waitSnapshotBuilds() {
+	snapshotSources.Lock()
+	var pending []*sortedBodies
+	for _, src := range snapshotSources.m {
+		pending = append(pending, src)
+	}
+	snapshotSources.Unlock()
+	for _, src := range pending {
+		<-src.done
 	}
 }
