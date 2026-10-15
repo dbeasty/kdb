@@ -50,14 +50,7 @@ public data class DocumentTree(
      * cursor in O(depth + page) through the trie instead of sorting every id per page.
      */
     public fun idsAfter(after: KdbUuid?): Iterator<KdbUuid> {
-        val root = trieRoot
-        if (root == null) {
-            // Only a tree made with the constructor lacks a trie; building one would hash every entry.
-            val sorted = entries.keys.map { it to it.toString() }.sortedBy { it.second }
-            val from = after?.toString()
-            return sorted.asSequence().filter { from == null || it.second > from }.map { it.first }.iterator()
-        }
-        val leaves = trieIterateAfter(root, after)
+        val leaves = TrieLeafIterator(trieRoot, after)
         return object : Iterator<KdbUuid> {
             override fun hasNext(): Boolean = leaves.hasNext()
 

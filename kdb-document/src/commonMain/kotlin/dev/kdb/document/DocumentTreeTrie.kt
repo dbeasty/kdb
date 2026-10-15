@@ -260,61 +260,6 @@ internal fun trieGet(root: TrieNode?, id: KdbUuid): KdbHash? {
     return null
 }
 
-/** Every leaf beneath [root], in nibble order, which is UUID byte (and canonical string) order. */
-internal class TrieLeafIterator(root: TrieNode?) : Iterator<TrieLeaf> {
-    // Internal nodes on the current path, each with the next child slot to visit.
-    private val nodes = ArrayList<TrieNode>()
-    private val slots = ArrayList<Int>()
-    private var next: TrieLeaf? = null
-
-    init {
-        if (root != null) descend(root)
-    }
-
-    private fun descend(start: TrieNode) {
-        val leaf = start.leaf
-        if (leaf != null) {
-            next = leaf
-            return
-        }
-        nodes.add(start)
-        slots.add(0)
-        advance()
-    }
-
-    private fun advance() {
-        next = null
-        while (nodes.isNotEmpty()) {
-            val top = nodes.size - 1
-            val children = nodes[top].children
-            var i = slots[top]
-            while (children != null && i < children.size && children[i] == null) i++
-            if (children == null || i >= children.size) {
-                nodes.removeAt(top)
-                slots.removeAt(top)
-                continue
-            }
-            slots[top] = i + 1
-            val child = children[i]!!
-            val leaf = child.leaf
-            if (leaf != null) {
-                next = leaf
-                return
-            }
-            nodes.add(child)
-            slots.add(0)
-        }
-    }
-
-    override fun hasNext(): Boolean = next != null
-
-    override fun next(): TrieLeaf {
-        val out = next ?: throw NoSuchElementException()
-        advance()
-        return out
-    }
-}
-
 /** Constructs a trie from scratch (O(n)); see trieBuild's Go counterpart. */
 internal fun trieBuild(entries: Map<KdbUuid, KdbHash>): TrieNode? {
     var root: TrieNode? = null
@@ -331,15 +276,13 @@ private fun uuidAfter(a: KdbUuid, b: KdbUuid): Boolean =
     if (a.msb != b.msb) a.msb.toULong() > b.msb.toULong() else a.lsb.toULong() > b.lsb.toULong()
 
 /**
- * The trie's entries in id order (UUID byte order, which is also the order of their canonical
- * lowercase strings), starting at the first id after [after], or at the first id when it is null.
+ * Every leaf beneath [root] in nibble order, which is UUID byte (and canonical string) order,
+ * starting at the first id after [after], or at the first id when it is null.
  *
  * Finding the start walks one path, so a page of k entries costs O(depth + k) rather than the
  * O(n log n) a sort of every id costs. The iterator holds a stack of at most TRIE_DEPTH frames.
  */
-internal fun trieIterateAfter(root: TrieNode?, after: KdbUuid?): Iterator<TrieLeaf> = TrieSeekIterator(root, after)
-
-private class TrieSeekIterator(root: TrieNode?, after: KdbUuid?) : Iterator<TrieLeaf> {
+internal class TrieLeafIterator(root: TrieNode?, after: KdbUuid? = null) : Iterator<TrieLeaf> {
     // Frame k is an internal node whose children from next[k] on are still to be visited.
     private val nodes = arrayOfNulls<TrieNode>(TRIE_DEPTH + 1)
     private val next = IntArray(TRIE_DEPTH + 1)

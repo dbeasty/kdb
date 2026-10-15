@@ -7,7 +7,6 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
-import kotlin.test.assertNull
 
 /**
  * DocumentTree.idsAfter must give exactly what sorting every id by its canonical string and dropping
@@ -85,14 +84,14 @@ class DocumentTreeSeekTest {
     }
 
     @Test
-    fun emptyAndTrieLessTrees() {
+    fun emptyTreesAndTreesOverAPlainMap() {
         assertFalse(DocumentTree.EMPTY.idsAfter(null).hasNext())
         assertFalse(DocumentTree.EMPTY.idsAfter(KdbUuid(1, 2)).hasNext())
         val r = Random(3)
         val all = sampleIds(r, 60)
         val entries = all.withIndex().associate { (i, id) -> id to hash(i) }
-        val bare = DocumentTree(DocumentTree.build(entries).treeHash, entries)
-        assertNull(bare.trieRoot)
+        // A tree made with the constructor over a plain map builds its trie on first use.
+        val bare = DocumentTree(DocumentTree.build(entries).treeHash, HashMap(entries))
         for (c in cursors(r, all)) assertEquals(reference(entries, c), ids(bare, c), "cursor=$c")
     }
 
