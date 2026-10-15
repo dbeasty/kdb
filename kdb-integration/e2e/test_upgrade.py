@@ -23,6 +23,7 @@ in e2e-nightly.yml), not per PR.
 from __future__ import annotations
 
 import random
+import re
 import time
 
 import pytest
@@ -51,6 +52,21 @@ from server_fixtures import (
 )
 
 PREV = prev_service_bin()
+
+
+def _release(binary: str | None) -> tuple[int, int, int]:
+    """(major, minor, patch) of a kdb-service binary; a from-source build reads as (0, 0, 0)."""
+    m = re.match(r"v?(\d+)\.(\d+)\.(\d+)", binary_version(binary)) if binary else None
+    return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
+
+
+# Some scenarios are about what v0.6.2 does NOT know (shallow roots, version 2 chains); against a
+# v0.7.x previous release there is nothing old to observe. The nightly runs this file against
+# both, so each such test says which previous release it is about.
+PREV_RELEASE = _release(PREV)
+PREV_IS_V06 = PREV is not None and (0, 1, 0) <= PREV_RELEASE < (0, 7, 0)
+needs_v06_prev = pytest.mark.skipif(
+    not PREV_IS_V06, reason="about what a v0.6.x node does not know; the previous binary is newer")
 
 pytestmark = [
     pytest.mark.server,
@@ -277,6 +293,7 @@ def test_deepen_peer_option_recovers_a_stuck_snapshot_joiner(make_cluster):
     converge(c, acked, "stuck joiner restarted with deepen=true", timeout=60)
 
 
+@needs_v06_prev
 def test_old_pushers_into_a_new_snapshot_hub_get_a_typed_error_then_heal_on_upgrade(make_cluster):
     """A snapshot hub that is only ever pushed to, on this build, with v0.6.2 pushers. An old
     pusher does not know SHALLOW_BOUNDARY, so it cannot send the fork point's state: its push of
@@ -339,6 +356,7 @@ def wait_chain(c: Cluster, want: str, nodes=None, timeout: float = 30.0) -> None
                          "\n".join(f"n{i}: {chain_of(n).get('hash')}" for i, n in enumerate(nodes)))
 
 
+@needs_v06_prev
 def test_resolution_chain_version_2_after_a_rolling_upgrade(make_cluster):
     """Version 2 chains (#130's F1, F2, F4 merge semantics) change what a merge builds, so they are
     gated: a chain without a version keeps the original semantics on every node, byte for byte -
@@ -591,6 +609,10 @@ def test_attachments_wait_for_every_node_to_be_upgraded(make_cluster, tmp_path):
         assert got.get("sha256") == hashlib.sha256(data).hexdigest(), (n.binary, got)
 
 
+@pytest.mark.xfail(PREV_IS_V06, strict=True, reason=(
+    "v0.6.2 reads the first attachment commit as the end of its log and serves the state before "
+    "it, silently dropping every later commit (#81 made v0.7 refuse a log it cannot decode). "
+    "Never roll a namespace with attachments back to v0.6.x."))
 def test_rollback_after_attachments_is_refused_by_the_old_binary(tmp_path):
     """Downgrade is not supported, and attachments make it impossible: commits carrying them do
     not decode on an older build. What matters is that the old binary refuses to open the data
