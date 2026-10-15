@@ -145,6 +145,10 @@ func TestKotlinRefusesRatherThanRollingBackADamagedNewestSegment(t *testing.T) {
 	}
 }
 
+// unixLines trims s and turns Windows line ends into \n: the JVM prints \r\n on Windows, and
+// callers split and compare lines.
+func unixLines(s string) string { return strings.TrimSpace(strings.ReplaceAll(s, "\r\n", "\n")) }
+
 type cliResult struct {
 	stdout, stderr string
 	code           int
@@ -158,7 +162,7 @@ func kotlinCLIResult(t *testing.T, repo string, args ...string) cliResult {
 	cmd := kotlinCommand(repo, args...)
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	err := cmd.Run()
-	res := cliResult{stdout: strings.TrimSpace(out.String()), stderr: strings.TrimSpace(errb.String())}
+	res := cliResult{stdout: unixLines(out.String()), stderr: unixLines(errb.String())}
 	if cmd.ProcessState != nil {
 		res.code = cmd.ProcessState.ExitCode()
 	} else if err != nil {

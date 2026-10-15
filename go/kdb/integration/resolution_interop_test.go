@@ -157,7 +157,7 @@ func kotlinCLI(t *testing.T, repo string, args ...string) string {
 		}
 		t.Fatalf("kotlin %v: %v\n%s\n%s", args, err, out, stderr)
 	}
-	return strings.TrimSpace(string(out))
+	return unixLines(string(out))
 }
 
 // lastLine is the last non-empty line of a CLI's output: the value it printed. Anything before it
