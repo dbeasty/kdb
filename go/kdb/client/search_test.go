@@ -3,6 +3,7 @@ package client_test
 import (
 	"context"
 	"errors"
+	"github.com/limidus/kdb/go/kdb/internal/testtime"
 	"testing"
 	"time"
 
@@ -98,7 +99,7 @@ func TestSearchRoundTripsAgainstAListener(t *testing.T) {
 		if req.Vector == nil || req.Vector.Index != "embedding" || len(req.Vector.Vector) != 2 || req.Vector.Vector[1] != -0.25 {
 			t.Fatalf("vector arm = %+v", req.Vector)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testtime.Scale(time.Second)):
 		t.Fatal("the provider never saw the request")
 	}
 }

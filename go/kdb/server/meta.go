@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"sort"
 	"strings"
@@ -606,7 +607,9 @@ func (m *MetaStore) reconcileLocked() error {
 	ix := indexDocs(docs)
 	// Namespaces not served here are applied if and when this process opens them (ApplyTo).
 	for ns, rt := range m.set.Runtimes() {
-		for _, d := range ix.effective(ns) {
+		eff := ix.effective(ns)
+		m.createIndexesInOneScan(rt, eff)
+		for _, d := range eff {
 			m.apply(rt, d)
 		}
 	}
@@ -651,8 +654,39 @@ func (m *MetaStore) ApplyTo(rt *KdbServerRuntime) {
 	if err != nil {
 		return
 	}
-	for _, d := range indexDocs(docs).effective(rt.Runtime.DefaultNamespace) {
+	eff := indexDocs(docs).effective(rt.Runtime.DefaultNamespace)
+	m.createIndexesInOneScan(rt, eff)
+	for _, d := range eff {
 		m.apply(rt, d)
+	}
+}
+
+// createIndexesInOneScan builds every index docs define that rt does not have yet in a single
+// pass over its documents, ahead of apply, which then finds each one in place. One at a time,
+// every index scanned the namespace again: a restored namespace with 38 indexes read its
+// documents 38 times before it could answer an indexed query (qtask production plan U5).
+// Anything this does not build - a changed definition, an error - apply handles as before.
+func (m *MetaStore) createIndexesInOneScan(rt *KdbServerRuntime, docs []metaDoc) {
+	p, ok := rt.SQLIndexProvider().(*RegistryIndexProvider)
+	if !ok || p == nil {
+		return
+	}
+	have := map[string]bool{}
+	for _, desc := range p.registry.Descriptors() {
+		have[desc.IndexName()] = true
+	}
+	var stmts []sql.StmtCreateIndex
+	for _, d := range docs {
+		if d.Kind != "index" || d.Dropped || have[d.Name] {
+			continue
+		}
+		stmts = append(stmts, sql.StmtCreateIndex{Name: d.Name, Table: d.Table, Fields: d.Fields, Using: d.Using, Unique: d.Unique, With: d.With})
+	}
+	if len(stmts) < 2 {
+		return
+	}
+	if err := p.createIndexesLocal(stmts, sql.QueryContext{NamespaceID: rt.Runtime.DefaultNamespace}); err != nil {
+		slog.Warn("could not build the defined indexes together; building them one at a time", "namespace", rt.Runtime.DefaultNamespace, "error", err)
 	}
 }
 

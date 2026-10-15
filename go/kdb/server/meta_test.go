@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/hex"
+	"github.com/limidus/kdb/go/kdb/internal/testtime"
 	"testing"
 	"time"
 
@@ -89,7 +90,7 @@ func TestIndexCreatedOnAIsBuiltOnB(t *testing.T) {
 	syncNodes(t, a, b)
 
 	pb := b.data.SQLIndexProvider().(*RegistryIndexProvider)
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(testtime.Scale(3 * time.Second))
 	for time.Now().Before(deadline) {
 		hits, _, err := pb.Search(context.Background(), wire.SearchMessage{
 			Namespace: "app/data", Text: &wire.SearchTextArm{Index: "titles", Query: "definitions"}, Limit: 5,
@@ -206,7 +207,7 @@ func TestIndexRecreatedAfterDropReachesPeer(t *testing.T) {
 	syncNodes(t, a, b)
 
 	pb := b.data.SQLIndexProvider().(*RegistryIndexProvider)
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(testtime.Scale(3 * time.Second))
 	for time.Now().Before(deadline) {
 		hits, _, err := pb.Search(context.Background(), wire.SearchMessage{
 			Namespace: "app/data", Text: &wire.SearchTextArm{Index: "titles", Query: "recreated"}, Limit: 5,

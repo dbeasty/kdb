@@ -72,7 +72,25 @@ func (e *Executor) executeSelect(query SelectQuery, plan PhysicalPlan, residual 
 	offset := query.Offset
 
 	grouped := isGroupedQuery(query)
-	pushLimit := !grouped && len(query.OrderBy) == 0 && !query.Distinct
+	// ORDER BY kdb_id (ascending) is the order a keyset scan already produces: read the rows in
+	// id order, starting past any `kdb_id > 'x'` bound, and stop at the LIMIT, instead of
+	// materializing every candidate to sort it. This is the shape of a client paging a filtered
+	// read by its last id (WHERE ... AND kdb_id > ? ORDER BY kdb_id LIMIT n).
+	ctxIn, keysetIn := ctx, ctx.keyset
+	idOrder := !grouped && !query.Distinct && !ctx.noIDOrder && isKdbIDOrder(query.OrderBy, env)
+	if idOrder && !ctx.keyset {
+		if _, ok := e.Storage.(storage.OrderedScanner); ok {
+			ctx.keyset = true
+		} else {
+			idOrder = false
+		}
+	}
+	if ctx.keyset {
+		if lo := kdbIDLowerBound(query.Where, env); lo != nil && (ctx.scanAfter == nil || bytes.Compare(lo.Bytes(), ctx.scanAfter.Bytes()) > 0) {
+			ctx.scanAfter = lo
+		}
+	}
+	pushLimit := !grouped && (len(query.OrderBy) == 0 || idOrder) && !query.Distinct
 	// How many ids a full scan needs before it may stop. Only a query with nothing to filter
 	// afterwards and nothing that needs every row can stop early; everything else must see the
 	// whole namespace, because the residual WHERE runs after id resolution. Stopping a scan at
@@ -82,7 +100,11 @@ func (e *Executor) executeSelect(query SelectQuery, plan PhysicalPlan, residual 
 	// A keyset page's scan applies the residual itself and keeps only matching documents in id
 	// order, so it can stop at the page however selective the WHERE is - except when the scan
 	// hands back bare ids (scanIDsOnly) and the residual runs afterwards.
-	if pushLimit && (residual == nil || (ctx.keyset && !e.scanIDsOnly)) {
+	//
+	// The same holds for any scan or id list that applies the residual as it reads and yields
+	// rows in the order they are returned: the first `want` matches are the answer, so reading on
+	// past them only burned I/O (a page of 200 over a user's 8,000 tasks read all 8,000).
+	if pushLimit && (residual == nil || !e.scanIDsOnly) {
 		// Rows wanted: the LIMIT, but never more than one past the result bound (so an
 		// overflow is detectable without reading the rest of the namespace), after skipping
 		// OFFSET rows.
@@ -100,8 +122,34 @@ func (e *Executor) executeSelect(query SelectQuery, plan PhysicalPlan, residual 
 	} else if ok {
 		return res, nil
 	}
+	if k, ok := topKEligible(query, idOrder); ok && !e.scanIDsOnly && !ctx.keyset {
+		docs, label, err := e.topKDocs(query, residual, env, ctx, k)
+		if err != nil {
+			return QueryResult{}, err
+		}
+		rows := applyLimitOffset(e.plainRows(query, env, docs), limit, offset)
+		if max := e.maxResultRows(ctx); len(rows) > max {
+			return QueryResult{}, &ResultRowLimitError{Limit: max}
+		}
+		for _, r := range rows {
+			ctx.Stats.addRetained(rowBytes(r))
+		}
+		if err := ctx.overRetainedLimit(); err != nil {
+			return QueryResult{}, err
+		}
+		if rows == nil {
+			rows = []QueryRow{}
+		}
+		return QueryResult{Columns: columnsFor(query, ctx.Schema), Rows: rows, Plan: label}, nil
+	}
 	src, err := e.chooseAccessPath(query.Where, query.OrderBy, env, ctx, stopAt, residual)
 	if err != nil {
+		if idOrder && !keysetIn && errors.Is(err, storage.ErrOrderedScanUnsupported) {
+			// The adapter under this namespace cannot scan in order after all: sort instead.
+			retry := ctxIn
+			retry.noIDOrder = true
+			return e.executeSelect(query, plan, residual, retry)
+		}
 		return QueryResult{}, err
 	}
 	label := src.label
@@ -124,7 +172,7 @@ func (e *Executor) executeSelect(query SelectQuery, plan PhysicalPlan, residual 
 			ids = applyLimitOffset(ids, limit, offset)
 			limited = true
 		}
-		docs, err = e.materialize(ids, residual, env, ctx)
+		docs, err = e.materializeUpTo(ids, residual, env, ctx, stopAt)
 		if err != nil {
 			return QueryResult{}, err
 		}
@@ -140,7 +188,7 @@ func (e *Executor) executeSelect(query SelectQuery, plan PhysicalPlan, residual 
 		rows = e.plainRows(query, env, docs)
 	}
 	var rowDocIDs []codec.UUID
-	if ctx.keyset && !grouped && len(query.OrderBy) == 0 && !query.Distinct {
+	if ctx.keyset && !grouped && (len(query.OrderBy) == 0 || idOrder) && !query.Distinct {
 		rowDocIDs = make([]codec.UUID, len(docs))
 		for i, d := range docs {
 			rowDocIDs[i] = d.doc.ID
@@ -159,6 +207,9 @@ func (e *Executor) executeSelect(query SelectQuery, plan PhysicalPlan, residual 
 	}
 	for _, r := range rows {
 		ctx.Stats.addRetained(rowBytes(r))
+	}
+	if err := ctx.overRetainedLimit(); err != nil {
+		return QueryResult{}, err
 	}
 	if rows == nil {
 		rows = []QueryRow{}
@@ -251,23 +302,28 @@ func (e *Executor) keysetEligible(query SelectQuery, page PageRequest) bool {
 	if page.OffsetOnly || (page.Offset > 0 && page.After == nil) {
 		return false
 	}
-	if len(query.OrderBy) > 0 || query.Distinct || isGroupedQuery(query) || query.Offset > 0 {
+	ordered := len(query.OrderBy) > 0 && !isKdbIDOrder(query.OrderBy, newEvalEnv(schema.KdbSchema{}, nil, query.From))
+	if ordered || query.Distinct || isGroupedQuery(query) || query.Offset > 0 {
 		return false
 	}
 	_, ok := e.Storage.(storage.OrderedScanner)
 	return ok
 }
 
-// tryCountOnly answers `SELECT COUNT(*) [, COUNT(*) ...] FROM t [WHERE col = const]` from counters
-// instead of reading documents, so counting a large namespace costs the same as counting a small
-// one and is not subject to the scan row budget (nothing is scanned).
+// tryCountOnly answers `SELECT COUNT(*) [, COUNT(*) ...] FROM t [WHERE ...]` without holding the
+// documents it counts, so counting a large namespace never materializes it.
 //
-// It declines - leaving the ordinary path to run - unless the answer is provably the one reading
-// the documents would give: the projections are all bare COUNT(*) with no grouping or DISTINCT;
-// the storage can count the tree without reading it and says every document in it is visible
-// (storage.DocumentCounter, which declines while expiry hides documents); and the WHERE is either
-// absent or a single equality on a string or boolean constant that an index serves exactly (the
-// index count and a re-check of the predicate agree for those).
+// It declines - leaving the ordinary path to run - unless the projections are all bare COUNT(*)
+// with no grouping or DISTINCT. Then, cheapest first:
+//
+//   - from counters, reading nothing: the storage counts the tree without reading it
+//     (storage.DocumentCounter, which subtracts what expiry hides when the expiry index can say)
+//     and the WHERE is absent or an AND of equalities / IN lists on string or boolean constants
+//     that indexes serve exactly (an index count and a re-check of the predicate agree for those);
+//     documents the storage hides from reads but an index still holds are listed
+//     (storage.HiddenDocumentLister) and taken back out;
+//   - otherwise by streaming: the documents the access path yields are checked against the WHERE
+//     one at a time and counted, never retained. Subject to the scan row budget like any scan.
 func (e *Executor) tryCountOnly(query SelectQuery, env *evalEnv, ctx QueryContext) (QueryResult, bool, error) {
 	if query.Distinct || len(query.GroupBy) > 0 || len(query.Projections) == 0 || query.Offset > 0 {
 		return QueryResult{}, false, nil
@@ -281,10 +337,6 @@ func (e *Executor) tryCountOnly(query SelectQuery, env *evalEnv, ctx QueryContex
 			return QueryResult{}, false, nil
 		}
 	}
-	counter, ok := e.Storage.(storage.DocumentCounter)
-	if !ok {
-		return QueryResult{}, false, nil
-	}
 	atCommit, err := e.atCommit(ctx)
 	if err != nil {
 		return QueryResult{}, false, err
@@ -293,23 +345,118 @@ func (e *Executor) tryCountOnly(query SelectQuery, env *evalEnv, ctx QueryContex
 	if err != nil {
 		return QueryResult{}, false, err
 	}
-	total, ok, err := counter.CountDocuments(ctx.NamespaceID, commit.DocumentTreeHash)
-	if err != nil || !ok {
+	n, label, ok, err := e.countFromCounters(query.Where, env, ctx, commit.DocumentTreeHash)
+	if err != nil {
 		return QueryResult{}, false, err
 	}
-	n, label := total, "count:tree"
-	if query.Where != nil {
-		got, ok := e.countByIndex(query.Where, env, ctx)
-		if !ok {
-			return QueryResult{}, false, nil
+	if !ok {
+		if n, label, err = e.countByStreaming(query.Where, env, ctx); err != nil {
+			return QueryResult{}, false, err
 		}
-		n, label = got, "count:index"
 	}
 	row := QueryRow{Values: make([]Cell, len(query.Projections))}
 	for i := range row.Values {
 		row.Values[i] = CellLong{Value: int64(n)}
 	}
 	return QueryResult{Columns: columnsFor(query, ctx.Schema), Rows: []QueryRow{row}, Plan: label}, true, nil
+}
+
+// countFromCounters is tryCountOnly's no-read tier; ok=false when it cannot vouch for the answer.
+func (e *Executor) countFromCounters(where Expr, env *evalEnv, ctx QueryContext, treeHash codec.Hash) (int, string, bool, error) {
+	counter, ok := e.Storage.(storage.DocumentCounter)
+	if !ok {
+		return 0, "", false, nil
+	}
+	total, ok, err := counter.CountDocuments(ctx.NamespaceID, treeHash)
+	if err != nil || !ok {
+		return 0, "", false, err
+	}
+	if where == nil {
+		return total, "count:tree", true, nil
+	}
+	got, ok := e.countByIndex(where, env, ctx)
+	if !ok {
+		return 0, "", false, nil
+	}
+	if lister, isLister := e.Storage.(storage.HiddenDocumentLister); isLister {
+		hidden, ok, err := lister.HiddenDocuments(ctx.NamespaceID, treeHash)
+		if err != nil || !ok {
+			return 0, "", false, err
+		}
+		for _, d := range hidden {
+			if env.predicate(where, newEvalDoc(d)) {
+				got--
+			}
+		}
+	}
+	return got, "count:index", true, nil
+}
+
+// countByStreaming counts the documents where accepts, reading them through the access path the
+// query would use but keeping none: one document is live at a time, however many match.
+func (e *Executor) countByStreaming(where Expr, env *evalEnv, ctx QueryContext) (int, string, error) {
+	n := 0
+	if where != nil {
+		ids, label, found, err := e.chooseIndexPath(where, nil, env, ctx)
+		if err != nil {
+			return 0, "", err
+		}
+		if found {
+			atCommit, err := e.atCommit(ctx)
+			if err != nil {
+				return 0, "", err
+			}
+			commit, err := e.DAG.GetCommitOrThrow(atCommit)
+			if err != nil {
+				return 0, "", err
+			}
+			for i, id := range ids {
+				if ctx.RowBudget > 0 && i >= ctx.RowBudget {
+					return 0, "", &ScanRowBudgetExceededError{Budget: ctx.RowBudget}
+				}
+				doc, err := e.Storage.GetDocument(ctx.NamespaceID, id, commit.DocumentTreeHash)
+				if err != nil {
+					return 0, "", err
+				}
+				ctx.Stats.addExamined(1)
+				if doc == nil {
+					continue
+				}
+				ctx.Stats.addDocRead(len(doc.JSON))
+				if env.predicate(where, newEvalDoc(*doc)) {
+					n++
+				}
+			}
+			return n, label, nil
+		}
+	}
+	atCommit, err := e.atCommit(ctx)
+	if err != nil {
+		return 0, "", err
+	}
+	commit, err := e.DAG.GetCommitOrThrow(atCommit)
+	if err != nil {
+		return 0, "", err
+	}
+	examined := 0
+	err = e.Storage.ScanDocuments(ctx.NamespaceID, commit.DocumentTreeHash, 256, func(batch []document.Document) error {
+		for _, d := range batch {
+			examined++
+			ctx.Stats.addExamined(1)
+			if ctx.RowBudget > 0 && examined > ctx.RowBudget {
+				return &ScanRowBudgetExceededError{Budget: ctx.RowBudget}
+			}
+			ctx.Stats.addDocRead(len(d.JSON))
+			if where == nil || env.predicate(where, newEvalDoc(d)) {
+				n++
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, "", err
+	}
+	return n, "fullscan", nil
 }
 
 // isCountStar reports whether x is COUNT(*) (or COUNT with no argument).
@@ -325,45 +472,139 @@ func isCountStar(x Expr) bool {
 	return len(fc.Args) == 1 && ok && cr.Name == "*"
 }
 
-// countByIndex counts the documents a single `col = <string|bool constant>` WHERE selects, from
-// the index alone.
+// exactConjunct is one conjunct an index serves exactly: `col = v` or `col IN (v, ...)` on string
+// or boolean constants (NULLs in an IN list match nothing and are dropped).
+type exactConjunct struct {
+	field  string
+	values []Cell
+}
+
+// exactConjunctOf recognises an exactConjunct; ok=false for anything else.
+func exactConjunctOf(conj Expr, env *evalEnv) (exactConjunct, bool) {
+	constCell := func(x Expr) (Cell, bool) {
+		switch x.(type) {
+		case ExprLiteral, ExprParameter:
+		default:
+			return nil, false
+		}
+		v := env.cell(x, newEvalDoc(emptyDoc))
+		switch v.(type) {
+		case CellString, CellBool, CellNull:
+			return v, true
+		}
+		return nil, false
+	}
+	column := func(x Expr) (string, bool) {
+		ref, ok := x.(ExprColumnRef)
+		if !ok {
+			return "", false
+		}
+		name := env.columnName(ref.Name)
+		if isReservedColumn(name) {
+			return "", false
+		}
+		return name, true
+	}
+	switch c := conj.(type) {
+	case ExprBinary:
+		if c.Op != BinaryOpEQ {
+			return exactConjunct{}, false
+		}
+		field, ok := column(c.Left)
+		other := c.Right
+		if !ok {
+			if field, ok = column(c.Right); !ok {
+				return exactConjunct{}, false
+			}
+			other = c.Left
+		}
+		v, ok := constCell(other)
+		if !ok || isNullCell(v) {
+			return exactConjunct{}, false
+		}
+		return exactConjunct{field: field, values: []Cell{v}}, true
+	case ExprIn:
+		field, ok := column(c.Expr)
+		if !ok {
+			return exactConjunct{}, false
+		}
+		out := exactConjunct{field: field}
+		for _, x := range c.Values {
+			v, ok := constCell(x)
+			if !ok {
+				return exactConjunct{}, false
+			}
+			if !isNullCell(v) {
+				out.values = append(out.values, v)
+			}
+		}
+		return out, true
+	}
+	return exactConjunct{}, false
+}
+
+// countByIndex counts the documents an AND of exactConjuncts selects, from indexes alone: a single
+// equality by its index count, anything else by intersecting the conjuncts' id sets.
 func (e *Executor) countByIndex(where Expr, env *evalEnv, ctx QueryContext) (int, bool) {
 	counter, ok := e.IndexProvider.(ExactCounter)
 	if !ok || e.IndexProvider == nil {
 		return 0, false
 	}
-	b, ok := where.(ExprBinary)
-	if !ok || b.Op != BinaryOpEQ {
-		return 0, false
+	conjs := conjuncts(where)
+	parts := make([]exactConjunct, 0, len(conjs))
+	for _, c := range conjs {
+		p, ok := exactConjunctOf(c, env)
+		if !ok {
+			return 0, false
+		}
+		parts = append(parts, p)
 	}
-	col, other := b.Left, b.Right
-	if _, isCol := col.(ExprColumnRef); !isCol {
-		col, other = b.Right, b.Left
+	if len(parts) == 1 && len(parts[0].values) == 1 {
+		n, ok, err := counter.ExactCount(ctx, parts[0].field, parts[0].values[0])
+		if err != nil || !ok {
+			return 0, false
+		}
+		return n, true
 	}
-	ref, isCol := col.(ExprColumnRef)
-	if !isCol {
-		return 0, false
+	// Smallest conjunct first, so the running intersection starts as small as it can.
+	sizes := make([]int, len(parts))
+	for i, p := range parts {
+		for _, v := range p.values {
+			n, ok, err := counter.ExactCount(ctx, p.field, v)
+			if err != nil || !ok {
+				return 0, false
+			}
+			sizes[i] += n
+		}
 	}
-	switch other.(type) {
-	case ExprLiteral, ExprParameter:
-	default:
-		return 0, false
+	order := make([]int, len(parts))
+	for i := range order {
+		order[i] = i
 	}
-	name := env.columnName(ref.Name)
-	if isReservedColumn(name) {
-		return 0, false
+	sort.Slice(order, func(a, b int) bool { return sizes[order[a]] < sizes[order[b]] })
+	var acc map[codec.UUID]struct{}
+	for _, i := range order {
+		p := parts[i]
+		set := make(map[codec.UUID]struct{}, sizes[i])
+		for _, v := range p.values {
+			ids, ok, err := e.IndexProvider.ExactLookup(ctx, p.field, v)
+			if err != nil || !ok {
+				return 0, false
+			}
+			for _, id := range ids {
+				if acc == nil {
+					set[id] = struct{}{}
+				} else if _, in := acc[id]; in {
+					set[id] = struct{}{}
+				}
+			}
+		}
+		acc = set
+		if len(acc) == 0 {
+			return 0, true
+		}
 	}
-	value := env.cell(other, newEvalDoc(emptyDoc))
-	switch value.(type) {
-	case CellString, CellBool:
-	default:
-		return 0, false
-	}
-	n, ok, err := counter.ExactCount(ctx, name, value)
-	if err != nil || !ok {
-		return 0, false
-	}
-	return n, true
+	return len(acc), true
 }
 
 // plainRows sorts and projects a non-grouped result. Sort keys are computed once per row, not
@@ -534,6 +775,9 @@ func (e *Executor) executeSingleRowSelect(query SelectQuery, ctx QueryContext) (
 	rows = applyLimitOffset(rows, limit, query.Offset)
 	for _, r := range rows {
 		ctx.Stats.addRetained(rowBytes(r))
+	}
+	if err := ctx.overRetainedLimit(); err != nil {
+		return QueryResult{}, err
 	}
 	return QueryResult{Columns: columnsFor(query, ctx.Schema), Rows: rows}, nil
 }
@@ -1062,6 +1306,13 @@ func flipOp(op BinaryOp) BinaryOp {
 // materialize fetches each id once and keeps the documents the residual accepts. Every fetch
 // counts toward DocsRead; rows examined and the row budget apply to residual evaluation.
 func (e *Executor) materialize(ids []codec.UUID, residual Expr, env *evalEnv, ctx QueryContext) ([]*evalDoc, error) {
+	return e.materializeUpTo(ids, residual, env, ctx, 0)
+}
+
+// materializeUpTo is materialize that stops once it holds stopAt accepted documents (0: never) -
+// for ids already in the order the rows are returned in, where the first stopAt matches are the
+// whole answer.
+func (e *Executor) materializeUpTo(ids []codec.UUID, residual Expr, env *evalEnv, ctx QueryContext, stopAt int) ([]*evalDoc, error) {
 	atCommit, err := e.atCommit(ctx)
 	if err != nil {
 		return nil, err
@@ -1092,9 +1343,65 @@ func (e *Executor) materialize(ids []codec.UUID, residual Expr, env *evalEnv, ct
 			continue
 		}
 		ctx.Stats.addRetained(int64(len(doc.JSON)) + retainedRowOverheadBytes)
+		if err := ctx.overRetainedLimit(); err != nil {
+			return nil, err
+		}
 		out = append(out, ed)
+		if stopAt > 0 && len(out) >= stopAt {
+			break
+		}
 	}
 	return out, nil
+}
+
+// isKdbIDOrder reports an ORDER BY that is exactly `kdb_id` ascending.
+func isKdbIDOrder(order []OrderItem, env *evalEnv) bool {
+	if len(order) != 1 || !order[0].Ascending {
+		return false
+	}
+	col, ok := order[0].Expr.(ExprColumnRef)
+	return ok && env.columnName(col.Name) == colKdbID
+}
+
+// kdbIDLowerBound is the tightest `kdb_id > '<uuid>'` among where's top-level conjuncts, as the
+// id a keyset scan may start after - or nil. Only a bound written as the id's canonical text
+// qualifies: kdb_id compares as a string, and canonical UUID text sorts exactly as the id's
+// bytes do, so skipping ids at or below it skips only rows the predicate would reject. Anything
+// else (>=, an empty string, upper case, not a UUID) is left to the residual WHERE.
+func kdbIDLowerBound(where Expr, env *evalEnv) *codec.UUID {
+	var best *codec.UUID
+	for _, c := range conjuncts(where) {
+		b, ok := c.(ExprBinary)
+		if !ok {
+			continue
+		}
+		col, other, op := b.Left, b.Right, b.Op
+		if _, isCol := col.(ExprColumnRef); !isCol {
+			col, other, op = b.Right, b.Left, flipOp(b.Op)
+		}
+		ref, isCol := col.(ExprColumnRef)
+		if !isCol || op != BinaryOpGT || env.columnName(ref.Name) != colKdbID {
+			continue
+		}
+		switch other.(type) {
+		case ExprLiteral, ExprParameter:
+		default:
+			continue
+		}
+		str, ok := env.cell(other, newEvalDoc(emptyDoc)).(CellString)
+		if !ok {
+			continue
+		}
+		id, err := codec.ParseUUID(str.Value)
+		if err != nil || id.String() != str.Value {
+			continue
+		}
+		if best == nil || bytes.Compare(id.Bytes(), best.Bytes()) > 0 {
+			idCopy := id
+			best = &idCopy
+		}
+	}
+	return best
 }
 
 // matchingDocs resolves and materializes every document a WHERE clause accepts, using the
@@ -1178,6 +1485,9 @@ func (e *Executor) fullScan(ctx QueryContext, stopAt int, residual Expr, env *ev
 				continue
 			}
 			ctx.Stats.addRetained(int64(len(d.JSON)) + retainedRowOverheadBytes)
+			if err := ctx.overRetainedLimit(); err != nil {
+				return err
+			}
 			docs = append(docs, ed)
 			if stopAt > 0 && len(docs) >= stopAt {
 				// Stop the scan outright rather than merely stopping appending: a query that
@@ -1259,8 +1569,12 @@ func projectRow(projections []Projection, env *evalEnv, d *evalDoc) []Cell {
 	for _, proj := range projections {
 		switch p := proj.(type) {
 		case ProjColumn:
-			out = append(out, env.cell(ExprColumnRef{Name: p.Name}, d))
+			out = append(out, env.projectedColumn(p.Name, d))
 		case ProjExpression:
+			if ref, ok := p.Expr.(ExprColumnRef); ok {
+				out = append(out, env.projectedColumn(ref.Name, d))
+				continue
+			}
 			c := env.cell(p.Expr, d)
 			if c == nil {
 				c = CellNull{}
@@ -1335,8 +1649,10 @@ func expressionSQLType(e Expr) string {
 			return "VARCHAR"
 		case "avg":
 			return "DOUBLE"
-		case "array_contains", "array_contains_any":
+		case "array_contains", "array_contains_any", "exists":
 			return "BOOLEAN"
+		case "all_values":
+			return "JSON"
 		}
 	case ExprBinary, ExprUnary, ExprIn, ExprBetween:
 		return "BOOLEAN"

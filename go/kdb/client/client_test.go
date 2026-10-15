@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/limidus/kdb/go/kdb/internal/testtime"
 	"strings"
 	"sync"
 	"testing"
@@ -43,7 +44,7 @@ func startTestServer(t *testing.T) (addr string, rt *server.KdbServerRuntime) {
 
 func connectTestClient(t *testing.T, addr string) *client.Client {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testtime.Scale(2*time.Second))
 	defer cancel()
 	c, err := client.Connect(ctx, addr, "")
 	if err != nil {

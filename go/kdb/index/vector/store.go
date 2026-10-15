@@ -5,6 +5,7 @@ package vector
 
 import (
 	"fmt"
+	kdbjson "github.com/limidus/kdb/go/kdb/json"
 	"sync"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -280,6 +281,11 @@ func (s *Store) PrepareDocument(docID codec.UUID, jsonText string) (index.Prepar
 	if err != nil {
 		return nil, err
 	}
+	return s.PrepareParsedDocument(docID, jsonText, root)
+}
+
+// PrepareParsedDocument implements index.ParsedDocumentStore.
+func (s *Store) PrepareParsedDocument(docID codec.UUID, _ string, root kdbjson.Value) (index.PreparedPut, error) {
 	vec, present, err := index.FieldVector(root, s.field)
 	if err != nil {
 		return nil, kdberr.NewSchemaViolationError(err.Error(), []kdberr.FieldViolation{{

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"github.com/limidus/kdb/go/kdb/internal/testtime"
 	"strings"
 	"sync"
 	"testing"
@@ -88,6 +89,7 @@ func (c *pipelinedClient) poll(cid int) (wire.Message, bool) {
 // await blocks until cid's reply arrives or timeout elapses.
 func (c *pipelinedClient) await(t *testing.T, cid int, timeout time.Duration) wire.Message {
 	t.Helper()
+	timeout = testtime.Scale(timeout)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if msg, ok := c.poll(cid); ok {

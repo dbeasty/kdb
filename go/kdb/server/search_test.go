@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"github.com/limidus/kdb/go/kdb/internal/testtime"
 	"testing"
 	"time"
 
@@ -124,7 +125,7 @@ func TestSearchDispatchesToProvider(t *testing.T) {
 		if req.Namespace != "app/data" || req.Text == nil || req.Text.Query != "deploy staging" || req.Limit != 10 {
 			t.Fatalf("provider saw %+v", req)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testtime.Scale(time.Second)):
 		t.Fatal("the provider never saw the request")
 	}
 

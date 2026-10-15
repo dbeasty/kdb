@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/embed"
@@ -29,13 +30,17 @@ func runUserCommand(args []string) int {
 	sub, rest := args[0], args[1:]
 
 	fs := flag.NewFlagSet("kdb-service user "+sub, flag.ExitOnError)
-	var dataDir, user, password, roles, role, grants string
+	var dataDir, user, password, roles, role, grants, label, tokenID string
+	var ttl time.Duration
 	fs.StringVar(&dataDir, "data-dir", "", "filesystem data root (same value the service runs with)")
 	fs.StringVar(&user, "user", "", "user id")
 	fs.StringVar(&password, "password", "", "user password (hashed with PBKDF2 before storage)")
 	fs.StringVar(&roles, "roles", "", "comma-separated role names for the new user")
 	fs.StringVar(&role, "role", "", "role name")
 	fs.StringVar(&grants, "grants", "", "comma-separated kind:pattern grants (kind is read, write, sync or admin), e.g. read:app/*,write:app/*")
+	fs.StringVar(&label, "label", "", "token label (which client holds it)")
+	fs.StringVar(&tokenID, "token-id", "", "token id (from token list)")
+	fs.DurationVar(&ttl, "ttl", 0, "token lifetime (0: until revoked)")
 	_ = fs.Parse(rest)
 
 	if dataDir == "" {
@@ -115,6 +120,47 @@ func runUserCommand(args []string) int {
 		for name, gs := range grantsByRole {
 			fmt.Printf("role %q grants=%v\n", name, gs)
 		}
+	case "token-create":
+		if user == "" {
+			fmt.Fprintln(os.Stderr, "Error: token create requires --user")
+			return 2
+		}
+		token, rec, err := reg.Store.CreateToken(user, label, ttl)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+		expires := "never"
+		if rec.ExpiresAt != "" {
+			expires = rec.ExpiresAt
+		}
+		fmt.Printf("created token %s for user %q (expires %s). It is shown once - store it now:\n%s\n", rec.TokenID, user, expires, token)
+	case "token-revoke":
+		if tokenID == "" {
+			fmt.Fprintln(os.Stderr, "Error: token revoke requires --token-id")
+			return 2
+		}
+		if err := reg.Store.RevokeToken(tokenID); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+		fmt.Printf("revoked token %s\n", tokenID)
+	case "token-list":
+		tokens, err := reg.Store.ListTokens()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+		if len(tokens) == 0 {
+			fmt.Println("no tokens")
+		}
+		for _, t := range tokens {
+			state := "active"
+			if t.Revoked {
+				state = "revoked"
+			}
+			fmt.Printf("token %s user=%q label=%q created=%s expires=%q %s\n", t.TokenID, t.User, t.Label, t.CreatedAt, t.ExpiresAt, state)
+		}
 	default:
 		printUserUsage()
 		return 2
@@ -141,5 +187,10 @@ Subcommands:
   role   --data-dir DIR --role NAME --grants "read:app/*,write:app/*"   (create or update)
          grant kinds: read, write, sync, admin
   assign --data-dir DIR --user NAME --role NAME
-  list   --data-dir DIR`)
+  list   --data-dir DIR
+
+Access tokens (revocable; presented as the bearer token, or as the password):
+  kdb-service token create --data-dir DIR --user NAME [--label L] [--ttl 720h]
+  kdb-service token revoke --data-dir DIR --token-id ID
+  kdb-service token list   --data-dir DIR`)
 }

@@ -55,6 +55,8 @@ type RegistryIndexProvider struct {
 	hasSavedHead bool
 	closed       bool
 	flusher      *indexFlusher
+
+	catchUpCounter
 }
 
 // NewRegistryIndexProvider wires reg to rt. rt supplies the head commit, document bodies for
@@ -420,6 +422,57 @@ func (p *RegistryIndexProvider) createIndexLocal(stmt sql.StmtCreateIndex, ctx s
 		// A rebuild that fails leaves a registered but empty index, which would answer
 		// queries with silently wrong results - the one outcome this layer exists to remove.
 		p.registry.Remove(desc.IndexName())
+		return err
+	}
+	return p.saveCatalogLocked()
+}
+
+// createIndexesLocal is createIndexLocal for several indexes at once: all are registered, then
+// filled by one scan of the documents instead of one scan each. On failure none is left
+// registered, so the caller can fall back to creating them one at a time.
+func (p *RegistryIndexProvider) createIndexesLocal(stmts []sql.StmtCreateIndex, ctx sql.QueryContext) error {
+	descs := make([]index.Descriptor, 0, len(stmts))
+	for _, stmt := range stmts {
+		desc, err := descriptorFor(stmt, ctx.NamespaceID)
+		if err != nil {
+			return err
+		}
+		descs = append(descs, desc)
+	}
+	if p.runtime == nil {
+		for _, d := range descs {
+			if _, err := p.registry.Add(d); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	p.persistMu.Lock()
+	defer p.persistMu.Unlock()
+	added := make([]index.Descriptor, 0, len(descs))
+	undo := func() {
+		for _, d := range added {
+			p.registry.Remove(d.IndexName())
+		}
+	}
+	ids := make([]codec.UUID, 0, len(descs))
+	for _, d := range descs {
+		if _, err := p.registry.Add(d); err != nil {
+			undo()
+			return err
+		}
+		added = append(added, d)
+		if p.dir != "" && !p.closed {
+			if err := index.InvalidateStoreSnapshot(index.IndexDir(p.dir, d.IndexID)); err != nil {
+				undo()
+				return err
+			}
+			delete(p.saved, d.IndexID)
+		}
+		ids = append(ids, d.IndexID)
+	}
+	if err := p.rebuildLocked(ids); err != nil {
+		undo()
 		return err
 	}
 	return p.saveCatalogLocked()

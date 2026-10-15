@@ -56,6 +56,7 @@ func (s *KdbServerRuntime) SetDocumentExpiry(p *policy.DocumentExpiryPolicy) {
 	s.stopSweeper()
 	if p == nil || p.FieldPath == "" {
 		s.expiry.Store(nil)
+		s.ensureExpiryIndex()
 		return
 	}
 	interval := time.Duration(p.SweepIntervalMillis) * time.Millisecond
@@ -67,6 +68,7 @@ func (s *KdbServerRuntime) SetDocumentExpiry(p *policy.DocumentExpiryPolicy) {
 		grace = 0
 	}
 	s.expiry.Store(&documentExpiry{fieldPath: p.FieldPath, grace: grace, interval: interval})
+	s.ensureExpiryIndex()
 	if s.Runtime.AssertWritable() != nil {
 		return
 	}
@@ -210,16 +212,35 @@ func (a *expiryHidingAdapter) hidesAt(treeHash codec.Hash) bool {
 }
 
 // CountDocuments implements storage.DocumentCounter. While expiry hides documents at treeHash the
-// tree's size over-counts what a read returns, so the answer is "cannot say" and the caller reads.
+// tree's size over-counts what a read returns: the expired documents the expiry index finds are
+// subtracted, and when it cannot find them cheaply the answer is "cannot say" and the caller reads.
 func (a *expiryHidingAdapter) CountDocuments(namespaceID string, treeHash codec.Hash) (int, bool, error) {
-	if a.hidesAt(treeHash) {
-		return 0, false, nil
-	}
 	counter, ok := a.Adapter.(storage.DocumentCounter)
 	if !ok {
 		return 0, false, nil
 	}
-	return counter.CountDocuments(namespaceID, treeHash)
+	if !a.hidesAt(treeHash) {
+		return counter.CountDocuments(namespaceID, treeHash)
+	}
+	hidden, ok, err := a.runtime.expiredDocsAt(treeHash, maxExpiredForCount)
+	if err != nil || !ok {
+		return 0, false, err
+	}
+	n, ok, err := counter.CountDocuments(namespaceID, treeHash)
+	if err != nil || !ok {
+		return 0, false, err
+	}
+	return n - len(hidden), true, nil
+}
+
+// HiddenDocuments implements storage.HiddenDocumentLister: the documents in treeHash that reads
+// at it do not return - none unless expiry hides at treeHash, then the expired ones, found
+// through the expiry index. ok=false when they cannot be listed without reading the namespace.
+func (a *expiryHidingAdapter) HiddenDocuments(namespaceID string, treeHash codec.Hash) ([]document.Document, bool, error) {
+	if !a.hidesAt(treeHash) {
+		return nil, true, nil
+	}
+	return a.runtime.expiredDocsAt(treeHash, maxExpiredForCount)
 }
 
 func (a *expiryHidingAdapter) GetDocument(namespaceID string, docID codec.UUID, atCommit codec.Hash) (*document.Document, error) {
@@ -365,15 +386,22 @@ func (s *KdbServerRuntime) SweepExpiredNow() (int, error) {
 	}
 	ns := s.Runtime.DefaultNamespace
 	var expired []codec.UUID
-	err := s.Runtime.Storage.ScanDocuments(ns, treeHash, 256, func(batch []document.Document) error {
+	// The expiry index names the expired documents without reading the namespace; only without
+	// it (no index registry, or one not yet at head) does the sweep read every body.
+	if docs, ok, err := s.expiredDocsAt(treeHash, 0); err != nil {
+		return 0, err
+	} else if ok {
+		for _, d := range docs {
+			expired = append(expired, d.ID)
+		}
+	} else if err := s.Runtime.Storage.ScanDocuments(ns, treeHash, 256, func(batch []document.Document) error {
 		for _, doc := range batch {
 			if s.isExpiredAtHead(doc.JSON) {
 				expired = append(expired, doc.ID)
 			}
 		}
 		return nil
-	})
-	if err != nil {
+	}); err != nil {
 		return 0, err
 	}
 	deleted := 0

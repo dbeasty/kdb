@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"github.com/limidus/kdb/go/kdb/internal/testtime"
 	"strconv"
 	"sync"
 	"testing"
@@ -59,7 +60,7 @@ func (c *rawWireClient) request(t *testing.T, msg wire.Message) wire.Message {
 		t.Fatal(err)
 	}
 	cid := msg.Header().CorrelationID
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testtime.Scale(2 * time.Second))
 	for time.Now().Before(deadline) {
 		if reply := c.conn.TryPoll(); reply != nil {
 			decoded, err := c.codec.Decode(reply)

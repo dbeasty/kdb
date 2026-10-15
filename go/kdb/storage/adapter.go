@@ -88,6 +88,14 @@ type DocumentCounter interface {
 	CountDocuments(namespaceID string, treeHash codec.Hash) (n int, ok bool, err error)
 }
 
+// HiddenDocumentLister is implemented by adapters that hide some documents of a tree from reads
+// (document expiry): it lists the hidden ones, so a count taken from an index - which still holds
+// them - can be corrected without reading the rest. ok=false when they cannot be listed cheaply;
+// the caller then reads the documents.
+type HiddenDocumentLister interface {
+	HiddenDocuments(namespaceID string, treeHash codec.Hash) (docs []document.Document, ok bool, err error)
+}
+
 // ForeignTreeStore is implemented by adapters that can hold a document tree they did not build - a
 // peer's state at a commit this namespace grafts in (peersync.Graft) - resolvable by hash, with
 // its documents, without it becoming the live tree. Every body is checked against the content

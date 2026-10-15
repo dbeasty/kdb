@@ -10,7 +10,11 @@
 # The image runs as a non-root user and honors the exit-75 orderly-abort contract
 # (kdb-spec-layer13 Component 50) - run with --restart=on-failure so a pressure abort restarts.
 
-FROM golang:1.26-alpine AS build
+# The build stage runs on the builder's own platform and cross-compiles (CGO is off), so a
+# multi-platform build (linux/amd64 + linux/arm64) never runs the Go toolchain under emulation.
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
+ARG TARGETOS=linux
+ARG TARGETARCH
 ARG VERSION=0.0.0-docker
 # Only go/ is copied into the build stage, so there is no .git here for the Go toolchain to
 # stamp the commit from automatically - it has to be passed in, or the image ships binaries that
@@ -26,7 +30,7 @@ COPY go/ ./
 RUN VP=github.com/limidus/kdb/go/kdb/version; \
     LDFLAGS="-X $VP.Version=${VERSION} -X $VP.Commit=${GIT_COMMIT} -X $VP.Dirty=${GIT_DIRTY} -X $VP.BuildDate=${BUILD_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; \
     for bin in kdb-service kdb kdb-inspect; do \
-      CGO_ENABLED=0 go build -ldflags "$LDFLAGS" -o "/out/$bin" "./cmd/$bin" || exit 1; \
+      CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags "$LDFLAGS" -o "/out/$bin" "./cmd/$bin" || exit 1; \
     done
 
 FROM alpine:3.20

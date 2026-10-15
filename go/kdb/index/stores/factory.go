@@ -44,3 +44,8 @@ func NewFactory(d *dag.InMemoryCommitDag, opts Options) index.StoreFactory {
 func Open(dir, namespaceID string, d *dag.InMemoryCommitDag, opts Options) (*index.Registry, index.LoadReport, error) {
 	return index.LoadRegistry(dir, namespaceID, d, NewFactory(d, opts))
 }
+
+// OpenWithLoadOptions is Open with index.LoadOptions (keeping Behind stores to catch up).
+func OpenWithLoadOptions(dir, namespaceID string, d *dag.InMemoryCommitDag, opts Options, load index.LoadOptions) (*index.Registry, index.LoadReport, error) {
+	return index.LoadRegistryWithOptions(dir, namespaceID, d, NewFactory(d, opts), load)
+}

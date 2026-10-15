@@ -383,6 +383,18 @@ func (a *Admission) AcquireBytes(ctx context.Context, class OpClass, cost int64)
 	}, nil
 }
 
+// MaxQueryBytes is the most one query may hold while it runs (sql.QueryContext.RetainedLimit) and
+// the most its up-front grant reserves: half the node's grant capacity. A query estimated above it
+// is no longer refused outright - estimates of queries no index serves are worst cases - but
+// admitted at this size and stopped if what it really holds passes it, so a wrong estimate costs
+// neither a false refusal nor the process (qtask production plan U2).
+func (a *Admission) MaxQueryBytes() int64 {
+	if a == nil {
+		return 0
+	}
+	return a.capacity / 2
+}
+
 func classIndex(c OpClass) int {
 	if !c.valid() {
 		return int(ClassWrite)

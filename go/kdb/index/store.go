@@ -2,6 +2,7 @@ package index
 
 import (
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/json"
 )
 
 // Store is the physical index interface (Component 8).
@@ -47,4 +48,36 @@ type PreparedPut interface {
 	// prepared put may apply as a delete (the document no longer carries the indexed field);
 	// the hint's Action says which.
 	Apply(commitHash codec.Hash) (Hint, error)
+}
+
+// ParsedDocumentStore is a DocumentStore that can prepare a document already decoded by the
+// caller - PrepareDocument with the parse done once for every index, rather than once per
+// index (a rebuild of 38 indexes decoded each 16 KiB document 38 times). PrepareParsedDocument
+// must answer exactly as PrepareDocument(docID, jsonText) does when root is ParseDocument(jsonText).
+type ParsedDocumentStore interface {
+	PrepareParsedDocument(docID codec.UUID, jsonText string, root json.Value) (PreparedPut, error)
+}
+
+// parsedDoc decodes a document at most once for several stores.
+type parsedDoc struct {
+	jsonText string
+	root     json.Value
+	err      error
+	done     bool
+}
+
+// prepare is store.PrepareDocument through the shared decode when the store accepts one.
+func (d *parsedDoc) prepare(store DocumentStore, docID codec.UUID) (PreparedPut, error) {
+	ps, ok := store.(ParsedDocumentStore)
+	if !ok {
+		return store.PrepareDocument(docID, d.jsonText)
+	}
+	if !d.done {
+		d.done = true
+		d.root, d.err = ParseDocument(d.jsonText)
+	}
+	if d.err != nil {
+		return nil, d.err
+	}
+	return ps.PrepareParsedDocument(docID, d.jsonText, d.root)
 }

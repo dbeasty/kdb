@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"github.com/limidus/kdb/go/kdb/internal/testtime"
 	"testing"
 	"time"
 
@@ -28,7 +29,7 @@ func syncPatterns(t *testing.T, from, to metaNode, patterns ...string) (peersync
 
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(testtime.Scale(3 * time.Second))
 	for time.Now().Before(deadline) {
 		if cond() {
 			return

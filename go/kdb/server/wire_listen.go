@@ -764,9 +764,22 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 			MaxRows:   rt.MaxResultRows(),
 			RowBudget: int(adm.ScanRowBudget()),
 		}
+		if page != nil {
+			scanIn.PageSize = page.Size
+		}
+		if est, ok := rt.SQLEngine().(sql.CandidateEstimator); ok {
+			scanIn.Candidates = est.EstimateCandidates(sel.Query, sql.QueryContext{
+				NamespaceID: namespaceID, Schema: rt.Schema(), AtCommit: head, Parameters: params,
+			})
+			scanIn.CandidatesKnown = scanIn.Candidates >= 0
+		}
 		estimate = adm.Costs().EstimateScan(scanIn)
+		grantBytes := estimate
+		if max := adm.MaxQueryBytes(); max > 0 && grantBytes > max {
+			grantBytes = max
+		}
 		actx, cancel := context.WithTimeout(context.Background(), readAcquireTimeout)
-		g, err := adm.AcquireBytes(actx, ClassScan, estimate)
+		g, err := adm.AcquireBytes(actx, ClassScan, grantBytes)
 		cancel()
 		if err != nil {
 			return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
@@ -788,6 +801,9 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 		RowBudget: int(rt.admission.ScanRowBudget()),
 		Stats:     stats,
 		Page:      page,
+		// What the query really holds is charged as it runs, and stops it at the most one query
+		// may hold - the grant above is an estimate and may be capped (Admission.MaxQueryBytes).
+		RetainedLimit: rt.admission.MaxQueryBytes(),
 	}
 	result, err := rt.SQLEngine().Execute(msg.SQL, ctx)
 	if err != nil {

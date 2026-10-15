@@ -448,7 +448,17 @@ func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request, prin
 		return
 	}
 	started := s.opts.Now()
-	m, err := backup.Create(shim, ns, store, req.BaseBackupID)
+	// The namespace's definitions go with it, so a restore brings back its indexes and unique
+	// constraints. Best effort: a backup without them still restores every document.
+	var opts backup.CreateOptions
+	if defs, err := rt.Meta.View(func(n string) bool { return n == ns }); err == nil && len(defs) > 0 {
+		if raw, err := json.Marshal(defs); err == nil {
+			opts.Definitions = raw
+		}
+	} else if err != nil {
+		s.logf("kdb: control: backup of namespace %s carries no definitions: %v", ns, err)
+	}
+	m, err := backup.CreateWithOptions(shim, ns, store, req.BaseBackupID, opts)
 	if err != nil {
 		var damaged *backup.DamagedSegmentError
 		if errors.As(err, &damaged) {

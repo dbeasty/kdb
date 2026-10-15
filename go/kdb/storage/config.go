@@ -117,6 +117,32 @@ type StorageEngineConfig struct {
 	// own write is not wanted; the cost is that every open replays the log
 	// in full.
 	DisableCheckpoints bool
+	// LargeCommitBodyBytes is the size of the document bodies one commit writes at or past which
+	// each body is filed in the blob store itself, instead of as a location record pointing into
+	// the commit's delta frame (objects history strategy only). A location costs a cold read the
+	// whole frame - one 4 MiB import commit decompressed to return one 16 KiB document - so a bulk
+	// write's documents are filed by value, at the cost of a second copy of their bytes. Cold
+	// reads that still meet a large frame through a location file what they decoded the same way.
+	// Zero uses DefaultLargeCommitBodyBytes (64 KiB); negative never files bodies.
+	LargeCommitBodyBytes int64
+}
+
+// DefaultLargeCommitBodyBytes is StorageEngineConfig.LargeCommitBodyBytes's default: a commit
+// writing 64 KiB of bodies or more is a batch whose documents are read one at a time later, and
+// reading one of them through the frame costs at least 64 KiB of decompression - several times
+// the document. A single ordinary document stays below it and keeps its 17-byte location.
+const DefaultLargeCommitBodyBytes = 64 << 10
+
+// ResolvedLargeCommitBodyBytes is the large-commit threshold in force, or 0 when bodies are never
+// filed by value.
+func (c StorageEngineConfig) ResolvedLargeCommitBodyBytes() int64 {
+	switch {
+	case c.LargeCommitBodyBytes < 0:
+		return 0
+	case c.LargeCommitBodyBytes == 0:
+		return DefaultLargeCommitBodyBytes
+	}
+	return c.LargeCommitBodyBytes
 }
 
 // ResolvedGlobalMemoryBudgetBytes returns GlobalMemoryBudgetBytes if set,

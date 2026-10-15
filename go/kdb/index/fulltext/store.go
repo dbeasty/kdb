@@ -5,6 +5,7 @@ package fulltext
 
 import (
 	"fmt"
+	kdbjson "github.com/limidus/kdb/go/kdb/json"
 	"math"
 	"sort"
 	"strings"
@@ -266,6 +267,11 @@ func (s *Store) PrepareDocument(docID codec.UUID, jsonText string) (index.Prepar
 	if err != nil {
 		return nil, err
 	}
+	return s.PrepareParsedDocument(docID, jsonText, root)
+}
+
+// PrepareParsedDocument implements index.ParsedDocumentStore.
+func (s *Store) PrepareParsedDocument(docID codec.UUID, jsonText string, root kdbjson.Value) (index.PreparedPut, error) {
 	return &preparedPut{store: s, docID: docID, jsonText: jsonText, ver: s.analyze(root)}, nil
 }
 

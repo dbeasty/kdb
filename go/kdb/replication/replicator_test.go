@@ -3,6 +3,7 @@ package replication
 import (
 	"errors"
 	"fmt"
+	"github.com/limidus/kdb/go/kdb/internal/testtime"
 	"io"
 	"net"
 	"testing"
@@ -50,7 +51,7 @@ func head(t *testing.T, srv *server.KdbServerRuntime) codec.Hash {
 
 func eventually(t *testing.T, within time.Duration, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(within)
+	deadline := time.Now().Add(testtime.Scale(within))
 	for time.Now().Before(deadline) {
 		if cond() {
 			return

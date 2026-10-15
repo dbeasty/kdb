@@ -37,9 +37,67 @@ type evalDoc struct {
 	doc    document.Document
 	root   kdbjson.Value
 	parsed bool
+
+	// Field-at-a-time decoding: members indexes the top-level members once (no value decoded),
+	// and fields holds the members decoded so far. A query that reads a few fields of a document
+	// carrying a 768-number embedding decodes those fields, not the embedding. membersBad means
+	// the scan could not walk the document, and tree() decides instead.
+	members        []schema.TopLevelMember
+	membersScanned bool
+	membersBad     bool
+	fields         map[string]kdbjson.Value
 }
 
 func newEvalDoc(doc document.Document) *evalDoc { return &evalDoc{doc: doc} }
+
+// member returns the decoded value of top-level member key (the last one, when repeated), found
+// reports whether the document has it, and usable=false means the document must be decoded whole
+// (tree) to answer. Once the whole tree is decoded it is used directly.
+func (d *evalDoc) member(key string) (v kdbjson.Value, found, usable bool) {
+	if d.parsed {
+		obj, ok := d.root.(kdbjson.ObjectValue)
+		if !ok {
+			return nil, false, d.root == nil
+		}
+		v, found = obj.Fields[key]
+		return v, found, true
+	}
+	if !d.membersScanned {
+		d.membersScanned = true
+		d.members, d.membersBad = nil, false
+		m, ok := schema.TopLevelMembers(d.doc.JSON)
+		if !ok {
+			d.membersBad = true
+		} else {
+			d.members = m
+		}
+	}
+	if d.membersBad {
+		return nil, false, false
+	}
+	if v, ok := d.fields[key]; ok {
+		return v, true, true
+	}
+	idx := -1
+	for i := range d.members {
+		if d.members[i].Key == key {
+			idx = i
+		}
+	}
+	if idx < 0 {
+		return nil, false, true
+	}
+	m := d.members[idx]
+	parsed, err := kdbjson.ParseValue(d.doc.JSON[m.Start:m.End])
+	if err != nil {
+		return nil, false, false
+	}
+	if d.fields == nil {
+		d.fields = make(map[string]kdbjson.Value, 4)
+	}
+	d.fields[key] = parsed
+	return parsed, true, true
+}
 
 func (d *evalDoc) tree() kdbjson.Value {
 	if !d.parsed {
@@ -102,11 +160,20 @@ func (env *evalEnv) columnValues(name string, d *evalDoc, expand bool) []kdbjson
 	case colAttachments:
 		return []kdbjson.Value{attachmentsJSON(env.attach.set(d.doc.ID))}
 	}
+	segs := kdbjson.SplitDotted(name)
+	if len(segs) > 0 {
+		if v, found, usable := d.member(segs[0]); usable {
+			if !found {
+				return nil
+			}
+			return kdbjson.CandidatesOf(v, segs[1:], expand)
+		}
+	}
 	root := d.tree()
 	if root == nil {
 		return nil
 	}
-	return kdbjson.CandidatesOf(root, kdbjson.SplitDotted(name), expand)
+	return kdbjson.CandidatesOf(root, segs, expand)
 }
 
 // candidates evaluates an operand to its candidate cells (§2): a column reference fans out over
@@ -338,6 +405,25 @@ func (env *evalEnv) functionCell(call ExprFunctionCall, d *evalDoc) Cell {
 			}
 		}
 		return CellBool{Value: wantAll}
+	case "exists":
+		// The path reaches a value - JSON null included. An absent path reaches none.
+		ref, ok := call.Args[0].(ExprColumnRef)
+		if len(call.Args) != 1 || !ok {
+			return CellNull{}
+		}
+		return CellBool{Value: len(env.columnValues(ref.Name, d, false)) > 0}
+	case "all_values":
+		// Every value the path reaches, as one JSON array - a path through an array of objects
+		// (`subs.u`) projects each element's value, where a bare column projects the first.
+		ref, ok := call.Args[0].(ExprColumnRef)
+		if len(call.Args) != 1 || !ok {
+			return CellNull{}
+		}
+		vals := env.columnValues(ref.Name, d, false)
+		if len(vals) == 0 {
+			return CellNull{}
+		}
+		return CellJSON{JSON: kdbjson.ToJSONString(kdbjson.ArrayValue{Elements: append([]kdbjson.Value(nil), vals...)})}
 	case "array_length":
 		if len(call.Args) != 1 {
 			return CellNull{}
@@ -672,4 +758,21 @@ func ParseFilter(expr string) (Expr, error) {
 		return nil, NewParseError("not a filter expression", expr, 0)
 	}
 	return sel.Query.Where, nil
+}
+
+// projectedColumn is a selected column's cell. It differs from the cell a predicate compares in
+// one way (qtask production plan U8): a JSON boolean is a CellBool, which the wire types as a
+// boolean - its text is still "1"/"0", so an untyped client reads what it always did - where a
+// predicate keeps comparing it as 0/1. A path through an array still projects its first value
+// (kdb-spec-layer16 §3.5); ALL_VALUES(path) projects them all.
+func (env *evalEnv) projectedColumn(name string, d *evalDoc) Cell {
+	c := env.cell(ExprColumnRef{Name: name}, d)
+	if l, ok := c.(CellLong); ok && (l.Value == 0 || l.Value == 1) && !isReservedColumn(env.columnName(name)) {
+		if vals := env.columnValues(name, d, false); len(vals) > 0 {
+			if b, ok := vals[0].(kdbjson.BoolValue); ok {
+				return CellBool{Value: b.V}
+			}
+		}
+	}
+	return c
 }

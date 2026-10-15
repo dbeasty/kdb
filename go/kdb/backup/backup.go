@@ -91,6 +91,17 @@ type Manifest struct {
 	// Attachments are the attachment store's segments (attachments.go). Absent from a manifest
 	// written before attachments, which restores as a namespace without large attachments.
 	Attachments []AttachmentSegment `json:"attachments,omitempty"`
+	// Definitions are the namespace's definitions - schema, unique constraints, indexes - as
+	// the server's metadata namespace holds them (a JSON array of wire.MetaDefinition), so a
+	// restore brings them back instead of the application having to declare them again. Absent
+	// from a manifest written without them (CreateOptions.Definitions), or before they existed.
+	Definitions json.RawMessage `json:"definitions,omitempty"`
+}
+
+// CreateOptions tunes CreateWithOptions.
+type CreateOptions struct {
+	// Definitions is stored verbatim in the manifest (Manifest.Definitions).
+	Definitions json.RawMessage
 }
 
 // ManifestKey returns the object key a backup's manifest lives at.
@@ -111,6 +122,11 @@ func activePrefixKey(namespaceID, backupID string, seq int64) string {
 // *DamagedSegmentError before anything is uploaded; a torn tail is left out of the segment's
 // upload, since it was never acknowledged.
 func Create(shim storage.PlatformIOShim, namespaceID string, store ObjectStore, baseBackupID string) (*Manifest, error) {
+	return CreateWithOptions(shim, namespaceID, store, baseBackupID, CreateOptions{})
+}
+
+// CreateWithOptions is Create with options (see CreateOptions).
+func CreateWithOptions(shim storage.PlatformIOShim, namespaceID string, store ObjectStore, baseBackupID string, opts CreateOptions) (*Manifest, error) {
 	ctx := context.Background()
 	seqs, err := integrity.ListSequencedSegments(shim, namespaceID)
 	if err != nil {
@@ -239,6 +255,9 @@ func Create(shim storage.PlatformIOShim, namespaceID string, store ObjectStore, 
 	// listed here.
 	if m.Attachments, err = backupAttachments(shim, namespaceID, store, base); err != nil {
 		return nil, err
+	}
+	if len(opts.Definitions) > 0 {
+		m.Definitions = opts.Definitions
 	}
 	m.CommitCount = heads.count()
 	for i, tip := range heads.tips() {

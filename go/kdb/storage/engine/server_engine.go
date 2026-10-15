@@ -26,6 +26,8 @@ type ServerEngine struct {
 	// bodiesExternal is set once some document bodies exist only in the blob store - see
 	// MaterializeLiveBodies - so cold reads consult it in every history mode.
 	bodiesExternal atomic.Bool
+	// largeCommitBodies and largeFrameRefiled count versions filed by value (large_frame_bodies.go).
+	largeCommitBodies, largeFrameRefiled atomic.Int64
 	// retainLive overrides config.Retain once something has set the
 	// retention window on the running engine; nil means "whatever this
 	// engine was opened with". Guarded because it is written from the

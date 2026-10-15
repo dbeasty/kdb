@@ -175,6 +175,7 @@ func (s *Server) runRestore(job *restoreJob, ns string, req startRestoreRequest,
 	}
 
 	var sources []recovery.Source
+	var definitions *backup.Manifest
 	// The backup first, fetched and manifest-verified into its own directory. FetchToDir re-hashes
 	// every object against the manifest, so a corrupt backup fails here rather than contributing
 	// bad frames to the union.
@@ -184,10 +185,12 @@ func (s *Server) runRestore(job *restoreJob, ns string, req startRestoreRequest,
 			fail(err)
 			return
 		}
-		if _, err := backup.FetchToDir(store, ns, req.BackupID, fetched); err != nil {
+		fetchedManifest, err := backup.FetchToDir(store, ns, req.BackupID, fetched)
+		if err != nil {
 			fail(fmt.Errorf("fetching backup %s: %w", req.BackupID, err))
 			return
 		}
+		definitions = fetchedManifest
 		shim, err := openShim(fetched)
 		if err != nil {
 			fail(err)
@@ -223,6 +226,10 @@ func (s *Server) runRestore(job *restoreJob, ns string, req startRestoreRequest,
 		return
 	}
 	result, err := recovery.HybridRestore(sources, ns, storage.CompressionZSTD, outShim)
+	if err == nil {
+		// The definitions the backup carried, for the server to adopt when it opens the result.
+		err = backup.WriteRestoredDefinitions(out, definitions)
+	}
 	release()
 	if err != nil {
 		fail(err)

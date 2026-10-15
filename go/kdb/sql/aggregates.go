@@ -37,7 +37,7 @@ func isAggregateFunction(name string) bool {
 
 func isScalarFunction(name string) bool {
 	switch strings.ToLower(name) {
-	case "array_contains", "array_contains_any", "array_length":
+	case "array_contains", "array_contains_any", "array_length", "exists", "all_values":
 		return true
 	default:
 		return false

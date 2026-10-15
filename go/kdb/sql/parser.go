@@ -709,6 +709,15 @@ func (p *rdParser) parseComparison() (Expr, error) {
 	p.skipWS()
 	if p.matchKeyword("IS") {
 		negated := p.matchKeyword("NOT")
+		if p.matchKeyword("MISSING") {
+			// `x IS MISSING` / `x IS NOT MISSING`: whether the path is in the document at all,
+			// which IS NULL cannot say - an explicit null and an absent field both read NULL.
+			var e Expr = ExprFunctionCall{Name: "exists", Args: []Expr{left}}
+			if !negated {
+				e = ExprUnary{Op: UnaryOpNot, Expr: e}
+			}
+			return e, nil
+		}
 		if err := p.expectKeyword("NULL"); err != nil {
 			return nil, err
 		}
