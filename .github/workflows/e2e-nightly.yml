@@ -147,9 +147,16 @@ jobs:
     # build one node at a time under load, crashed nodes recovered by the new binary, a 2-old +
     # 3-new mesh with kills, a snapshot joiner served by v0.6.2, SQL across versions, and what a
     # rollback to v0.6.2 keeps. ~5 minutes, so nightly rather than per PR.
+    # Against both earlier lines: v0.7.1 is the release before this one; v0.6.2 is the oldest
+    # still documented as a rollback target. Scenarios about what v0.6.x does not know skip
+    # against v0.7.1 (test_upgrade.needs_v06_prev).
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        prev: [v0.7.1, v0.6.2]
     env:
-      PREV_TAG: v0.6.2
+      PREV_TAG: ${{ matrix.prev }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -178,7 +185,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-evidence-upgrade-${{ github.run_attempt }}
+          name: e2e-evidence-upgrade-${{ matrix.prev }}-${{ github.run_attempt }}
           path: kdb-integration/e2e/evidence/
           if-no-files-found: ignore
           retention-days: 14

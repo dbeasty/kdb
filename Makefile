@@ -104,7 +104,7 @@ build-kotlin:
 # The previous release's kdb-service, for the mixed-version upgrade e2e tests
 # (kdb-integration/e2e/test_upgrade.py): built from the PREV_TAG tag into go/bin/prev/ without
 # touching this checkout. Then: export KDB_SERVICE_BIN_PREV=$$PWD/go/bin/prev/kdb-service-$(PREV_TAG)
-PREV_TAG ?= v0.6.2
+PREV_TAG ?= v0.7.1
 build-prev-service:
 	./scripts/build-prev-service.sh $(PREV_TAG)
 

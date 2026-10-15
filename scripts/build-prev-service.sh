@@ -14,7 +14,7 @@
 # `make build-prev-service` (optionally PREV_TAG=vX.Y.Z) runs this.
 set -euo pipefail
 
-TAG="${1:-${PREV_TAG:-v0.6.2}}"
+TAG="${1:-${PREV_TAG:-v0.7.1}}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT_DIR="$ROOT/go/bin/prev"
 OUT="$OUT_DIR/kdb-service-$TAG"
