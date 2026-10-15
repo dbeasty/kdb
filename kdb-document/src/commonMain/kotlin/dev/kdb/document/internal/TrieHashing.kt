@@ -11,6 +11,37 @@ internal expect fun sha256OnlyChild(
     child: ByteArray,
 ): ByteArray
 
+/**
+ * [sha256OnlyChild] on the portable SHA-256, resumed from the state after nib's constant prefix's
+ * whole blocks (0 to 7 of the nine, 3.5 on average): what JS and native use.
+ */
+internal fun sha256OnlyChildMidstate(
+    nib: Int,
+    child: ByteArray,
+): ByteArray {
+    val skip = ONLY_CHILD_SKIP[nib]
+    val buf = ByteArray(1 + 16 * 32)
+    if (skip == 0) buf[0] = 0x01
+    child.copyInto(buf, 1 + nib * 32)
+    return sha256Resume(ONLY_CHILD_MIDSTATE[nib].copyOf(), skip.toLong(), buf, skip)
+}
+
+private val ONLY_CHILD_SKIP: IntArray = IntArray(16) { (1 + it * 32) / SHA256_BLOCK * SHA256_BLOCK }
+
+private val ONLY_CHILD_MIDSTATE: Array<IntArray> =
+    Array(16) { nib ->
+        val state = SHA256_H0.copyOf()
+        val prefix = ByteArray(ONLY_CHILD_SKIP[nib])
+        if (prefix.isNotEmpty()) prefix[0] = 0x01
+        val w = IntArray(64)
+        var off = 0
+        while (off < prefix.size) {
+            sha256Compress(state, prefix, off, w)
+            off += SHA256_BLOCK
+        }
+        state
+    }
+
 /** [sha256OnlyChild] hashing the whole preimage. */
 internal fun sha256OnlyChildPortable(
     nib: Int,

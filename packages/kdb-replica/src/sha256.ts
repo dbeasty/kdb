@@ -30,43 +30,64 @@ const K = new Uint32Array([
 
 const W = new Uint32Array(64);
 
-/** SHA-256 in pure TS, whatever the runtime. Exported so tests check it, not just the native one. */
-export function sha256Portable(data: Uint8Array): Uint8Array {
-  let h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a;
-  let h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
-  const bitLen = data.length * 8;
-  const padded = new Uint8Array(((data.length + 9 + 63) >> 6) << 6);
-  padded.set(data);
-  padded[data.length] = 0x80;
-  const view = new DataView(padded.buffer);
-  view.setUint32(padded.length - 8, Math.floor(bitLen / 0x100000000));
-  view.setUint32(padded.length - 4, bitLen >>> 0);
-  for (let off = 0; off < padded.length; off += 64) {
-    for (let i = 0; i < 16; i++) W[i] = view.getUint32(off + i * 4);
-    for (let i = 16; i < 64; i++) {
-      const w15 = W[i - 15]!, w2 = W[i - 2]!;
-      const s0 = ((w15 >>> 7) | (w15 << 25)) ^ ((w15 >>> 18) | (w15 << 14)) ^ (w15 >>> 3);
-      const s1 = ((w2 >>> 17) | (w2 << 15)) ^ ((w2 >>> 19) | (w2 << 13)) ^ (w2 >>> 10);
-      W[i] = (W[i - 16]! + s0 + W[i - 7]! + s1) | 0;
-    }
-    let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
-    for (let i = 0; i < 64; i++) {
-      const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
-      const ch = (e & f) ^ (~e & g);
-      const t1 = (h + S1 + ch + K[i]! + W[i]!) | 0;
-      const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
-      const maj = (a & b) ^ (a & c) ^ (b & c);
-      const t2 = (S0 + maj) | 0;
-      h = g; g = f; f = e; e = (d + t1) | 0;
-      d = c; c = b; b = a; a = (t1 + t2) | 0;
-    }
-    h0 = (h0 + a) | 0; h1 = (h1 + b) | 0; h2 = (h2 + c) | 0; h3 = (h3 + d) | 0;
-    h4 = (h4 + e) | 0; h5 = (h5 + f) | 0; h6 = (h6 + g) | 0; h7 = (h7 + h) | 0;
+const H0 = new Int32Array([
+  0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+]);
+
+/** Folds the 64-byte block at off of view into state (eight words, modified in place). */
+function compress(state: Int32Array, view: DataView, off: number): void {
+  for (let i = 0; i < 16; i++) W[i] = view.getUint32(off + i * 4);
+  for (let i = 16; i < 64; i++) {
+    const w15 = W[i - 15]!, w2 = W[i - 2]!;
+    const s0 = ((w15 >>> 7) | (w15 << 25)) ^ ((w15 >>> 18) | (w15 << 14)) ^ (w15 >>> 3);
+    const s1 = ((w2 >>> 17) | (w2 << 15)) ^ ((w2 >>> 19) | (w2 << 13)) ^ (w2 >>> 10);
+    W[i] = (W[i - 16]! + s0 + W[i - 7]! + s1) | 0;
   }
+  let a = state[0]!, b = state[1]!, c = state[2]!, d = state[3]!;
+  let e = state[4]!, f = state[5]!, g = state[6]!, h = state[7]!;
+  for (let i = 0; i < 64; i++) {
+    const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+    const ch = (e & f) ^ (~e & g);
+    const t1 = (h + S1 + ch + K[i]! + W[i]!) | 0;
+    const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+    const maj = (a & b) ^ (a & c) ^ (b & c);
+    const t2 = (S0 + maj) | 0;
+    h = g; g = f; f = e; e = (d + t1) | 0;
+    d = c; c = b; b = a; a = (t1 + t2) | 0;
+  }
+  state[0] = (state[0]! + a) | 0; state[1] = (state[1]! + b) | 0;
+  state[2] = (state[2]! + c) | 0; state[3] = (state[3]! + d) | 0;
+  state[4] = (state[4]! + e) | 0; state[5] = (state[5]! + f) | 0;
+  state[6] = (state[6]! + g) | 0; state[7] = (state[7]! + h) | 0;
+}
+
+/**
+ * Finishes a SHA-256 whose first prefixLen bytes (whole blocks) are already folded into state,
+ * hashing data[from:] as the rest. With H0 and no prefix it is the plain digest; with a midstate
+ * it skips a constant prefix's blocks.
+ */
+function resume(state: Int32Array, prefixLen: number, data: Uint8Array, from: number): Uint8Array {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  let off = from;
+  for (; data.length - off >= 64; off += 64) compress(state, view, off);
+  const rest = data.length - off;
+  const tail = new Uint8Array(rest + 9 <= 64 ? 64 : 128);
+  tail.set(data.subarray(off), 0);
+  tail[rest] = 0x80;
+  const tv = new DataView(tail.buffer);
+  const bitLen = (prefixLen + data.length - from) * 8;
+  tv.setUint32(tail.length - 8, Math.floor(bitLen / 0x100000000));
+  tv.setUint32(tail.length - 4, bitLen >>> 0);
+  for (let t = 0; t < tail.length; t += 64) compress(state, tv, t);
   const out = new Uint8Array(32);
   const ov = new DataView(out.buffer);
-  [h0, h1, h2, h3, h4, h5, h6, h7].forEach((v, i) => ov.setUint32(i * 4, v));
+  for (let i = 0; i < 8; i++) ov.setUint32(i * 4, state[i]!);
   return out;
+}
+
+/** SHA-256 in pure TS, whatever the runtime. Exported so tests check it, not just the native one. */
+export function sha256Portable(data: Uint8Array): Uint8Array {
+  return resume(H0.slice(), 0, data, 0);
 }
 
 export function sha256(data: Uint8Array): Uint8Array {
@@ -76,3 +97,41 @@ export function sha256(data: Uint8Array): Uint8Array {
   }
   return sha256Portable(data);
 }
+
+/**
+ * The trie's single-child internal hash: SHA-256 over 0x01 and sixteen 32-byte slots with only
+ * nib's set. On Node it is one native digest of the full preimage: the call costs more than its
+ * nine blocks (a prefixed hash's copy() is no cheaper than createHash). The pure-TS digest instead
+ * resumes from the state after the constant prefix's whole blocks (everything before nib's slot),
+ * skipping 3.5 of the nine blocks on average: a browser's fold is about a third faster. Either
+ * way the result is the full preimage's hash byte for byte, as Go and Kotlin compute it.
+ */
+export function onlyChildHash(nib: number, child: Uint8Array): Uint8Array {
+  if (!nodeCrypto) return onlyChildHashPortable(nib, child);
+  onlyChildBuf.fill(0);
+  onlyChildBuf[0] = 0x01;
+  onlyChildBuf.set(child, 1 + nib * 32);
+  return sha256(onlyChildBuf);
+}
+
+/** The pure-TS path of onlyChildHash, whatever the runtime (tests check it on Node too). */
+export function onlyChildHashPortable(nib: number, child: Uint8Array): Uint8Array {
+  const skip = ONLY_CHILD_SKIP[nib]!;
+  onlyChildBuf.fill(0, skip);
+  if (skip === 0) onlyChildBuf[0] = 0x01;
+  onlyChildBuf.set(child, 1 + nib * 32);
+  return resume(ONLY_CHILD_MIDSTATE[nib]!.slice(), skip, onlyChildBuf, skip);
+}
+
+const ONLY_CHILD_SKIP = Array.from({ length: 16 }, (_, nib) => Math.floor((1 + nib * 32) / 64) * 64);
+const onlyChildBuf = new Uint8Array(1 + 16 * 32);
+
+/** The state after nib's constant prefix: 0x01, then zeros, in whole blocks. */
+const ONLY_CHILD_MIDSTATE: Int32Array[] = ONLY_CHILD_SKIP.map((skip) => {
+  const state = H0.slice();
+  const prefix = new Uint8Array(skip);
+  if (skip > 0) prefix[0] = 0x01;
+  const view = new DataView(prefix.buffer);
+  for (let off = 0; off < skip; off += 64) compress(state, view, off);
+  return state;
+});
