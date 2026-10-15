@@ -1,13 +1,17 @@
 package dev.kdb.document.internal
 
+/** SHA-256: the platform's own where it has a faster one (the JVM), else [sha256DigestPortable]. */
+internal expect fun sha256Digest(message: ByteArray): ByteArray
+
 /**
- * Pure Kotlin SHA-256 (RFC 6234). Multiplatform-safe.
+ * Pure Kotlin SHA-256 (RFC 6234). Multiplatform-safe: what JS and native use, and what the JVM's
+ * platform digest is checked against.
  *
  * Parentheses matter: `ushr`/`shl` bind tighter than `or` in `rotr`; for Maj/Ch and σ xor
  * chains, `and`/`xor` must be grouped explicitly — Kotlin does not match Java `&`/`^`
  * precedence for the infix `and`/`xor` spellings.
  */
-internal fun sha256Digest(message: ByteArray): ByteArray {
+internal fun sha256DigestPortable(message: ByteArray): ByteArray {
     val msgLen = message.size.toLong()
     val bitLen = msgLen * 8L
     val padLen = (56 - (message.size + 1) % 64 + 64) % 64
@@ -22,75 +26,7 @@ internal fun sha256Digest(message: ByteArray): ByteArray {
         bl = bl ushr 8
     }
 
-    fun i32(u: UInt): Int = u.toInt()
-
-    val k =
-        intArrayOf(
-            i32(0x428a2f98u),
-            i32(0x71374491u),
-            i32(0xb5c0fbcfu),
-            i32(0xe9b5dba5u),
-            i32(0x3956c25bu),
-            i32(0x59f111f1u),
-            i32(0x923f82a4u),
-            i32(0xab1c5ed5u),
-            i32(0xd807aa98u),
-            i32(0x12835b01u),
-            i32(0x243185beu),
-            i32(0x550c7dc3u),
-            i32(0x72be5d74u),
-            i32(0x80deb1feu),
-            i32(0x9bdc06a7u),
-            i32(0xc19bf174u),
-            i32(0xe49b69c1u),
-            i32(0xefbe4786u),
-            i32(0x0fc19dc6u),
-            i32(0x240ca1ccu),
-            i32(0x2de92c6fu),
-            i32(0x4a7484aau),
-            i32(0x5cb0a9dcu),
-            i32(0x76f988dau),
-            i32(0x983e5152u),
-            i32(0xa831c66du),
-            i32(0xb00327c8u),
-            i32(0xbf597fc7u),
-            i32(0xc6e00bf3u),
-            i32(0xd5a79147u),
-            i32(0x06ca6351u),
-            i32(0x14292967u),
-            i32(0x27b70a85u),
-            i32(0x2e1b2138u),
-            i32(0x4d2c6dfcu),
-            i32(0x53380d13u),
-            i32(0x650a7354u),
-            i32(0x766a0abbu),
-            i32(0x81c2c92eu),
-            i32(0x92722c85u),
-            i32(0xa2bfe8a1u),
-            i32(0xa81a664bu),
-            i32(0xc24b8b70u),
-            i32(0xc76c51a3u),
-            i32(0xd192e819u),
-            i32(0xd6990624u),
-            i32(0xf40e3585u),
-            i32(0x106aa070u),
-            i32(0x19a4c116u),
-            i32(0x1e376c08u),
-            i32(0x2748774cu),
-            i32(0x34b0bcb5u),
-            i32(0x391c0cb3u),
-            i32(0x4ed8aa4au),
-            i32(0x5b9cca4fu),
-            i32(0x682e6ff3u),
-            i32(0x748f82eeu),
-            i32(0x78a5636fu),
-            i32(0x84c87814u),
-            i32(0x8cc70208u),
-            i32(0x90befffau),
-            i32(0xa4506cebu),
-            i32(0xbef9a3f7u),
-            i32(0xc67178f2u),
-        )
+    val k = SHA256_K
 
     // Parentheses required: `ushr`/`shl` bind tighter than `or`.
     fun rotr(x: Int, n: Int): Int = ((x ushr n) or (x shl (32 - n)))
@@ -171,3 +107,74 @@ internal fun sha256Digest(message: ByteArray): ByteArray {
     }
     return out
 }
+
+private fun i32(u: UInt): Int = u.toInt()
+
+// Round constants, built once rather than on every digest.
+private val SHA256_K =
+    intArrayOf(
+        i32(0x428a2f98u),
+        i32(0x71374491u),
+        i32(0xb5c0fbcfu),
+        i32(0xe9b5dba5u),
+        i32(0x3956c25bu),
+        i32(0x59f111f1u),
+        i32(0x923f82a4u),
+        i32(0xab1c5ed5u),
+        i32(0xd807aa98u),
+        i32(0x12835b01u),
+        i32(0x243185beu),
+        i32(0x550c7dc3u),
+        i32(0x72be5d74u),
+        i32(0x80deb1feu),
+        i32(0x9bdc06a7u),
+        i32(0xc19bf174u),
+        i32(0xe49b69c1u),
+        i32(0xefbe4786u),
+        i32(0x0fc19dc6u),
+        i32(0x240ca1ccu),
+        i32(0x2de92c6fu),
+        i32(0x4a7484aau),
+        i32(0x5cb0a9dcu),
+        i32(0x76f988dau),
+        i32(0x983e5152u),
+        i32(0xa831c66du),
+        i32(0xb00327c8u),
+        i32(0xbf597fc7u),
+        i32(0xc6e00bf3u),
+        i32(0xd5a79147u),
+        i32(0x06ca6351u),
+        i32(0x14292967u),
+        i32(0x27b70a85u),
+        i32(0x2e1b2138u),
+        i32(0x4d2c6dfcu),
+        i32(0x53380d13u),
+        i32(0x650a7354u),
+        i32(0x766a0abbu),
+        i32(0x81c2c92eu),
+        i32(0x92722c85u),
+        i32(0xa2bfe8a1u),
+        i32(0xa81a664bu),
+        i32(0xc24b8b70u),
+        i32(0xc76c51a3u),
+        i32(0xd192e819u),
+        i32(0xd6990624u),
+        i32(0xf40e3585u),
+        i32(0x106aa070u),
+        i32(0x19a4c116u),
+        i32(0x1e376c08u),
+        i32(0x2748774cu),
+        i32(0x34b0bcb5u),
+        i32(0x391c0cb3u),
+        i32(0x4ed8aa4au),
+        i32(0x5b9cca4fu),
+        i32(0x682e6ff3u),
+        i32(0x748f82eeu),
+        i32(0x78a5636fu),
+        i32(0x84c87814u),
+        i32(0x8cc70208u),
+        i32(0x90befffau),
+        i32(0xa4506cebu),
+        i32(0xbef9a3f7u),
+        i32(0xc67178f2u),
+    )
