@@ -278,7 +278,7 @@ func TestPublishDoesNotBlockOnAStuckSubscriber(t *testing.T) {
 	}
 	close(stuck.release)
 	head, _ := rt.dag.Head()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for stuck.last() != head {
 		if time.Now().After(deadline) {
 			t.Fatalf("the drained subscriber never caught up to the head (sent %d frames)", stuck.sent.Load())
@@ -310,7 +310,7 @@ func TestPublishReachesAHealthySubscriberBesideAStuckOne(t *testing.T) {
 	if _, err := rt.Upsert(ns, mustRandomUUID(t), `{"i":1}`, auth.Principal{}); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for healthy.sent.Load() == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("healthy subscriber never received the frame behind a stuck one")

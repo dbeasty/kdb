@@ -374,6 +374,24 @@ is what marks a URI as a listen address (a client uses the same scheme without i
 serves **every namespace under its data root**: `--namespace` only names the default one, and a
 write to a namespace that does not exist creates it (a read does not).
 
+#### Users and credentials (`--rbac`)
+
+With `--rbac` and `--data-dir`, users and roles live in a durable registry under the data root
+(the reserved `_system/users` and `_system/roles` namespaces). Create them with the `user`
+subcommands **before the first start**; they open the registry exclusively, so the service must
+be stopped:
+
+```bash
+kdb-service user role   --data-dir /var/lib/kdb --role app --grants "read:app/*,write:app/*"
+kdb-service user create --data-dir /var/lib/kdb --user qtask --password "$QTASK_PW" --roles app
+kdb-service user list   --data-dir /var/lib/kdb
+kdb-service --data-dir /var/lib/kdb --rbac ...
+```
+
+Grant kinds are `read`, `write`, `sync` and `admin`; `user assign --user U --role R` adds a role
+to an existing user. Clients then connect with the token `user:password`. Without `--data-dir`
+the registry is in-memory and empty on every start, so `--rbac` is only useful there for embedding.
+
 ### 5.3 A client against it
 
 ````go
