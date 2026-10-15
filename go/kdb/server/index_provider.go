@@ -71,6 +71,7 @@ func (p *RegistryIndexProvider) Registry() *index.Registry { return p.registry }
 var (
 	_ sql.IndexProvider    = (*RegistryIndexProvider)(nil)
 	_ sql.ExactCounter     = (*RegistryIndexProvider)(nil)
+	_ sql.OrderedKeyIndex  = (*RegistryIndexProvider)(nil)
 	_ sql.IndexDDLExecutor = (*RegistryIndexProvider)(nil)
 	_ SearchProvider       = (*RegistryIndexProvider)(nil)
 )
@@ -178,6 +179,25 @@ func (p *RegistryIndexProvider) RangeLookup(ctx sql.QueryContext, field string, 
 		return nil, true, err
 	}
 	return ids, true, nil
+}
+
+// IndexKeyGroups reads the BTREE on field key by key, for the ordered top-k
+// (sql.OrderedKeyIndex). ok=false when the field has no BTREE that qualifies.
+func (p *RegistryIndexProvider) IndexKeyGroups(ctx sql.QueryContext, field string, kind sql.IndexKeyKind, after sql.Cell, maxIDs int) ([]sql.IndexKeyGroup, bool, error) {
+	store, ok := p.registry.ByField(field, index.IndexTypeBTree)
+	if !ok {
+		return nil, false, nil
+	}
+	return sql.IndexKeyGroupsFromStore(store, ctx, field, kind, after, maxIDs)
+}
+
+// UnindexedDocs returns the ids the BTREE on field files under no key (sql.OrderedKeyIndex).
+func (p *RegistryIndexProvider) UnindexedDocs(ctx sql.QueryContext, field string, ids []codec.UUID) ([]codec.UUID, bool, error) {
+	store, ok := p.registry.ByField(field, index.IndexTypeBTree)
+	if !ok {
+		return nil, false, nil
+	}
+	return sql.UnindexedDocsFromStore(store, ctx, field, ids)
 }
 
 // searchText is store.Search, falling back to a throwaway index of the documents at the commit

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 
+	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
 )
 
@@ -108,21 +109,35 @@ func (e *Executor) topKDocs(query SelectQuery, residual Expr, env *evalEnv, ctx 
 		return nil, "", err
 	}
 	if found {
+		// A BTREE on the first ORDER BY column may settle the page after reading about k
+		// documents (ordered_topk.go). When it does not apply, or gives up part way, the
+		// documents it read are reused here rather than read again.
+		fetched := map[codec.UUID]*document.Document{}
+		if docs, ok, err := e.btreeTopK(query, residual, env, ctx, k, ids, atCommit, treeHash, fetched); err != nil {
+			return nil, "", err
+		} else if ok {
+			return docs, label + "+order(" + orderedField(query, env) + ")", nil
+		}
 		for i, id := range ids {
 			if residual != nil && ctx.RowBudget > 0 && i >= ctx.RowBudget {
 				return nil, "", &ScanRowBudgetExceededError{Budget: ctx.RowBudget}
 			}
-			doc, err := e.Storage.GetDocument(ctx.NamespaceID, id, treeHash)
-			if err != nil {
-				return nil, "", err
-			}
-			if residual != nil {
-				ctx.Stats.addExamined(1)
+			doc, seen := fetched[id]
+			if !seen {
+				doc, err = e.Storage.GetDocument(ctx.NamespaceID, id, treeHash)
+				if err != nil {
+					return nil, "", err
+				}
+				if residual != nil {
+					ctx.Stats.addExamined(1)
+				}
+				if doc != nil {
+					ctx.Stats.addDocRead(len(doc.JSON))
+				}
 			}
 			if doc == nil {
 				continue
 			}
-			ctx.Stats.addDocRead(len(doc.JSON))
 			ed := newEvalDoc(*doc)
 			if residual != nil && !env.predicate(residual, ed) {
 				continue
