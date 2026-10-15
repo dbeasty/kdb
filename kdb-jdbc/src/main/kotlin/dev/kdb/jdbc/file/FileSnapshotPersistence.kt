@@ -3,6 +3,7 @@ package dev.kdb.jdbc.file
 import dev.kdb.dag.CheckpointCommit
 import dev.kdb.document.KdbBranch
 import dev.kdb.document.KdbCommit
+import dev.kdb.document.KdbDocument
 import dev.kdb.embed.SnapshotPersistence
 import dev.kdb.embed.SnapshotState
 import dev.kdb.storage.PlatformIoShim
@@ -40,7 +41,7 @@ internal class FileSnapshotPersistence(
         genesis: KdbCommit,
         state: SnapshotState,
     ) {
-        writeBodies(namespaceId, state)
+        writeBodies(io, namespaceId, state.documents)
         val root = state.root
         val hasAttachments = root.attachmentTreeHash != null
         val now = root.timestamp
@@ -60,62 +61,63 @@ internal class FileSnapshotPersistence(
                 attachmentTables = if (hasAttachments) state.attachmentTables ?: ByteArray(0) else ByteArray(0),
             ),
         )
-        markShallowRoot(namespaceId, root.hash.toHex())
+        markShallowRoot(dataRoot, namespaceId, root.hash.toHex())
     }
 
-    /** Bodies in tables of at most [TABLE_BYTES] each: one writer holds its entries until finish. */
-    private suspend fun writeBodies(
-        namespaceId: String,
-        state: SnapshotState,
-    ) {
-        var writer: DefaultSsTableWriter? = null
-        var bytes = 0L
-        // One sequence for every table, so they list the namespace once and number on from there.
-        val sequence = SsTableSequence(io, namespaceId)
-        for (d in state.documents) {
-            val w = writer ?: DefaultSsTableWriter(io, namespaceId, 0, sequence = sequence).also { writer = it }
-            val body = d.json.encodeToByteArray()
-            w.put(d.contentHash, body)
-            bytes += body.size + 32
-            if (bytes >= TABLE_BYTES) {
-                w.finish()
-                writer = null
-                bytes = 0
-            }
+}
+
+/** Bodies in tables of at most 32 MiB each, keyed by content hash: one writer holds its entries until finish. */
+internal suspend fun writeBodies(
+    io: PlatformIoShim,
+    namespaceId: String,
+    documents: List<KdbDocument>,
+) {
+    var writer: DefaultSsTableWriter? = null
+    var bytes = 0L
+    // One sequence for every table, so they list the namespace once and number on from there.
+    val sequence = SsTableSequence(io, namespaceId)
+    for (d in documents) {
+        val w = writer ?: DefaultSsTableWriter(io, namespaceId, 0, sequence = sequence).also { writer = it }
+        val body = d.json.encodeToByteArray()
+        w.put(d.contentHash, body)
+        bytes += body.size + 32
+        if (bytes >= BODY_TABLE_BYTES) {
+            w.finish()
+            writer = null
+            bytes = 0
         }
-        writer?.finish()
     }
+    writer?.finish()
+}
 
-    /** Adds [rootHex] to the marker's shallowRoots and sets bodiesExternal, keeping every other
-     * field; written as Go writes it (temp file, fsync, rename, directory fsync). */
-    private fun markShallowRoot(
-        namespaceId: String,
-        rootHex: String,
-    ) {
-        val path = NamespacePaths.metaFile(dataRoot, namespaceId)
-        Files.createDirectories(path.parent)
-        val old =
-            if (Files.isRegularFile(path)) {
-                runCatching { Json.parseToJsonElement(Files.readString(path)) as? JsonObject }.getOrNull()
-                    ?: throw IllegalStateException("kdb: namespace marker $path does not parse; refusing to overwrite it")
-            } else {
-                null
-            }
-        val fields = LinkedHashMap<String, kotlinx.serialization.json.JsonElement>(old ?: emptyMap())
-        fields.putIfAbsent("namespaceId", JsonPrimitive(namespaceId))
-        val roots = (fields["shallowRoots"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.content }.orEmpty()
-        fields["shallowRoots"] = JsonArray((roots + rootHex).distinct().map { JsonPrimitive(it) })
-        fields["bodiesExternal"] = JsonPrimitive(true)
-        val tmp = path.resolveSibling(path.fileName.toString() + ".tmp")
-        FileChannel.open(tmp, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE).use { ch ->
-            ch.write(java.nio.ByteBuffer.wrap(JsonObject(fields).toString().encodeToByteArray()))
-            ch.force(true)
+private const val BODY_TABLE_BYTES = 32L shl 20
+
+/** Adds [rootHex] to the marker's shallowRoots and sets bodiesExternal, keeping every other
+ * field; written as Go writes it (temp file, fsync, rename, directory fsync). */
+internal fun markShallowRoot(
+    dataRoot: String,
+    namespaceId: String,
+    rootHex: String,
+) {
+    val path = NamespacePaths.metaFile(dataRoot, namespaceId)
+    Files.createDirectories(path.parent)
+    val old =
+        if (Files.isRegularFile(path)) {
+            runCatching { Json.parseToJsonElement(Files.readString(path)) as? JsonObject }.getOrNull()
+                ?: throw IllegalStateException("kdb: namespace marker $path does not parse; refusing to overwrite it")
+        } else {
+            null
         }
-        Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
-        runCatching { FileChannel.open(path.parent, StandardOpenOption.READ).use { it.force(true) } }
+    val fields = LinkedHashMap<String, kotlinx.serialization.json.JsonElement>(old ?: emptyMap())
+    fields.putIfAbsent("namespaceId", JsonPrimitive(namespaceId))
+    val roots = (fields["shallowRoots"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.content }.orEmpty()
+    fields["shallowRoots"] = JsonArray((roots + rootHex).distinct().map { JsonPrimitive(it) })
+    fields["bodiesExternal"] = JsonPrimitive(true)
+    val tmp = path.resolveSibling(path.fileName.toString() + ".tmp")
+    FileChannel.open(tmp, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE).use { ch ->
+        ch.write(java.nio.ByteBuffer.wrap(JsonObject(fields).toString().encodeToByteArray()))
+        ch.force(true)
     }
-
-    private companion object {
-        const val TABLE_BYTES = 32L shl 20
-    }
+    Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+    runCatching { FileChannel.open(path.parent, StandardOpenOption.READ).use { it.force(true) } }
 }

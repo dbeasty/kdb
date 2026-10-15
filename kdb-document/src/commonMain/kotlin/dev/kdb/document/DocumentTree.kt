@@ -49,6 +49,16 @@ public data class DocumentTree(
         return DocumentTree(trieTreeHash(root), newEntries).also { it.trieRoot = root }
     }
 
+    /** The subtree at [prefix] as a peer's TREE_NODES reports it (Go's DocumentTree.Node). */
+    public fun node(
+        prefix: String,
+        entryLimit: Int,
+    ): DocumentTreeNode {
+        val root = trieRootOrBuild()
+        if (trieRoot == null) trieRoot = root
+        return trieNodeAt(root, prefix, entryLimit)
+    }
+
     private fun trieRootOrBuild(): TrieNode? {
         val cached = trieRoot
         if (cached != null || entries.isEmpty()) return cached

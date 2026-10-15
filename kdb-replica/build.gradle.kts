@@ -24,6 +24,14 @@ kotlin {
             implementation(libs.kotlinx.coroutines.core)
             implementation(libs.kotlinx.serialization.json)
         }
+        // On disk, full-mode namespaces live in a Kotlin file runtime (FileReplicaNamespace).
+        jvmMain.dependencies {
+            implementation(project(":kdb-dag"))
+            implementation(project(":kdb-embed"))
+            implementation(project(":kdb-jdbc"))
+            implementation(project(":kdb-schema"))
+            implementation(project(":kdb-storage"))
+        }
         commonTest.dependencies {
             implementation(libs.kotlin.test)
             implementation(libs.kotlinx.coroutines.test)
