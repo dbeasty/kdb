@@ -47,12 +47,8 @@ import (
 // rather than reimplement its configuration, governance and drain handling. It exits the process
 // on failure exactly as it always did.
 func Main() {
-	if len(os.Args) > 1 && os.Args[1] == "user" {
-		os.Exit(runUserCommand(os.Args[2:]))
-	}
-	if len(os.Args) > 2 && os.Args[1] == "token" {
-		// kdb-service token create|revoke|list: the same registry, through runUserCommand.
-		os.Exit(runUserCommand(append([]string{"token-" + os.Args[2]}, os.Args[3:]...)))
+	if code, ok := runSubcommand(os.Args[1:]); ok {
+		os.Exit(code)
 	}
 
 	fs := flag.NewFlagSet("kdb-service", flag.ExitOnError)

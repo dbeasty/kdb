@@ -11,6 +11,33 @@ import (
 	"github.com/limidus/kdb/go/kdb/embed"
 )
 
+// runSubcommand routes the admin subcommands - user, and token create|revoke|list - and reports
+// ok=false when args name neither, so the caller starts the service. A bare "token" prints usage
+// rather than falling through to a server start on the default ports.
+func runSubcommand(args []string) (code int, ok bool) {
+	if len(args) == 0 {
+		return 0, false
+	}
+	switch args[0] {
+	case "user":
+		return runUserCommand(args[1:]), true
+	case "token":
+		if len(args) < 2 {
+			printUserUsage()
+			return 2, true
+		}
+		// The same registry, through runUserCommand.
+		return runUserCommand(append([]string{"token-" + args[1]}, args[2:]...)), true
+	}
+	return 0, false
+}
+
+// userSubcommands are the subcommands runUserCommand accepts.
+var userSubcommands = map[string]bool{
+	"create": true, "role": true, "assign": true, "list": true,
+	"token-create": true, "token-revoke": true, "token-list": true,
+}
+
 // runUserCommand implements the RBAC bootstrap CLI (kdb-finish-up-plan Phase 2.7):
 //
 //	kdb-service user create --data-dir DIR --user NAME --password PW [--roles r1,r2]
@@ -28,6 +55,10 @@ func runUserCommand(args []string) int {
 		return 2
 	}
 	sub, rest := args[0], args[1:]
+	if !userSubcommands[sub] {
+		printUserUsage()
+		return 2
+	}
 
 	fs := flag.NewFlagSet("kdb-service user "+sub, flag.ExitOnError)
 	var dataDir, user, password, roles, role, grants, label, tokenID string
