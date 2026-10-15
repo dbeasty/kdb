@@ -69,16 +69,29 @@ qtask's `KDB_SERVICE_BIN` / `KDB_CLIENT_MODULE` overrides, and records before/af
 
 ## Phase P0 - blockers for qtask's cutover
 
-### U1. Expiry and `COUNT(*)` without reading document bodies - M
+### U1. Expiry and `COUNT(*)` without reading document bodies - M (the biggest single cause)
 
-**Measured:** with `--expire-field` set, a collection-wide `COUNT(*)` or any wide query reads
+**Measured, profiled (2026-10-15):** the expiry sweeper alone keeps a 2-CPU `kdb-service`
+saturated. With no client connected, on the benchmark's 517k-document namespace and
+`--expire-interval 1m`, CPU sat at ~0.1% and then rose to 117% for most of each minute. A 60 s CPU
+profile (`/debug/pprof/profile` on the admin address) put **85% of samples under
+`KdbServerRuntime.SweepExpiredNow` → `ServerEngine.ScanDocuments` → `DocumentTree.Walk`**, mostly
+`delta.(*DefaultReader).ReadCommitAt` (51%: commit frames re-read and zstd-decompressed per
+document, plus CRC32 and SHA-256) and `prefetchWindow` (68% cumulative). So every minute the
+sweep reads, decompresses and checks every document in the namespace to find the few that expired,
+and user queries queue behind it (their 30 s client timeouts in the benchmark). This is consistent
+with the benchmark: 127% CPU at a single user doing 0.4 actions/s.
+
+Also **measured**: with `--expire-field` set, a collection-wide `COUNT(*)` or any wide query reads
 every document body (rehearsal: 0.8-20 s at 27,600 documents depending on how they were written;
 the namespace-wide count is what OOM-killed the server at 100k tasks; reading the same tasks by
 key was fine, 13 s at 761 MiB). **Hypothesis:** the expiry filter is evaluated per row from the
 parsed body, and `COUNT(*)` only uses index counts for a single `=` (`countByIndex`).
 
-Do: keep each document's expiry deadline in an index (or in the tree entry) so "is it expired" is
-answered without the body; serve `COUNT(*)` from index cardinalities/id sets whenever the WHERE is
+Do: keep each document's expiry deadline in an ordered index (or in the tree entry) so the sweep
+visits only documents whose deadline has passed - a range read on that index, O(expired) not
+O(namespace) - and "is it expired" is answered without the body; until then, at least make the
+sweep yield to queries (bounded batch per tick, lower priority); serve `COUNT(*)` from index cardinalities/id sets whenever the WHERE is
 index-servable (incl. AND of indexed `=`/`IN`, and the OR union from U3), checking expiry from that
 index. Reproduce: qtask `tests/data-kdb-large-namespace.test.ts` plus a new KDB test that counts
 100k bodies-heavy documents under `--expire-field` and asserts bodies were not decoded (counter or
