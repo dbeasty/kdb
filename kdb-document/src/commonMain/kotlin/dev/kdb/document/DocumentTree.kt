@@ -34,6 +34,27 @@ public data class DocumentTree(
 
     public fun hashFor(docId: KdbUuid): KdbHash? = entries[docId]
 
+    /**
+     * The ids in canonical order (UUID byte order, the order of their lowercase strings), from the
+     * first id after [after], or from the first id when it is null. A paging reader resumes from its
+     * cursor in O(depth + page) through the trie instead of sorting every id per page.
+     */
+    public fun idsAfter(after: KdbUuid?): Iterator<KdbUuid> {
+        val root = trieRoot
+        if (root == null) {
+            // Only a tree made with the constructor lacks a trie; building one would hash every entry.
+            val sorted = entries.keys.map { it to it.toString() }.sortedBy { it.second }
+            val from = after?.toString()
+            return sorted.asSequence().filter { from == null || it.second > from }.map { it.first }.iterator()
+        }
+        val leaves = trieIterateAfter(root, after)
+        return object : Iterator<KdbUuid> {
+            override fun hasNext(): Boolean = leaves.hasNext()
+
+            override fun next(): KdbUuid = leaves.next().uuid
+        }
+    }
+
     public fun with(
         docId: KdbUuid,
         contentHash: KdbHash,

@@ -7,6 +7,9 @@ import dev.kdb.auth.ConnectionContext
 import dev.kdb.auth.KdbAuthorizationException
 import dev.kdb.auth.Principal
 import dev.kdb.codec.KdbHash
+import dev.kdb.codec.KdbUuid
+import dev.kdb.document.DocumentTree
+import dev.kdb.document.KdbDocument
 import dev.kdb.document.KdbCommit
 import dev.kdb.wire.WireCodec
 import dev.kdb.wire.WireMessage
@@ -251,30 +254,8 @@ internal class SyncV2HostSession(
         val commit = ns.dag.getCommitOrThrow(head)
         if (!peerAttachments && commit.attachmentTreeHash != null) throw AttachmentsUnsupportedException(m.namespace, commit.hash.toHex())
         val tree = snapshots.headTree(commit)
-        // Canonical lowercase ids sort as their bytes do, which is the order a cursor names.
-        val ids = tree.entries.keys.map { it to it.toString() }.sortedBy { it.second }.filter { it.second > m.after }
         val budget = if (m.maxBytes <= 0) DEFAULT_PAGE_BYTES else m.maxBytes
-        val docs = ArrayList<SnapshotDoc>()
-        var size = 0
-        var i = 0
-        while (i < ids.size) {
-            val chunk = ids.subList(i, minOf(ids.size, i + 128))
-            val bodies = snapshots.documentsAtHead(chunk.map { it.first })
-            var stop = false
-            for ((j, d) in bodies.withIndex()) {
-                val id = chunk[j]
-                val body = d?.json ?: throw PeerSyncException("peer sync: document ${id.second} of ${head.toHex()} has no body here")
-                if (docs.isNotEmpty() && size + body.length > budget) {
-                    stop = true
-                    break
-                }
-                size += body.length + 64
-                docs += SnapshotDoc(id.second, body)
-            }
-            if (stop) break
-            i += chunk.size
-        }
-        val done = docs.size == ids.size
+        val (docs, done) = snapshotPageDocs(tree, m.after, budget, head.toHex()) { snapshots.documentsAtHead(it) }
         val tables = if (done && commit.attachmentTreeHash != null) ns.dag.packAttachmentTables(listOf(head)) else null
         return SyncV2Message.SnapshotPage(
             m.correlationId, m.namespace, commit, docs, if (done) "" else docs.last().docId, done, tree.size, tables,
@@ -288,6 +269,52 @@ internal class SyncV2HostSession(
     }
 
     private fun frameName(m: SyncV2Message): String = m::class.simpleName ?: "frame"
+}
+
+/**
+ * The documents of one SNAPSHOT_FETCH page after cursor [after], and whether they finish the
+ * snapshot: ids in order, bodies read [fetch] 128 at a time, at least one document per page, then
+ * as many as fit [budget] (each counted at its body's length plus 64).
+ */
+internal suspend fun snapshotPageDocs(
+    tree: DocumentTree,
+    after: String,
+    budget: Int,
+    headHex: String,
+    fetch: suspend (List<KdbUuid>) -> List<KdbDocument?>,
+): Pair<List<SnapshotDoc>, Boolean> {
+    val ids = snapshotIdsAfter(tree, after)
+    val docs = ArrayList<SnapshotDoc>()
+    var size = 0
+    while (true) {
+        val chunk = ArrayList<KdbUuid>(128)
+        while (chunk.size < 128 && ids.hasNext()) chunk += ids.next()
+        if (chunk.isEmpty()) return docs to true
+        val bodies = fetch(chunk)
+        for ((j, d) in bodies.withIndex()) {
+            val id = chunk[j].toString()
+            val body = d?.json ?: throw PeerSyncException("peer sync: document $id of $headHex has no body here")
+            if (docs.isNotEmpty() && size + body.length > budget) return docs to false
+            size += body.length + 64
+            docs += SnapshotDoc(id, body)
+        }
+    }
+}
+
+/**
+ * The ids of [tree] a SNAPSHOT_FETCH cursor [after] has yet to see, in the order pages carry them:
+ * every id whose canonical lowercase string sorts after the cursor string, which is UUID byte order.
+ * A cursor this node wrote (or Go wrote) is a canonical id, so the trie seeks straight to it; any
+ * other string is compared the way it always was, against every id in order.
+ */
+internal fun snapshotIdsAfter(
+    tree: DocumentTree,
+    after: String,
+): Iterator<KdbUuid> {
+    if (after.isEmpty()) return tree.idsAfter(null)
+    val cursor = runCatching { KdbUuid.fromString(after) }.getOrNull()
+    if (cursor != null && cursor.toString() == after) return tree.idsAfter(cursor)
+    return tree.idsAfter(null).asSequence().filter { it.toString() > after }.iterator()
 }
 
 /** A frame this host does not serve (Go's UnsupportedFrameError): answered UNSUPPORTED. */

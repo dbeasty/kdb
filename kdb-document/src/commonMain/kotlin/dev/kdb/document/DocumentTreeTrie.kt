@@ -232,3 +232,106 @@ internal fun trieBuild(entries: Map<KdbUuid, KdbHash>): TrieNode? {
 }
 
 internal fun trieTreeHash(root: TrieNode?): KdbHash = KdbHash(nodeHash(root))
+
+/** Whether [a] sorts after [b] as 16 big-endian bytes, the trie's (and the canonical string's) order. */
+private fun uuidAfter(a: KdbUuid, b: KdbUuid): Boolean =
+    if (a.msb != b.msb) a.msb.toULong() > b.msb.toULong() else a.lsb.toULong() > b.lsb.toULong()
+
+/**
+ * The trie's entries in id order (UUID byte order, which is also the order of their canonical
+ * lowercase strings), starting at the first id after [after], or at the first id when it is null.
+ *
+ * Finding the start walks one path, so a page of k entries costs O(depth + k) rather than the
+ * O(n log n) a sort of every id costs. The iterator holds a stack of at most TRIE_DEPTH frames.
+ */
+internal fun trieIterateAfter(root: TrieNode?, after: KdbUuid?): Iterator<TrieLeaf> = TrieSeekIterator(root, after)
+
+private class TrieSeekIterator(root: TrieNode?, after: KdbUuid?) : Iterator<TrieLeaf> {
+    // Frame k is an internal node whose children from next[k] on are still to be visited.
+    private val nodes = arrayOfNulls<TrieNode>(TRIE_DEPTH + 1)
+    private val next = IntArray(TRIE_DEPTH + 1)
+    private var top = -1
+    private var pending: TrieLeaf? = null
+
+    init {
+        if (root != null) {
+            if (after == null) {
+                descend(root)
+            } else {
+                seek(root, after)
+            }
+        }
+    }
+
+    /** Positions the stack just past [after]: every frame on its path resumes at the next sibling. */
+    private fun seek(root: TrieNode, after: KdbUuid) {
+        val ub = uuidBytes(after)
+        var node = root
+        var depth = 0
+        while (true) {
+            val leaf = node.leaf
+            if (leaf != null) {
+                // The only entry beneath this position: it may still sort after the cursor.
+                if (uuidAfter(leaf.uuid, after)) pending = leaf
+                return
+            }
+            val children = node.children ?: return
+            if (depth == TRIE_DEPTH) return
+            val nib = nibbleAt(ub, depth)
+            push(node, nib + 1)
+            node = children[nib] ?: return
+            depth++
+        }
+    }
+
+    /** Pushes the frames down to [node]'s first leaf and parks that leaf in pending. */
+    private fun descend(start: TrieNode) {
+        var node = start
+        while (true) {
+            val leaf = node.leaf
+            if (leaf != null) {
+                pending = leaf
+                return
+            }
+            val children = node.children ?: return
+            var i = 0
+            while (i < 16 && children[i] == null) i++
+            if (i == 16) return
+            push(node, i + 1)
+            node = children[i]!!
+        }
+    }
+
+    private fun push(node: TrieNode, from: Int) {
+        top++
+        nodes[top] = node
+        next[top] = from
+    }
+
+    private fun advance() {
+        while (pending == null && top >= 0) {
+            val children = nodes[top]!!.children!!
+            var i = next[top]
+            while (i < 16 && children[i] == null) i++
+            if (i == 16) {
+                nodes[top] = null
+                top--
+                continue
+            }
+            next[top] = i + 1
+            descend(children[i]!!)
+        }
+    }
+
+    override fun hasNext(): Boolean {
+        advance()
+        return pending != null
+    }
+
+    override fun next(): TrieLeaf {
+        advance()
+        val leaf = pending ?: throw NoSuchElementException()
+        pending = null
+        return leaf
+    }
+}
