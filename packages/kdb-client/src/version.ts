@@ -6,7 +6,7 @@
  * package.json drifts from it. The client trusts that pairing only as far as the handshake
  * confirms it: see `checkServerCompatible`.
  */
-export const CLIENT_VERSION = "0.7.2";
+export const CLIENT_VERSION = "0.8.0";
 
 interface Parsed {
   major: number;
