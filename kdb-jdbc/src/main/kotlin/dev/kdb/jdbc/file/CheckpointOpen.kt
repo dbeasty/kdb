@@ -22,8 +22,8 @@ import java.util.concurrent.TimeUnit
 
 /**
  * Opens a namespace from Go's checkpoint instead of replaying its whole delta log - Go's
- * restoreNamespace (go/kdb/embed/checkpoint_open.go), read-only: Kotlin reads Go's checkpoints and
- * never writes one.
+ * restoreNamespace (go/kdb/embed/checkpoint_open.go). The checkpoint is Go's or one Kotlin wrote in
+ * Go's format ([NamespaceCheckpointer]); the two are the same thing.
  *
  * The checkpoint is a cache, never an authority, and the rule here is Go's: anything wrong with it -
  * absent, undecodable, a version or feature this build cannot read, describing another namespace,
@@ -64,6 +64,18 @@ internal class CheckpointOpen(
     var whyNot: String = ""
         private set
 
+    /** The last [open] found a checkpoint in a format or with a feature this build does not read. */
+    var foreign: Boolean = false
+        private set
+
+    /** The checkpoint the last [open] opened from, or null. */
+    var opened: GoCheckpoint? = null
+        private set
+
+    /** How many delta segments after the checkpoint the last successful [open] replayed. */
+    var tailSegments: Int = 0
+        private set
+
     /**
      * The namespace's DAG, opened from the checkpoint with the engine holding its live state, or
      * null (see [whyNot]) with the engine reset to empty, for the caller to replay the log.
@@ -76,9 +88,11 @@ internal class CheckpointOpen(
             try {
                 GoCheckpoint.read(io, namespaceId)
             } catch (e: UnusableCheckpointException) {
+                foreign = e.foreign
                 return unusable("${e.message}")
             } ?: return unusable("there is none")
         if (cp.graphRefs > 0) {
+            foreign = true
             return unusable(
                 "it references ${cp.graphRefs} Go graph segment(s) (graph.file) for commits it does not carry, which this build does not read",
             )
@@ -131,6 +145,8 @@ internal class CheckpointOpen(
                 "${cp.throughSequence}; $checkedBy); replayed $tail later segment(s); ${cp.liveTree.size} live document(s), bodies from " +
                 "the blob store ${found.blobStore}, log locations ${found.located}, segment scan ${found.scanned}",
         )
+        opened = cp
+        tailSegments = tail
         return dag
     }
 

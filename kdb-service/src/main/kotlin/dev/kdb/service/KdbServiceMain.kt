@@ -42,6 +42,17 @@ import java.nio.file.Path
 public fun main(args: Array<String>) {
     val config = ServiceConfig.parse(args)
     val runtime = openRuntime(config)
+    // An orderly shutdown (SIGTERM, SIGINT) seals the delta log and writes the namespace's
+    // checkpoint in Go's format, as Go's kdb-service does at close.
+    Runtime.getRuntime().addShutdownHook(
+        Thread {
+            try {
+                runBlocking { runtime.close() }
+            } catch (e: Exception) {
+                System.err.println("kdb: closing namespace ${config.namespace}: ${e.message}")
+            }
+        },
+    )
     val wire = defaultWireCodec()
     val serverRuntime = KdbServerRuntime(runtime)
     // Layer 16 §9.5: --expire-* installs a documentExpiry policy on the served namespace; start()

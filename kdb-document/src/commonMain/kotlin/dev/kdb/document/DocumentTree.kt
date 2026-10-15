@@ -76,6 +76,12 @@ public data class DocumentTree(
         return DocumentTree(trieTreeHash(root), TrieEntries(root, size - 1))
     }
 
+    /** The subtree at [prefix] as a peer's TREE_NODES reports it (Go's DocumentTree.Node). */
+    public fun node(
+        prefix: String,
+        entryLimit: Int,
+    ): DocumentTreeNode = trieNodeAt(trieRoot, prefix, entryLimit)
+
     public companion object {
         // Ahead of EMPTY: constructing EMPTY reads it.
         private val UNBUILT = Any()

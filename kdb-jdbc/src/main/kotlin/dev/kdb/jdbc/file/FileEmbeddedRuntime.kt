@@ -14,10 +14,12 @@ import dev.kdb.schema.KdbSchema
 import dev.kdb.schema.isNone
 import dev.kdb.sql.sqlEngine
 import dev.kdb.storage.DeltaSegmentReader
+import dev.kdb.storage.DeltaSegmentWriter
 import dev.kdb.storage.PlatformIoShim
 import dev.kdb.storage.StorageAdapter
 import dev.kdb.storage.StorageEngineConfig
 import dev.kdb.storage.delta.DefaultDeltaSegmentReader
+import dev.kdb.storage.delta.DefaultDeltaSegmentWriter
 import dev.kdb.storage.engine.DefaultStorageEngineFactory
 import dev.kdb.storage.engine.ServerStorageEngine
 import dev.kdb.storage.engine.StorageEngineTarget
@@ -62,10 +64,10 @@ public fun openFileRuntime(
     val deltaWriter =
         handle.deltaWriter
             ?: error("SERVER storage engine requires delta writer for file mode")
-    val baseDag = runBlocking { restoreNamespace(dataRoot, namespaceId, io, handle.adapter, handle.deltaReader!!) }
+    val restored = runBlocking { restoreNamespace(dataRoot, namespaceId, io, handle.adapter, handle.deltaReader!!) }
     val dag: CommitDag =
         PersistingCommitDag(
-            baseDag,
+            restored.dag,
             DeltaCommitPersistence(namespaceId, deltaWriter),
         )
     val storage = handle.adapter
@@ -124,8 +126,72 @@ public fun openFileRuntime(
         rt.snapshotPersistence = FileSnapshotPersistence(dataRoot, io)
         val roots = NamespaceMarker.shallowRoots(dataRoot, namespaceId).mapNotNull { runCatching { KdbHash.fromHex(it) }.getOrNull() }
         if (roots.isNotEmpty()) rt.shallowRoots[namespaceId] = roots.toMutableSet()
+        val engine = storage as? ServerStorageEngine
+        runBlocking {
+            if (engine != null) installCheckpoints(rt, dataRoot, namespaceId, io, engine, deltaWriter, restored)
+            rt.addCloseHook { handle.close() }
+        }
     }
 }
+
+/**
+ * Go's checkpoint policy for a file runtime: one right after an open that replayed the whole log
+ * (checkpointAfterFullReplay), and one at close once the writer is sealed (checkpointOnClose) -
+ * skipped at close when nothing has changed since the checkpoint this runtime opened from or wrote.
+ */
+private suspend fun installCheckpoints(
+    rt: EmbeddedKdbRuntime,
+    dataRoot: String,
+    namespaceId: String,
+    io: PlatformIoShim,
+    engine: ServerStorageEngine,
+    writer: DeltaSegmentWriter,
+    restored: Restored,
+) {
+    val cp = NamespaceCheckpointer(dataRoot, namespaceId, io, engine, rt.dag) { rt.shallowRoots[namespaceId]?.toSet().orEmpty() }
+    cp.foreignOnDisk = restored.foreignCheckpoint
+    restored.fromCheckpoint?.let { cp.remember(it.segments) }
+    val writerSeq = (writer as? DefaultDeltaSegmentWriter)?.sequence
+    // A squash catch-up is durable only through a checkpoint (Go's PersistSquash).
+    if (writerSeq != null) rt.squashPersistence = FileSquashPersistence(dataRoot, io, cp, writerSeq)
+    var current = restored.fromCheckpoint != null && restored.tailSegments == 0
+    if (!current && restored.replayedInFull && writerSeq != null && writerSeq > 0) {
+        // Strictly below the writer's own segment: that one takes this session's commits.
+        cp.save(writerSeq - 1)?.let { why ->
+            System.err.println("kdb: namespace $namespaceId: no checkpoint after the full replay ($why) - the next open will replay the log again")
+        } ?: run { current = true }
+    }
+    val refsAtOpen = refsOf(rt)
+    val rootsAtOpen = rt.shallowRoots[namespaceId]?.toSet().orEmpty()
+    rt.addCloseHook {
+        writer.flush()
+        val wrote = writer.currentSizeBytes > 0
+        if (!writer.isSealed) writer.seal()
+        val changed = !current || wrote || refsOf(rt) != refsAtOpen || rt.shallowRoots[namespaceId]?.toSet().orEmpty() != rootsAtOpen
+        if (!changed) return@addCloseHook
+        val through = (writerSeq ?: 0).let { if (wrote) it else it - 1 }
+        // As Go's saveCheckpoint: an empty log has nothing to claim, and a snapshot install's own
+        // checkpoint (through -1) already records the state.
+        if (through < 0) return@addCloseHook
+        cp.save(through)?.let { why ->
+            System.err.println("kdb: namespace $namespaceId: no checkpoint on close ($why) - the next open will replay the log")
+        }
+    }
+}
+
+private suspend fun refsOf(rt: EmbeddedKdbRuntime): Pair<List<Any>, List<Any>> =
+    rt.dag.listBranches().map { it.name to it.headHash } to rt.dag.listTags().map { it.name to it.commitHash }
+
+/** How [restoreNamespace] rebuilt the namespace. */
+private class Restored(
+    val dag: CommitDag,
+    /** The checkpoint it opened from, or null when it replayed the log. */
+    val fromCheckpoint: GoCheckpoint? = null,
+    val tailSegments: Int = 0,
+    val replayedInFull: Boolean = false,
+    /** A checkpoint is on disk that this build does not read (CheckpointOpen.foreign). */
+    val foreignCheckpoint: Boolean = false,
+)
 
 /**
  * Rebuilds the namespace's DAG and live state: from Go's checkpoint and the log after it when the
@@ -139,7 +205,7 @@ private suspend fun restoreNamespace(
     io: PlatformIoShim,
     storage: StorageAdapter,
     reader: DeltaSegmentReader,
-): CommitDag {
+): Restored {
     val marker = NamespaceMarker.roots(dataRoot, namespaceId)
     fun hashes(hexes: List<String>): Set<KdbHash> = hexes.mapNotNull { runCatching { KdbHash.fromHex(it) }.getOrNull() }.toSet()
     val graft = hashes(marker.graftRoots)
@@ -151,7 +217,7 @@ private suspend fun restoreNamespace(
         } else {
             null
         }
-    opener?.open()?.let { return it }
+    if (opener != null) opener.open()?.let { return Restored(it, opener.opened, opener.tailSegments) }
     val why = opener?.whyNot ?: "this storage engine cannot restore one"
     if (marker.shallowRoots.isNotEmpty()) {
         throw ShallowNamespaceException(namespaceId, marker.shallowRoots, "the checkpoint: $why")
@@ -171,5 +237,5 @@ private suspend fun restoreNamespace(
     }
     val dag = inMemoryCommitDag(namespaceId)
     DeltaNamespaceReplayer.replay(dag, storage, reader, decisions, shallow = graft)
-    return dag
+    return Restored(dag, replayedInFull = true, foreignCheckpoint = opener?.foreign == true)
 }

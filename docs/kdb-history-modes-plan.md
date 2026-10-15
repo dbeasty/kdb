@@ -310,7 +310,8 @@ small.
 Either way the checkpoint becomes **format version 2** and, under NONE
 only, an *authority* rather than a pure cache. The Go tree owns this file
 alone (Kotlin's `ServerStorageEngine` writes no checkpoint), so it is not
-a cross-tree gate.
+a cross-tree gate. (Since 2026-10-14 Kotlin writes Go's checkpoint format too:
+`NamespaceCheckpointer.kt`, docs/kdb-client-replica-plan.md §11.)
 
 ### 2b. Truncate the journal behind the checkpoint
 

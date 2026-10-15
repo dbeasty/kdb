@@ -133,15 +133,91 @@ public fun netEffect(ordered: List<ReplicaCommit>): LinkedHashMap<String, KdbOp>
  * document id to attachment-set hash, in a second trie - and checks every commit's
  * `attachmentTreeHash` against it as it checks the tree hash. Bytes are not here; see [BlobStore].
  */
-public class ReplicaNamespace private constructor(
-    private val store: ReplicaStore,
-    @kotlin.concurrent.Volatile private var meta: NamespaceMeta,
-) {
-    public val name: String = meta.name
-    internal val key: String = namespaceKey(meta.name)
-    private val trie = TrieReader(store, key)
-    private val lock = Mutex()
-    private val genesisHash = genesisCommit(name).hash
+public interface ReplicaNamespace {
+    public val name: String
+    public val head: String?
+
+    /** Whether the namespace is still at its genesis, holding nothing: what a snapshot bootstraps. */
+    public val isEmpty: Boolean
+    public val pending: List<String>
+    public val target: ConvergeTarget?
+    public val remoteMain: String?
+    public val nodeId: String
+
+    /** The hash of the documents' tree as held now. */
+    public suspend fun rootHash(): String
+
+    public suspend fun commit(hash: String): ReplicaCommit?
+
+    public suspend fun headCommit(): ReplicaCommit?
+
+    /** The document's JSON, or null. */
+    public suspend fun get(id: String): String?
+
+    /** The document's content hash, or null. */
+    public suspend fun contentHashOf(id: String): String?
+
+    /** Documents in id order, after [after] (exclusive) and before [before], at most [limit]. */
+    public suspend fun scan(after: String? = null, before: String? = null, limit: Int = Int.MAX_VALUE): List<ReplicaDocument>
+
+    /**
+     * Fast-forwards to [target], given the commits between the current head and target (any
+     * order). The range must reach the current head; the tree built must be target's. Returns the
+     * ids of the documents that changed.
+     */
+    public suspend fun fastForward(commits: List<ReplicaCommit>, target: String): List<String>
+
+    /**
+     * Commits [ops] locally on top of the head and queues the commit for push. Its timestamp is
+     * the wall clock, but never at or below one the replica has already seen or made, so a device
+     * with a slow clock still orders after the host's history (the host refuses skewed commits).
+     */
+    public suspend fun commitLocal(
+        ops: List<KdbOp>,
+        transactionId: KdbUuid,
+        message: String = "",
+        nowMicros: Long = nowMicros(),
+    ): ReplicaCommit
+
+    /** Records the host's main as of this sync. */
+    public suspend fun setRemoteMain(hash: String?)
+
+    /**
+     * Starts converging to [target] by [via] ("snapshot" or "diff"); a no-op if already converging
+     * to it. Refused while local commits are unpushed: a replica never drops them.
+     */
+    public suspend fun beginConverge(target: ReplicaCommit, via: String)
+
+    /** Applies one page of a convergence: final states for some documents (null deletes), and the
+     * cursor to resume after. Unverified until [finishConverge]. */
+    public suspend fun applyConvergePage(docs: List<Pair<String, String?>>, after: String)
+
+    /** Sets attachment sets during a convergence: a whole replacement or per document. */
+    public suspend fun applyConvergeAttachments(sets: Map<String, List<ReplicaAttachment>>, whole: Boolean)
+
+    /** The attachment table's root as the replica holds it now; null when it is empty. */
+    public suspend fun attachmentRoot(): String?
+
+    /** The document's attachments (refs; the bytes are fetched on read), in id order. */
+    public suspend fun attachments(id: String): List<ReplicaAttachment>
+
+    /** Completes a convergence: the built tree must be the target's, which becomes the head. */
+    public suspend fun finishConverge()
+
+    /** Marks the oldest [n] pending commits as held by the host. */
+    public suspend fun markPushed(n: Int, remoteMain: String)
+
+    /** The unpushed local commits, oldest first. */
+    public suspend fun pendingCommits(): List<ReplicaCommit>
+
+    /** The subtree at [prefix], as Go's DocumentTree.Node reports it. */
+    public suspend fun treeNode(prefix: String, entryLimit: Int, tree: TreeKind = TreeKind.DOCUMENTS): TreeNodeView
+
+    /** Every document as (id, contentHash), in id order. */
+    public suspend fun walkTree(visit: suspend (id: String, contentHash: String) -> Unit)
+
+    /** Releases what the namespace holds open; the store-backed one holds nothing. */
+    public suspend fun close() {}
 
     public companion object {
         public fun metaKey(name: String): String = "m/ns/${namespaceKey(name)}"
@@ -149,7 +225,7 @@ public class ReplicaNamespace private constructor(
         /** Opens namespace [name] in [store], creating its (empty) metadata on first use. */
         public suspend fun open(store: ReplicaStore, name: String, nodeId: String): ReplicaNamespace {
             val raw = store.get(metaKey(name))
-            if (raw != null) return ReplicaNamespace(store, metaJson.decodeFromString(raw.decodeToString()))
+            if (raw != null) return StoreReplicaNamespace(store, metaJson.decodeFromString(raw.decodeToString()))
             val genesis = genesisCommit(name)
             val meta = NamespaceMeta(name = name, nodeId = nodeId, head = genesis.hash)
             store.apply(
@@ -158,26 +234,37 @@ public class ReplicaNamespace private constructor(
                     put("c/${namespaceKey(name)}/${genesis.hash}", genesis.payload)
                 },
             )
-            return ReplicaNamespace(store, meta)
+            return StoreReplicaNamespace(store, meta)
         }
     }
+}
 
-    public val head: String? get() = meta.head
+/** A namespace kept in the replica's [ReplicaStore] (plan §5): the TS replica's layout. */
+internal class StoreReplicaNamespace(
+    private val store: ReplicaStore,
+    @kotlin.concurrent.Volatile private var meta: NamespaceMeta,
+) : ReplicaNamespace {
+    override val name: String = meta.name
+    internal val key: String = namespaceKey(meta.name)
+    private val trie = TrieReader(store, key)
+    private val lock = Mutex()
+    private val genesisHash = genesisCommit(name).hash
 
-    /** Whether the namespace is still at its genesis, holding nothing: what a snapshot bootstraps. */
-    public val isEmpty: Boolean get() = meta.head == genesisHash && meta.pending.isEmpty() && meta.target == null
+    override val head: String? get() = meta.head
 
-    public val pending: List<String> get() = meta.pending
-    public val target: ConvergeTarget? get() = meta.target
-    public val remoteMain: String? get() = meta.remoteMain
-    public val nodeId: String get() = meta.nodeId
+    override val isEmpty: Boolean get() = meta.head == genesisHash && meta.pending.isEmpty() && meta.target == null
+
+    override val pending: List<String> get() = meta.pending
+    override val target: ConvergeTarget? get() = meta.target
+    override val remoteMain: String? get() = meta.remoteMain
+    override val nodeId: String get() = meta.nodeId
 
     private fun docKey(id: String) = "d/$key/${id.lowercase()}"
 
     private fun commitKey(hash: String) = "c/$key/$hash"
 
     private fun writeMeta(batch: Batch, m: NamespaceMeta) {
-        batch[metaKey(name)] = metaJson.encodeToString(NamespaceMeta.serializer(), m).encodeToByteArray()
+        batch[ReplicaNamespace.metaKey(name)] = metaJson.encodeToString(NamespaceMeta.serializer(), m).encodeToByteArray()
     }
 
     private suspend fun commitMeta(batch: Batch, m: NamespaceMeta) {
@@ -186,20 +273,20 @@ public class ReplicaNamespace private constructor(
         meta = m
     }
 
-    public suspend fun rootHash(): String = trie.rootHash()
+    override suspend fun rootHash(): String = trie.rootHash()
 
-    public suspend fun commit(hash: String): ReplicaCommit? = store.get(commitKey(hash))?.let { ReplicaCommit.decode(it) }
+    override suspend fun commit(hash: String): ReplicaCommit? = store.get(commitKey(hash))?.let { ReplicaCommit.decode(it) }
 
-    public suspend fun headCommit(): ReplicaCommit? = meta.head?.let { commit(it) }
+    override suspend fun headCommit(): ReplicaCommit? = meta.head?.let { commit(it) }
 
     /** The document's JSON, or null. */
-    public suspend fun get(id: String): String? = store.get(docKey(id))?.let { it.decodeToString(32, it.size) }
+    override suspend fun get(id: String): String? = store.get(docKey(id))?.let { it.decodeToString(32, it.size) }
 
     /** The document's content hash, or null. */
-    public suspend fun contentHashOf(id: String): String? = store.get(docKey(id))?.copyOfRange(0, 32)?.toHex()
+    override suspend fun contentHashOf(id: String): String? = store.get(docKey(id))?.copyOfRange(0, 32)?.toHex()
 
     /** Documents in id order, after [after] (exclusive) and before [before], at most [limit]. */
-    public suspend fun scan(after: String? = null, before: String? = null, limit: Int = Int.MAX_VALUE): List<ReplicaDocument> {
+    override suspend fun scan(after: String?, before: String?, limit: Int): List<ReplicaDocument> {
         val base = "d/$key/"
         val start = if (after != null) base + after.lowercase() + "\u0000" else base
         val end = if (before != null) base + before.lowercase() else prefixEnd(base)
@@ -233,7 +320,7 @@ public class ReplicaNamespace private constructor(
      * order). The range must reach the current head; the tree built must be target's. Returns the
      * ids of the documents that changed.
      */
-    public suspend fun fastForward(commits: List<ReplicaCommit>, target: String): List<String> =
+    override suspend fun fastForward(commits: List<ReplicaCommit>, target: String): List<String> =
         lock.withLock {
             if (meta.pending.isNotEmpty()) {
                 throw NotFastForwardException("kdb replica: local commits are not yet pushed; push before pulling")
@@ -242,7 +329,7 @@ public class ReplicaNamespace private constructor(
             if (target == meta.head) return@withLock emptyList()
             val byHash = commits.associateBy { it.hash }
             val tip = byHash[target] ?: throw NotFastForwardException("kdb replica: the range does not contain its target $target")
-            checkReachesHead(byHash, target)
+            checkReachesHead(byHash, target, meta.head)
             val ordered = topoSort(commits)
             val effect = netEffect(ordered)
             val batch = Batch()
@@ -270,32 +357,6 @@ public class ReplicaNamespace private constructor(
             effect.keys.toList()
         }
 
-    private fun checkReachesHead(byHash: Map<String, ReplicaCommit>, target: String) {
-        val head = meta.head
-        val seen = HashSet<String>()
-        val queue = ArrayDeque(listOf(target))
-        var reached = false
-        var roots = false
-        while (queue.isNotEmpty()) {
-            val h = queue.removeLast()
-            if (!seen.add(h)) continue
-            val c = byHash[h]
-            if (c == null) {
-                if (h == head) reached = true
-                continue
-            }
-            if (c.parents.isEmpty()) roots = true
-            queue.addAll(c.parents)
-        }
-        if (head == null) {
-            if (!roots || seen.any { it !in byHash }) {
-                throw NotFastForwardException("kdb replica: a namespace with no head needs the whole history or a snapshot")
-            }
-        } else if (!reached) {
-            throw NotFastForwardException("kdb replica: $target does not descend from the head $head")
-        }
-    }
-
     private fun replaceHead(batch: Batch, tip: ReplicaCommit, lastMicros: Long): NamespaceMeta {
         val old = meta.head
         if (old != null && old != tip.hash) batch[commitKey(old)] = null
@@ -308,11 +369,11 @@ public class ReplicaNamespace private constructor(
      * the wall clock, but never at or below one the replica has already seen or made, so a device
      * with a slow clock still orders after the host's history (the host refuses skewed commits).
      */
-    public suspend fun commitLocal(
+    override suspend fun commitLocal(
         ops: List<KdbOp>,
         transactionId: KdbUuid,
-        message: String = "",
-        nowMicros: Long = nowMicros(),
+        message: String,
+        nowMicros: Long,
     ): ReplicaCommit =
         lock.withLock {
             if (meta.target != null) {
@@ -346,7 +407,7 @@ public class ReplicaNamespace private constructor(
         }
 
     /** Records the host's main as of this sync. */
-    public suspend fun setRemoteMain(hash: String?) {
+    override suspend fun setRemoteMain(hash: String?) {
         lock.withLock { commitMeta(Batch(), meta.copy(remoteMain = hash)) }
     }
 
@@ -354,7 +415,7 @@ public class ReplicaNamespace private constructor(
      * Starts converging to [target] by [via] ("snapshot" or "diff"); a no-op if already converging
      * to it. Refused while local commits are unpushed: a replica never drops them.
      */
-    public suspend fun beginConverge(target: ReplicaCommit, via: String) {
+    override suspend fun beginConverge(target: ReplicaCommit, via: String) {
         lock.withLock {
             val t = meta.target
             if (t != null && t.hash == target.hash && t.via == via) return@withLock
@@ -370,7 +431,7 @@ public class ReplicaNamespace private constructor(
      * cursor to resume after. Unverified until [finishConverge], but durable, so an interrupted
      * convergence resumes rather than restarts.
      */
-    public suspend fun applyConvergePage(docs: List<Pair<String, String?>>, after: String) {
+    override suspend fun applyConvergePage(docs: List<Pair<String, String?>>, after: String) {
         lock.withLock {
             val t = meta.target ?: error("kdb replica: not converging")
             val ops =
@@ -390,7 +451,7 @@ public class ReplicaNamespace private constructor(
      * every other set goes) or per document (a diff). Unverified until [finishConverge], like the
      * pages.
      */
-    public suspend fun applyConvergeAttachments(sets: Map<String, List<ReplicaAttachment>>, whole: Boolean) {
+    override suspend fun applyConvergeAttachments(sets: Map<String, List<ReplicaAttachment>>, whole: Boolean) {
         lock.withLock {
             if (meta.target == null) error("kdb replica: not converging")
             val att = AttachmentEdit(store, key)
@@ -405,17 +466,17 @@ public class ReplicaNamespace private constructor(
     }
 
     /** The attachment table's root as the replica holds it now; null when it is empty. */
-    public suspend fun attachmentRoot(): String? = attachmentRootOf(store, key)
+    override suspend fun attachmentRoot(): String? = attachmentRootOf(store, key)
 
     /** The document's attachments (refs; the bytes are fetched on read), in id order. */
-    public suspend fun attachments(id: String): List<ReplicaAttachment> = attachmentsOf(store, key, id)
+    override suspend fun attachments(id: String): List<ReplicaAttachment> = attachmentsOf(store, key, id)
 
     /**
      * Completes a convergence: the built tree must be the target's. Then the target is the head, a
      * root this replica holds without its history. Throws [TreeMismatchException] otherwise, and
      * stays converging - a diff against the target's tree then repairs whatever differs.
      */
-    public suspend fun finishConverge() {
+    override suspend fun finishConverge() {
         lock.withLock {
             val t = meta.target ?: return@withLock
             val tip = ReplicaCommit.decode(hexToBytes(t.payloadHex))
@@ -430,7 +491,7 @@ public class ReplicaNamespace private constructor(
     }
 
     /** Marks the oldest [n] pending commits as held by the host. */
-    public suspend fun markPushed(n: Int, remoteMain: String) {
+    override suspend fun markPushed(n: Int, remoteMain: String) {
         lock.withLock {
             val batch = Batch()
             // Pushed commits other than the head are history the replica does not keep.
@@ -440,14 +501,14 @@ public class ReplicaNamespace private constructor(
     }
 
     /** The unpushed local commits, oldest first. */
-    public suspend fun pendingCommits(): List<ReplicaCommit> =
+    override suspend fun pendingCommits(): List<ReplicaCommit> =
         meta.pending.map { h -> commit(h) ?: error("kdb replica: pending commit $h is missing from the store") }
 
     /**
      * The subtree at [prefix], as Go's DocumentTree.Node reports it, so a diff against a host's
      * TREE_NODES compares like with like - including for a subtree stored folded into one leaf.
      */
-    public suspend fun treeNode(prefix: String, entryLimit: Int, tree: TreeKind = TreeKind.DOCUMENTS): TreeNodeView {
+    override suspend fun treeNode(prefix: String, entryLimit: Int, tree: TreeKind): TreeNodeView {
         val trie = if (tree == TreeKind.DOCUMENTS) this.trie else TrieReader(store, attachmentTrieKey(key))
         val empty = TreeNodeView(prefix, "", emptyList(), null)
         var at = ""
@@ -486,7 +547,7 @@ public class ReplicaNamespace private constructor(
     }
 
     /** Every document as (id, contentHash), in id order, from the trie. */
-    public suspend fun walkTree(visit: suspend (id: String, contentHash: String) -> Unit) {
+    override suspend fun walkTree(visit: suspend (id: String, contentHash: String) -> Unit) {
         trie.walk { id, ch ->
             visit(id, ch)
             true
@@ -498,4 +559,30 @@ private fun maxMicros(last: Long, commits: List<ReplicaCommit>): Long {
     var m = last
     for (c in commits) if (c.timestampMicros > m) m = c.timestampMicros
     return m
+}
+
+/** That [target] descends from [head] through [byHash] (or, with no head, that the range is whole). */
+internal fun checkReachesHead(byHash: Map<String, ReplicaCommit>, target: String, head: String?) {
+    val seen = HashSet<String>()
+    val queue = ArrayDeque(listOf(target))
+    var reached = false
+    var roots = false
+    while (queue.isNotEmpty()) {
+        val h = queue.removeLast()
+        if (!seen.add(h)) continue
+        val c = byHash[h]
+        if (c == null) {
+            if (h == head) reached = true
+            continue
+        }
+        if (c.parents.isEmpty()) roots = true
+        queue.addAll(c.parents)
+    }
+    if (head == null) {
+        if (!roots || seen.any { it !in byHash }) {
+            throw NotFastForwardException("kdb replica: a namespace with no head needs the whole history or a snapshot")
+        }
+    } else if (!reached) {
+        throw NotFastForwardException("kdb replica: $target does not descend from the head $head")
+    }
 }

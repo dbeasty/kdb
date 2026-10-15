@@ -56,4 +56,11 @@ public interface CheckpointRestorableDag {
 
     /** How many restored commits still have their operations only in the log. */
     public suspend fun commitsWithoutOperations(): Int
+
+    /**
+     * Every commit held, as a checkpoint records it (Go: the commits of CheckpointSnapshot), with
+     * the operation count of those whose operations are still only in the log - for writing a
+     * checkpoint. Null when the DAG holds what a checkpoint cannot carry (archived commit stubs).
+     */
+    public suspend fun checkpointCommits(): List<CheckpointCommit>?
 }

@@ -525,7 +525,13 @@ Kotlin reads checkpoint formats 2 to 6, and validates one against the log the wa
 (segment fingerprints, the truncation floor, damage) before using it. It does not read Go's graph
 segments: a checkpoint written with `graph.file` on that names graph segments for commits it does
 not carry makes Kotlin replay the log instead. A checkpoint Kotlin can't use costs a slower open,
-never a different answer. Kotlin reads Go's checkpoints but never writes one.
+never a different answer.
+
+Kotlin also writes checkpoints in Go's format (2 for a small namespace without attachments, otherwise 6), at
+the same points Go does: right after an open that had to replay the whole log, and when the runtime is closed
+(the CLI exits, a JDBC connection closes, `kdb-service` shuts down). A close that changed nothing leaves the
+checkpoint as it was. Go opens a Kotlin-written checkpoint as its own, and the reverse. Kotlin leaves a
+checkpoint it cannot read (a newer format, or one naming graph segments) as it is and replays instead.
 
 Attachments survive the same open. The checkpoint carries the attachment tables of branch and tag
 heads, and Kotlin rebuilds an older commit's table by loading that commit's history from the delta

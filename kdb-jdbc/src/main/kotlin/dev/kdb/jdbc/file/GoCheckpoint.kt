@@ -113,7 +113,10 @@ internal class GoCheckpoint(
                 } ?: throw UnusableCheckpointException("its root is not a record")
             val version = (rec.fields[1] as? KdbValue.Int32Val)?.v ?: throw UnusableCheckpointException("it has no format version")
             if (version !in VERSION_LEGACY..VERSION_SECTION) {
-                throw UnusableCheckpointException("it is format version $version, and this build reads $VERSION_LEGACY-$VERSION_SECTION")
+                throw UnusableCheckpointException(
+                    "it is format version $version, and this build reads $VERSION_LEGACY-$VERSION_SECTION",
+                    foreign = true,
+                )
             }
             val ns = str(rec.fields[2], "namespaceId")
             if (ns != namespaceId) {
@@ -495,4 +498,7 @@ internal class GoCheckpoint(
 internal class UnusableCheckpointException(
     reason: String,
     cause: Throwable? = null,
+    /** Unusable because it is in a format or uses a feature this build does not read, not because it is
+     * stale or damaged: a checkpoint Kotlin must not replace with its own (see [NamespaceCheckpointer]). */
+    val foreign: Boolean = false,
 ) : IllegalStateException(reason, cause)
