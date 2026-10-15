@@ -438,7 +438,10 @@ func (s *trieSlab) commit(e *trieEdit, r tref, gen uint32) *trieTree {
 	s.drain(drainPerUpdate)
 	r = s.place(e, r)
 	s.retain(r)
+	w := s.pace
+	s.pace = nil
 	s.mu.Unlock()
+	slabPace(w)
 	return s.adoptAt(r, gen)
 }
 
