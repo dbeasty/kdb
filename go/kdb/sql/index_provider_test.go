@@ -131,10 +131,12 @@ func TestIndexExactLookupIsUsedAndResidualStillApplies(t *testing.T) {
 	if res.Plan != "fullscan" || strings.Join(rows, ",") != "alpha" {
 		t.Fatalf("%q %v", res.Plan, rows)
 	}
-	// OR is not a conjunct; NULL keys and reserved columns are never looked up.
-	_, res, _ = f.query(`SELECT title FROM tasks WHERE status = 'open' OR status = 'done'`)
-	if res.Plan != "fullscan" {
-		t.Fatalf("OR must not use the index: %q", res.Plan)
+	// An OR whose disjuncts are all servable is served by their union (or_union_test.go), and
+	// the residual still drops what the index over-returned; NULL keys and reserved columns are
+	// never looked up.
+	rows, res, _ = f.query(`SELECT title FROM tasks WHERE status = 'open' OR status = 'done' ORDER BY title`)
+	if res.Plan != "index:or(eq(status)|eq(status))" || strings.Join(rows, ",") != "Echo,alpha,bravo,charlie" {
+		t.Fatalf("OR: %q %v", res.Plan, rows)
 	}
 	_, res, _ = f.query(`SELECT title FROM tasks WHERE status = NULL`)
 	if res.Plan != "fullscan" {

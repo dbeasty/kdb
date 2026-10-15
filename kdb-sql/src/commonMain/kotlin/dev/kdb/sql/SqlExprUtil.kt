@@ -76,6 +76,14 @@ internal fun andConjuncts(expr: SqlExpr): List<SqlExpr> {
     return listOf(expr)
 }
 
+/** Splits top-level OR into disjuncts (flattened). */
+internal fun orDisjuncts(expr: SqlExpr): List<SqlExpr> {
+    if (expr is SqlExpr.Binary && expr.op == BinaryOp.OR) {
+        return orDisjuncts(expr.left) + orDisjuncts(expr.right)
+    }
+    return listOf(expr)
+}
+
 internal fun recomposeAnd(parts: List<SqlExpr>): SqlExpr? {
     if (parts.isEmpty()) return null
     return parts.reduce { acc, e -> SqlExpr.Binary(BinaryOp.AND, acc, e) }
