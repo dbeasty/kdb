@@ -144,11 +144,14 @@ class NetworkWebSocketWireTransportTest {
 
     /** Two listeners on one fixed port at different paths (kdb-service's peer sync and stream):
      * the second used to fail to bind; now each path reaches its own handler, and the port is
-     * released once both stop. */
+     * released once both stop - even though they are cancelled together, which used to leave the
+     * server listening when one release found the other holding the registry lock.
+     *
+     * The first listener binds port 0 and the second joins the port it got, so no other process
+     * can take the port in between. */
     @Test
     fun twoListenersShareAFixedPortByPath() =
         runBlocking {
-            val port = java.net.ServerSocket(0).use { it.localPort }
             val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
             fun answer(cid: Int): suspend (dev.kdb.stream.WireConnection) -> Unit =
                 { conn ->
@@ -156,8 +159,8 @@ class NetworkWebSocketWireTransportTest {
                         conn.send(wire.encode(hello(cid)))
                     }
                 }
-            val a = scope.launch { transport.listen("kdb-ws://127.0.0.1:$port/kdb?bind=true", dev.kdb.transport.core.TransportConnectOptions(), answer(1)) }
-            delay(200)
+            val a = scope.launch { transport.listen("kdb-ws://127.0.0.1:0/kdb?bind=true", dev.kdb.transport.core.TransportConnectOptions(), answer(1)) }
+            val port = awaitListenPort(transport as JvmWebSocketWireTransport)
             val b = scope.launch { transport.listen("kdb-ws://127.0.0.1:$port/kdb/stream?bind=true", dev.kdb.transport.core.TransportConnectOptions(), answer(2)) }
             delay(200)
             for ((path, cid) in listOf("/kdb" to 1, "/kdb/stream" to 2)) {
@@ -179,6 +182,14 @@ class NetworkWebSocketWireTransportTest {
             WireHeader(WireMessageType.HANDSHAKE, KDB_WIRE_PROTOCOL_VERSION, cid, 0),
             HandshakePayload(nodeId = "n", namespaces = listOf("demo"), localHeads = emptyMap(), clientMode = WireClientMode.FULL_PEER),
         )
+
+    private suspend fun awaitListenPort(transport: JvmWebSocketWireTransport): Int {
+        repeat(500) {
+            runCatching { transport.networkListenPort() }.getOrNull()?.takeIf { it != 0 }?.let { return it }
+            delay(10)
+        }
+        error("listener did not bind")
+    }
 
     private suspend fun awaitServerPort(server: JvmNetworkWebSocketServer) {
         repeat(500) {
