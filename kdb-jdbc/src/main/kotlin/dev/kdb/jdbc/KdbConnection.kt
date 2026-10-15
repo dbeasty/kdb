@@ -211,7 +211,12 @@ public class KdbConnection(
         closed = true
         lease?.release()
         if (url.mode == JdbcMode.FILE) {
-            url.dataRoot?.let { DataDirectoryLockRegistry.releaseBlocking(it) }
+            // An orderly close: seals the delta log and writes the namespace's checkpoint (Go's format).
+            try {
+                kotlinx.coroutines.runBlocking { runtime.close() }
+            } finally {
+                url.dataRoot?.let { DataDirectoryLockRegistry.releaseBlocking(it) }
+            }
         }
     }
 

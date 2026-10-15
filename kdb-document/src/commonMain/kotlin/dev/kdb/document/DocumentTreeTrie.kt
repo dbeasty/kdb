@@ -325,3 +325,61 @@ internal fun trieBuild(entries: Map<KdbUuid, KdbHash>): TrieNode? {
 }
 
 internal fun trieTreeHash(root: TrieNode?): KdbHash = KdbHash(nodeHash(root))
+
+/**
+ * One position of the trie as a peer's TREE_NODES reports it - Go's DocumentTree.Node
+ * (go/kdb/document/document_tree_node.go): the subtree at [prefix] (a string of lowercase hex
+ * nibbles), its children's hashes, and its entries when it holds no more than the entry limit.
+ */
+public class DocumentTreeNode(
+    public val prefix: String,
+    /** Null when the subtree is empty. */
+    public val hash: KdbHash?,
+    /** 16 child hashes, null for an empty child; empty when the subtree is empty. */
+    public val children: List<KdbHash?>,
+    /** Document id to content hash, when the subtree holds at most the entry limit; else null. */
+    public val entries: Map<KdbUuid, KdbHash>?,
+)
+
+private fun hexNibble(c: Char): Int = if (c <= '9') c - '0' else c - 'a' + 10
+
+private fun hexOf(b: ByteArray): String = b.joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
+
+/** Walks [n]'s entries until [visit] returns false; true when it saw them all. */
+private fun trieWalk(n: TrieNode, visit: (KdbUuid, KdbHash) -> Boolean): Boolean {
+    n.leaf?.let { return visit(it.uuid, it.hash) }
+    for (c in n.children.orEmpty()) if (c != null && !trieWalk(c, visit)) return false
+    return true
+}
+
+internal fun trieNodeAt(root: TrieNode?, prefix: String, entryLimit: Int): DocumentTreeNode {
+    require(prefix.length <= TRIE_DEPTH && prefix.all { it in '0'..'9' || it in 'a'..'f' }) { "document tree: \"$prefix\" is not a nibble prefix" }
+    val empty = DocumentTreeNode(prefix, null, emptyList(), null)
+    val depth = prefix.length
+    var r = root ?: return empty
+    for (d in 0 until depth) {
+        if (r.leaf != null) break
+        r = r.children?.get(hexNibble(prefix[d])) ?: return empty
+    }
+    val leaf = r.leaf
+    if (leaf != null) {
+        // A compressed leaf stands for everything below where it sits; it belongs to this subtree
+        // only if its id carries the whole prefix.
+        val ub = uuidBytes(leaf.uuid)
+        if (!hexOf(ub).startsWith(prefix)) return empty
+        val children = MutableList<KdbHash?>(16) { null }
+        if (depth < TRIE_DEPTH) children[nibbleAt(ub, depth)] = KdbHash(foldLeaf(ub, leaf.hash, depth + 1))
+        return DocumentTreeNode(prefix, KdbHash(foldLeaf(ub, leaf.hash, depth)), children, if (entryLimit >= 1) mapOf(leaf.uuid to leaf.hash) else null)
+    }
+    val children = (0 until 16).map { i -> r.children?.get(i)?.let { KdbHash(it.hash) } }
+    var entries: Map<KdbUuid, KdbHash>? = null
+    if (entryLimit > 0) {
+        val found = LinkedHashMap<KdbUuid, KdbHash>()
+        val small = trieWalk(r) { id, h ->
+            found[id] = h
+            found.size <= entryLimit
+        }
+        if (small) entries = found
+    }
+    return DocumentTreeNode(prefix, KdbHash(r.hash), children, entries)
+}

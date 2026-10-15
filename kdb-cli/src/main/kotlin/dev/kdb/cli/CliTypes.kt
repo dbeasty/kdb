@@ -34,7 +34,17 @@ public class CliRuntime(
         } catch (_: Exception) {
             // A failed flush costs a rebuild on the next open; it must not fail the command.
         }
+        closeEmbedded()
         lockLease.close()
+    }
+
+    /** Seals the namespace's delta log and writes its checkpoint (Go's format), as Go does at close. */
+    private fun closeEmbedded() {
+        try {
+            kotlinx.coroutines.runBlocking { embedded.close() }
+        } catch (e: Exception) {
+            System.err.println("kdb: namespace $namespaceId: closing: ${e.message}")
+        }
     }
 
     internal fun switchNamespace(config: CliConfig, namespaceId: String): CliRuntime {
@@ -47,11 +57,13 @@ public class CliRuntime(
             )
         }
         val catalog = NamespacePaths.catalogFromNamespace(namespaceId)
-        return CliRuntime(
-            namespaceId,
-            openFileRuntime(config.dataDir, catalog, namespaceId, acquireDirectoryLock = false),
-            lockLease,
-        )
+        val next = openFileRuntime(config.dataDir, catalog, namespaceId, acquireDirectoryLock = false)
+        try {
+            kotlinx.coroutines.runBlocking { embedded.indexManager.registryFor(this@CliRuntime.namespaceId).flushAll() }
+        } catch (_: Exception) {
+        }
+        closeEmbedded()
+        return CliRuntime(namespaceId, next, lockLease)
     }
 }
 

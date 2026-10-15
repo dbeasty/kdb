@@ -43,6 +43,8 @@ internal class PersistingCommitDag(
 
     override suspend fun commitsWithoutOperations(): Int = restorable.commitsWithoutOperations()
 
+    override suspend fun checkpointCommits(): List<CheckpointCommit>? = restorable.checkpointCommits()
+
     override suspend fun lookupHashPrefix(hexPrefixLower: String): List<KdbHash> =
         delegate.lookupHashPrefix(hexPrefixLower)
 

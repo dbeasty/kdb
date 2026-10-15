@@ -21,13 +21,11 @@ public typealias Batch = LinkedHashMap<String, ByteArray?>
  * returns only once that transaction is durable. A local write is acknowledged only after its
  * apply returns, so an unpushed write survives a crash.
  *
- * **Persistent backend: not built yet, deliberately.** Only [MemoryReplicaStore] exists. The
- * owner chose the Kotlin embed runtime (`FileEmbeddedRuntime`, kdb-jdbc) as the replica's on-disk
- * store (plan §3.3, decision D12), so a replica's data directory is one Go tools can read. That
- * needs an on-disk format decision that is still pending: how the replica's metadata, trie nodes
- * and outbox map onto the runtime's delta log and checkpoints, and shallow-root support in
- * Kotlin's replayer (plan step 5a). Until then, a persistent backend would be a second format to
- * migrate away from, so this interface is the seam it will plug into.
+ * **On disk, full-mode namespaces live in the Kotlin embed runtime, not in a store** (plan §3.3,
+ * D12): [ReplicaOptions.fullNamespaces] with the JVM's `fileNamespaces(dataDir)` keeps each in a
+ * Kotlin file runtime, in a node's format (delta log, Go checkpoints), so Go tools open a replica's
+ * directory. Only [MemoryReplicaStore] implements this interface; it still holds filtered
+ * namespaces and attachment bytes, which are therefore not kept across a restart.
  */
 public interface ReplicaStore {
     public suspend fun get(key: String): ByteArray?

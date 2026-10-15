@@ -188,6 +188,10 @@ public class AttachmentTable private constructor(
     /** The number of documents with at least one attachment. */
     public val documents: Int get() = sets.size
 
+    /** Document id to the hash of its attachment set: the trie [root] is the hash of, which a
+     * peer's TREE_NODES on the attachment tree walks. */
+    public val setTree: DocumentTree get() = tree
+
     /** The commit's attachmentTreeHash for this table: null when it is empty, so a commit with no
      * attachments carries no field and hashes as it always did. */
     public val root: KdbHash? get() = if (sets.size == 0) null else tree.treeHash

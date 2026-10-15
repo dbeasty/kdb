@@ -42,8 +42,9 @@ internal class InMemoryCommitDag(
     /** Attachment tables by root (see AttachmentTables.kt). */
     private val attachments = AttachmentTableCache()
     /** Commits restored from a checkpoint whose operations are still only in the log - see
-     * [CheckpointRestorableDag]. Held with an empty operation list until [hydrateLocked] loads it. */
-    private val opsMissing = HashSet<KdbHash>()
+     * [CheckpointRestorableDag]. Held with an empty operation list until [hydrateLocked] loads it;
+     * the value is how many operations it has, which a checkpoint written now must record. */
+    private val opsMissing = HashMap<KdbHash, Int>()
     private var opsLoader: (suspend (KdbHash) -> KdbCommit?)? = null
 
     init {
@@ -150,7 +151,7 @@ internal class InMemoryCommitDag(
                 this.commits[c.hash] = c
                 insertHex(c.hash.toHex())
                 if (!txIndex.containsKey(c.transactionId)) txIndex[c.transactionId] = c.hash
-                if (cc.operationCount > 0 && c.operations.isEmpty()) opsMissing += c.hash
+                if (cc.operationCount > 0 && c.operations.isEmpty()) opsMissing[c.hash] = cc.operationCount
             }
             for (b in branches) {
                 requireCommitPresentLocked(b.headHash)
@@ -181,6 +182,12 @@ internal class InMemoryCommitDag(
     }
 
     override suspend fun commitsWithoutOperations(): Int = mutex.withLock { opsMissing.size }
+
+    override suspend fun checkpointCommits(): List<CheckpointCommit>? =
+        mutex.withLock {
+            if (stubs.isNotEmpty()) return@withLock null
+            commits.values.map { CheckpointCommit(it, opsMissing[it.hash] ?: it.operations.size) }
+        }
 
     override suspend fun getCommitOrThrow(hash: KdbHash): KdbCommit =
         mutex.withLock {
