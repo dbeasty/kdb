@@ -175,13 +175,13 @@ it is the first thing to re-run when a frame stops decoding.
 
 ## Versioning and compatibility
 
-`@limidus/kdb-client` is published once per KDB release **with the server's version number** (`0.9.0` of
+`@limidus/kdb-client` is published once per KDB release **with the server's version number** (`0.9.1` of
 the package speaks to `0.7.x` servers). The handshake enforces it: the server reports its release
 in `handshakeAck.serverVersion`, and `connect` fails with a `KdbProtocolError` when that is not a
 release this client was published for (same major; while the major is 0, same minor). A server
 that reports no version (older than 0.7.0, or the JVM engine) is refused too, and a from-source
 `0.0.0-dev` server is accepted. Pass `skipVersionCheck: true` to override deliberately.
 
-Pin the dependency to the server release you deploy (`"@limidus/kdb-client": "0.9.0"`); the release
+Pin the dependency to the server release you deploy (`"@limidus/kdb-client": "0.9.1"`); the release
 workflow refuses to publish a package whose version differs from the repo's `VERSION`, and
 attaches the tarball to the GitHub release as well as publishing it to npm.
