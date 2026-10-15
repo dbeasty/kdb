@@ -73,6 +73,8 @@ func Main() {
 	var expireField string
 	var expireGrace, expireInterval time.Duration
 	fs.StringVar(&expireField, "expire-field", "", "document expiry (kdb-spec-layer16 §9.5): the top-level field (or dotted path) holding each document's expiry timestamp as an RFC 3339 string or epoch milliseconds. Documents whose timestamp has passed are hidden from reads at head and deleted by a periodic sweep; empty (default) disables expiry")
+	var expireNamespaces string
+	fs.StringVar(&expireNamespaces, "expire-namespaces", "", "comma-separated namespaces or patterns (peersync syntax, e.g. qtask/*) that also get the --expire-field policy when they are opened on demand. Empty (default): expiry applies to --namespace alone, since it deletes data")
 	fs.DurationVar(&expireGrace, "expire-grace", 0, "how long a document stays readable past its --expire-field timestamp before it counts as expired")
 	fs.DurationVar(&expireInterval, "expire-interval", time.Duration(policy.DefaultSweepIntervalMillis)*time.Millisecond, "how often the expiry sweeper scans head and deletes expired documents (batches of at most 500 per commit, message \"expiry sweep\")")
 	fs.StringVar(&peerConflictPolicy, "peer-conflict-policy", "strict", "how the peer-sync listener resolves a same-document divergence pushed by a peer: strict (report a conflict, never silently resolve - default) or last-write (later timestamp wins symmetrically on every node)")
@@ -488,9 +490,14 @@ func Main() {
 			sec.ShareGovernanceWith(srv)
 			// Its own indexes, so CREATE INDEX, indexed lookups and SEARCH work on every
 			// namespace the listener serves, not only --namespace. Document expiry stays with
-			// --namespace alone: it deletes data, and the flag names one namespace's policy.
+			// --namespace alone - it deletes data, and the flag names one namespace's policy -
+			// unless --expire-namespaces names this one too (a collection per namespace).
 			if _, err := sec.OpenIndexes(stores.Options{}); err != nil {
 				return nil, fmt.Errorf("opening indexes for %s: %w", id, err)
+			}
+			if p := srv.DocumentExpiry(); p != nil && namespaceMatchesAny(expireNamespaces, id) {
+				// Its sweeper stops with the runtime (Release), like the primary's.
+				sec.SetDocumentExpiry(p)
 			}
 			// A namespace opened on demand needs the same upkeep as one opened at startup: a
 			// history=none collection that never ran maintenance would grow without bound.

@@ -3,9 +3,11 @@ package service
 import (
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/backup"
+	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/server"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
@@ -40,4 +42,19 @@ func adoptRestoredDefinitions(dataDir, namespace string, meta *server.MetaStore)
 	}
 	slog.Info("adopted the definitions restored with the namespace", "namespace", namespace,
 		"definitions", len(defs), "changed", n, "took", time.Since(start).Round(time.Millisecond))
+}
+
+// namespaceMatchesAny reports whether ns is named by the comma-separated list of namespaces and
+// patterns (peersync.MatchNamespace: "*" matches one segment, "**" any number).
+func namespaceMatchesAny(list, ns string) bool {
+	for _, p := range strings.Split(list, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if p == ns || peersync.MatchNamespace(p, ns) {
+			return true
+		}
+	}
+	return false
 }
