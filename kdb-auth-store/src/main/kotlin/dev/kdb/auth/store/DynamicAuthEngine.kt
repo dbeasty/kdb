@@ -25,6 +25,14 @@ private class DynamicAuthEngine(
     override val authenticator: Authenticator =
         object : Authenticator {
             override suspend fun authenticate(credentials: AuthCredentials): Principal {
+                // A revocable access token (AccessTokens.kt), presented as the bearer token or as
+                // the password: it authenticates as its user, with the user's roles.
+                for (t in listOf(credentials.token, credentials.password)) {
+                    if (t != null && AccessTokens.isAccessToken(t)) {
+                        val (_, user) = store.verifyToken(t)
+                        return Principal(id = user.id, roles = user.roles)
+                    }
+                }
                 val (user, password) = resolveUserAndSecret(credentials)
                 val record =
                     store.getUser(user)

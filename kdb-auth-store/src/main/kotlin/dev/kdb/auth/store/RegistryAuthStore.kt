@@ -1,5 +1,6 @@
 package dev.kdb.auth.store
 
+import dev.kdb.auth.KdbAuthenticationException
 import dev.kdb.codec.KdbUuid
 import dev.kdb.dag.CommitDag
 import dev.kdb.dag.inMemoryCommitDag
@@ -16,6 +17,12 @@ import dev.kdb.transaction.transactionEngine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
+import java.security.SecureRandom
+import java.time.Instant
+import java.time.OffsetDateTime
+import java.time.temporal.ChronoUnit
+import java.util.Base64
+import kotlin.time.Duration
 
 /**
  * [UserStore]/[RoleStore] persisted as documents inside KDB itself, written through the normal
@@ -64,7 +71,10 @@ public class RegistryAuthStore(
 
     override suspend fun listUsers(): List<UserRecord> =
         mutex.withLock {
-            scanAll(userDag, USERS_NAMESPACE) { json.decodeFromString(UserRecord.serializer(), it) }
+            // Access-token records share the namespace (under ids no user id produces); skip them.
+            scanAll(userDag, USERS_NAMESPACE) { body ->
+                if (AccessTokens.decode(body) != null) null else json.decodeFromString(UserRecord.serializer(), body)
+            }.filterNotNull()
         }
 
     override suspend fun updateCredentials(
@@ -157,6 +167,95 @@ public class RegistryAuthStore(
         }
     }
 
+    // ---------------------------------------------------------------- access tokens (U12)
+
+    /**
+     * Issues an access token for [user] (who must exist), valid for [ttl] (null: until revoked),
+     * and returns the token string - shown once; only its digest is kept - and its record.
+     */
+    public suspend fun createToken(
+        user: String,
+        label: String = "",
+        ttl: Duration? = null,
+    ): Pair<String, TokenRecord> =
+        mutex.withLock {
+            readUser(user) ?: throw UserNotFoundException(user)
+            val idBytes = ByteArray(8).also { random.nextBytes(it) }
+            val secretBytes = ByteArray(32).also { random.nextBytes(it) }
+            val id = idBytes.joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
+            val secret = Base64.getUrlEncoder().withoutPadding().encodeToString(secretBytes)
+            val now = Instant.now().truncatedTo(ChronoUnit.SECONDS)
+            val record =
+                TokenRecord(
+                    tokenId = id,
+                    user = user,
+                    label = label,
+                    secretSha256 = AccessTokens.secretDigest(secret),
+                    createdAt = now.toString(),
+                    expiresAt =
+                        ttl?.takeIf { it.isPositive() }?.let {
+                            now.plusMillis(it.inWholeMilliseconds).truncatedTo(ChronoUnit.SECONDS).toString()
+                        },
+                )
+            writeToken(record)
+            "${AccessTokens.PREFIX}${id}_$secret" to record
+        }
+
+    /** Revokes a token by id; every later authentication presenting it is refused. */
+    public suspend fun revokeToken(tokenId: String) {
+        mutex.withLock {
+            val record = readToken(tokenId) ?: throw TokenNotFoundException(tokenId)
+            writeToken(record.copy(revoked = true))
+        }
+    }
+
+    /** Every token record (no secrets: the registry holds none), oldest first. */
+    public suspend fun listTokens(): List<TokenRecord> =
+        mutex.withLock {
+            scanAll(userDag, USERS_NAMESPACE) { AccessTokens.decode(it) }.filterNotNull().sortedBy { it.createdAt }
+        }
+
+    /**
+     * Resolves a token string to its live record and user: known, digest matching, not revoked,
+     * not expired, and its user still present. Throws [KdbAuthenticationException] otherwise.
+     */
+    public suspend fun verifyToken(
+        token: String,
+        now: Instant = Instant.now(),
+    ): Pair<TokenRecord, UserRecord> {
+        val (id, secret) = AccessTokens.parse(token) ?: throw KdbAuthenticationException("malformed access token")
+        return mutex.withLock {
+            val record = readToken(id)
+            if (record == null || !AccessTokens.digestsEqual(record.secretSha256, AccessTokens.secretDigest(secret))) {
+                throw KdbAuthenticationException("invalid access token")
+            }
+            if (record.revoked) throw KdbAuthenticationException("access token $id has been revoked")
+            record.expiresAt?.let { exp ->
+                val expires = runCatching { OffsetDateTime.parse(exp).toInstant() }.getOrNull()
+                if (expires == null || !now.isBefore(expires)) throw KdbAuthenticationException("access token $id has expired")
+            }
+            val user =
+                readUser(record.user)
+                    ?: throw KdbAuthenticationException("access token $id belongs to a user that no longer exists")
+            record to user
+        }
+    }
+
+    private suspend fun readToken(id: String): TokenRecord? {
+        val treeHash = currentTreeHash(userDag) ?: return null
+        val doc = storage.getDocument(USERS_NAMESPACE, tokenDocId(id), treeHash) ?: return null
+        return AccessTokens.decode(doc.json)
+    }
+
+    private suspend fun writeToken(record: TokenRecord) {
+        val document = KdbDocument.fromJson(tokenDocId(record.tokenId), AccessTokens.encode(record))
+        val tx =
+            TransactionBuilder(USERS_NAMESPACE, userDag.head(), authorNodeId, KdbSchema.NONE)
+                .writeDocument(document)
+                .build()
+        commitOrThrow(userDag, tx)
+    }
+
     /** Snapshot suitable for [dev.kdb.auth.principalHasPermission]: `roleName -> grants`. */
     public suspend fun grantsByRole(): Map<String, Set<String>> = listRoles().associate { it.name to it.grants }
 
@@ -240,6 +339,11 @@ public class RegistryAuthStore(
         private fun userDocId(id: String): KdbUuid = deterministicId("user:$id")
 
         private fun roleDocId(name: String): KdbUuid = deterministicId("role:$name")
+
+        /** Where a token record lives: Go's `tokenDocID`, the same derivation as users. */
+        internal fun tokenDocId(tokenId: String): KdbUuid = deterministicId("token:$tokenId")
+
+        private val random = SecureRandom()
 
         /** In-memory store for tests/dev — see the durability caveat in the class doc. */
         public fun inMemory(authorNodeId: KdbUuid = KdbUuid.random()): RegistryAuthStore =
