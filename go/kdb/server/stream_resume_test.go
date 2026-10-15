@@ -69,7 +69,9 @@ func (c *recordingConn) TryPoll() []byte         { return nil }
 // waitAt waits until the subscriber is at want, then checks it holds exactly expect.
 func (c *recordingConn) waitAt(want codec.Hash, expect map[codec.UUID]string) {
 	c.t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	// Generous: a far-behind catch-up applies ~20 MiB of frames, which under -race on a busy
+	// runner took past 5 s. A subscriber that is really stuck still fails here.
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		c.mu.Lock()
 		pos, broken := c.pos, c.broken
