@@ -102,6 +102,11 @@ func (e *defaultEngine) Merge(
 	}
 	ordered := topoSort(d, commitSet)
 
+	ancestorCommit, err := d.GetCommitOrThrow(*ancestor)
+	if err != nil {
+		return nil, err
+	}
+	branch := newBranchDocuments(d.NamespaceID, store, ancestorCommit.DocumentTreeHash)
 	head := primaryHead
 	for _, hash := range ordered {
 		mc, err := d.GetCommitOrThrow(hash)
@@ -111,10 +116,18 @@ func (e *defaultEngine) Merge(
 		if len(mc.Operations) == 0 {
 			continue
 		}
+		headCommit, err := d.GetCommitOrThrow(head)
+		if err != nil {
+			return nil, err
+		}
+		ops, err := branch.rebase(mc.Operations, headCommit.DocumentTreeHash)
+		if err != nil {
+			return nil, err
+		}
 		step := document.Transaction{
 			ID:           mc.TransactionID,
 			BaseVersion:  head,
-			Operations:   mc.Operations,
+			Operations:   ops,
 			Timestamp:    mc.Timestamp,
 			AuthorNodeID: mc.AuthorNodeID,
 		}
@@ -561,6 +574,63 @@ func topoSort(d *dag.InMemoryCommitDag, hashes map[codec.Hash]struct{}) []codec.
 		return hexes
 	}
 	return out
+}
+
+// branchDocuments is a merge step's view of the branch being merged in. A logged write is the
+// whole document the branch stored (operationsAsStored), so replaying it as a merge patch over the
+// primary would overwrite every field the primary changed concurrently. rebase instead turns each
+// write into the branch's own field-level change - against the document as the branch had it
+// before that write, folded forward from the common ancestor's tree - carried over onto the
+// primary's document, as a replace write. Deletes pass through. Kotlin: BranchDocuments.
+//
+// Each emitted write is a whole document, so the result does not depend on whether staging
+// resolves a write against the baseline or against the transaction's earlier operations.
+type branchDocuments struct {
+	namespaceID  string
+	store        storage.Adapter
+	ancestorTree codec.Hash
+	docs         map[codec.UUID]*document.Document
+}
+
+func newBranchDocuments(namespaceID string, store storage.Adapter, ancestorTree codec.Hash) *branchDocuments {
+	return &branchDocuments{namespaceID: namespaceID, store: store, ancestorTree: ancestorTree, docs: map[codec.UUID]*document.Document{}}
+}
+
+func (b *branchDocuments) rebase(ops []document.Op, primaryTree codec.Hash) ([]document.Op, error) {
+	primary := map[codec.UUID]*document.Document{}
+	read := func(seen map[codec.UUID]*document.Document, id codec.UUID, tree codec.Hash) (*document.Document, error) {
+		if doc, ok := seen[id]; ok {
+			return doc, nil
+		}
+		return b.store.GetDocument(b.namespaceID, id, tree)
+	}
+	out := make([]document.Op, len(ops))
+	for i, op := range ops {
+		out[i] = op
+		switch o := op.(type) {
+		case document.WriteOp:
+			before, err := read(b.docs, o.DocID, b.ancestorTree)
+			if err != nil {
+				return nil, err
+			}
+			onto, err := read(primary, o.DocID, primaryTree)
+			if err != nil {
+				return nil, err
+			}
+			after := document.Document{ID: o.DocID, JSON: o.Patch}
+			rebased, err := after.RebasedOnto(before, onto)
+			if err != nil {
+				continue // not a JSON object: leave it for staging to reject as it always has
+			}
+			b.docs[o.DocID] = &after
+			primary[o.DocID] = &rebased
+			out[i] = document.WriteOp{DocID: o.DocID, Patch: rebased.JSON, Replace: true}
+		case document.DeleteOp:
+			b.docs[o.DocID] = nil
+			primary[o.DocID] = nil
+		}
+	}
+	return out, nil
 }
 
 // operationsAsStored replaces each WriteOp's patch with the document that was actually staged for

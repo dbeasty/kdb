@@ -96,6 +96,7 @@ internal class DefaultTransactionEngine(
         val ordered = topoSort(dag, branchCommits.ifEmpty { setOf(mergedHead) })
 
         var head = primaryHead
+        val branchDocs = BranchDocuments(dag.namespaceId, storage, dag.getCommitOrThrow(ancestor).documentTreeHash)
         for (hash in ordered) {
             val mc = dag.getCommitOrThrow(hash)
             if (mc.operations.isEmpty()) continue
@@ -103,7 +104,7 @@ internal class DefaultTransactionEngine(
                 KdbTransaction(
                     id = mc.transactionId,
                     baseVersion = head,
-                    operations = mc.operations,
+                    operations = branchDocs.rebase(mc.operations, dag.getCommitOrThrow(head).documentTreeHash),
                     timestamp = mc.timestamp,
                     authorNodeId = mc.authorNodeId,
                 )
@@ -367,6 +368,57 @@ internal class DefaultTransactionEngine(
         }
 
         return TransactionResult.Success(commit, commit.documentTreeHash)
+    }
+
+    /**
+     * A merge step's view of the branch being merged in. A logged write is the whole document the
+     * branch stored (see [operationsAsStored]), so replaying it as a merge patch over the primary
+     * would overwrite every field the primary changed concurrently. [rebase] instead turns each
+     * write into the branch's own field-level change - against the document as the branch had it
+     * before that write, folded forward from the common ancestor's tree - carried over onto the
+     * primary's document, as a replace write. Deletes pass through. Go: branchDocuments.
+     *
+     * Each emitted write is a whole document, so the result does not depend on whether staging
+     * resolves a write against the baseline or against the transaction's earlier operations.
+     */
+    private class BranchDocuments(
+        private val namespaceId: String,
+        private val storage: StorageAdapter,
+        private val ancestorTree: KdbHash,
+    ) {
+        private val branch = mutableMapOf<KdbUuid, KdbDocument?>()
+
+        suspend fun rebase(
+            ops: List<KdbOp>,
+            primaryTree: KdbHash,
+        ): List<KdbOp> {
+            val primary = mutableMapOf<KdbUuid, KdbDocument?>()
+            return ops.map { op ->
+                when (op) {
+                    is KdbOp.Write -> {
+                        val before = if (op.docId in branch) branch[op.docId] else storage.getDocument(namespaceId, op.docId, ancestorTree)
+                        val onto = if (op.docId in primary) primary[op.docId] else storage.getDocument(namespaceId, op.docId, primaryTree)
+                        val after = KdbDocument(op.docId, op.patch)
+                        // Not a JSON object: leave it for staging to reject as it always has.
+                        val rebased =
+                            try {
+                                after.rebasedOnto(before, onto)
+                            } catch (_: DocumentDecodeException) {
+                                return@map op
+                            }
+                        branch[op.docId] = after
+                        primary[op.docId] = rebased
+                        KdbOp.Write(op.docId, rebased.json, replace = true)
+                    }
+                    is KdbOp.Delete -> {
+                        branch[op.docId] = null
+                        primary[op.docId] = null
+                        op
+                    }
+                    else -> op
+                }
+            }
+        }
     }
 
     /**

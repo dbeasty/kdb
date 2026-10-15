@@ -40,6 +40,78 @@ func (d Document) Merge(patchJSON string) (Document, error) {
 	return Document{ID: d.ID, JSON: out}, nil
 }
 
+// RebasedOnto carries the root-level change from before to d over onto onto: keys d added or
+// changed take d's value, keys d dropped are removed, and every other key keeps onto's value.
+// onto's key order is kept and new keys follow in d's order (as Merge orders them). A nil before
+// is a creation, so every key counts as changed; a nil onto is an empty document. Values are
+// compared by their JSON text, as Kotlin compares them, so both engines agree on what changed.
+// Kotlin: KdbDocument.rebasedOnto.
+//
+// A logged write is the whole stored document, so this is how a merge re-applies one branch's
+// write without overwriting the other branch's concurrent changes to other fields.
+func (d Document) RebasedOnto(before, onto *Document) (Document, error) {
+	after, err := rootObject(d.JSON, &d.ID)
+	if err != nil {
+		return Document{}, err
+	}
+	prev, target := kdbjson.ObjectValue{}, kdbjson.ObjectValue{}
+	if before != nil {
+		if prev, err = rootObject(before.JSON, &d.ID); err != nil {
+			return Document{}, err
+		}
+	}
+	if onto != nil {
+		if target, err = rootObject(onto.JSON, &d.ID); err != nil {
+			return Document{}, err
+		}
+	}
+	changed := func(k string) bool {
+		a, inAfter := after.Fields[k]
+		b, inPrev := prev.Fields[k]
+		if !inAfter || !inPrev {
+			return inAfter != inPrev
+		}
+		return kdbjson.ToJSONString(a) != kdbjson.ToJSONString(b)
+	}
+	out := kdbjson.ObjectValue{Fields: map[string]kdbjson.Value{}}
+	put := func(k string, v kdbjson.Value) {
+		out.Keys = append(out.Keys, k)
+		out.Fields[k] = v
+	}
+	for _, k := range target.Keys {
+		_, inAfter := after.Fields[k]
+		_, inPrev := prev.Fields[k]
+		switch {
+		case !inAfter:
+			if !inPrev {
+				put(k, target.Fields[k])
+			}
+		case changed(k):
+			put(k, after.Fields[k])
+		default:
+			put(k, target.Fields[k])
+		}
+	}
+	for _, k := range after.Keys {
+		if _, inTarget := target.Fields[k]; !inTarget && changed(k) {
+			put(k, after.Fields[k])
+		}
+	}
+	return Document{ID: d.ID, JSON: kdbjson.ToJSONString(out)}, nil
+}
+
+func rootObject(jsonText string, id *codec.UUID) (kdbjson.ObjectValue, error) {
+	v, err := kdbjson.ParseValue(jsonText)
+	if err != nil {
+		return kdbjson.ObjectValue{}, NewDecodeError("invalid document json", id, err)
+	}
+	o, ok := v.(kdbjson.ObjectValue)
+	if !ok {
+		return kdbjson.ObjectValue{}, NewDecodeError("document root must be a JSON object", id, nil)
+	}
+	return o, nil
+}
+
 // WithJSON returns a copy with new JSON after validation.
 func (d Document) WithJSON(newJSON string) (Document, error) {
 	if err := validateObjectJSON(newJSON); err != nil {
