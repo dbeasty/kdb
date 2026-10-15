@@ -313,8 +313,10 @@ registry the step only warns and skips. One-time setup, in this order:
 
 1. The `@limidus` scope is the npm organization `limidus`. The previous name, `@kdb/client`, could
    not be published: the npm name `kdb` belongs to someone else.
-2. Publish the first version by hand from a checkout of the release tag, with an npm account that
-   is a member of `limidus` (`npm login` asks for its two-factor code):
+2. Publish the first version by hand, with an npm account that is a member of `limidus`
+   (`npm login` asks for its two-factor code), from a checkout whose `packages/kdb-client` already
+   carries the `@limidus` name and the released server's version - for the first one, `main` right
+   after the rename merged (0.9.0; the `v0.9.0` tag itself still says `@kdb/client`):
    `cd packages/kdb-client && npm ci && npm run build && npm publish --access public`.
 3. On npmjs.com, open `@limidus/kdb-client` → **Settings** → **Trusted Publisher** → GitHub
    Actions: organization or user `dbeasty`, repository `kdb`, workflow filename `release.yml`
