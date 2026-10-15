@@ -708,7 +708,7 @@ is a JSON array of `{id, name, size, mime, hash}`.
 - Go (`go/kdb/client`): `PutAttachment`, `OpenAttachment` (an `io.Reader`), `ReadAttachment`,
   `ListAttachments`, `RenameAttachment`, `DeleteAttachment`, `UploadAttachment` (+ `ResumeUpload`),
   `Transaction.Attachments`; SQL parameters `client.Bytes` and `client.Blob`.
-- TypeScript (`@kdb/client`): `putAttachment`, `getAttachment`, `readAttachment`,
+- TypeScript (`@limidus/kdb-client`): `putAttachment`, `getAttachment`, `readAttachment`,
   `listAttachments`, `uploadAttachment`, `renameAttachment`, `deleteAttachment`.
 - JDBC: `setBytes`, `setBinaryStream` / `setBlob` (uploaded, then bound), `getBytes` /
   `getBinaryStream` / `getBlob`; `conn.unwrap(KdbAttachments.class)` for the attachment API.

@@ -1,5 +1,5 @@
 {
-  "name": "@kdb/replica",
+  "name": "@limidus/kdb-replica",
   "version": "0.1.0",
   "description": "A client-side KDB replica: syncs namespaces with a KDB node over peer sync v2 and serves them locally.",
   "license": "AGPL-3.0-or-later",
@@ -28,9 +28,9 @@
     "@types/node": "^22.10.2",
     "fake-indexeddb": "^6.0.0",
     "typescript": "^5.9.2",
-    "@kdb/client": "file:../kdb-client"
+    "@limidus/kdb-client": "file:../kdb-client"
   },
   "dependencies": {
-    "@kdb/client": "^0.9.0"
+    "@limidus/kdb-client": "^0.9.0"
   }
 }

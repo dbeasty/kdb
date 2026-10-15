@@ -924,7 +924,7 @@ A **Recovery** section per namespace, plus a database-level view:
 ## 9. UI surface
 
 React + TypeScript + Vite in `packages/kdb-ui`. Data access via a generated typed client over the
-control API; `@kdb/client` is *not* required by the UI (the control API is HTTP), but the two
+control API; `@limidus/kdb-client` is *not* required by the UI (the control API is HTTP), but the two
 should share the schema/DTO types where they overlap.
 
 **Shell.** Left rail: connection → namespaces → per-namespace tree (Documents, SQL, History,

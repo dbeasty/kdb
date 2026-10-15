@@ -1,4 +1,4 @@
-# Component 63 — TypeScript Client SDK (`@kdb/client`)
+# Component 63 — TypeScript Client SDK (`@limidus/kdb-client`)
 
 Layer 12, alongside Component 40 (Go Client SDK), Component 41 (auth tokens) and Component 42
 (native transport). This is the JavaScript/TypeScript counterpart to Component 40: the same
@@ -42,14 +42,14 @@ So the plan is three packages shipped in three phases, not one package chosen ou
 
 | Package | What it is | Phase | Analogy |
 |---|---|---|---|
-| `@kdb/client` | Network driver. Wire codec + transports + the Component 40 operation set, hand-written TS. | 1 | `mongodb` |
-| `@kdb/codegen` | Types generated **from the KDB schema**, plus a typed SQL builder over them. | 2 | Prisma / Kysely |
-| `@kdb/embed` | The engine itself, in-process in the browser or Node. Not a client. | 3 | PouchDB / `wa-sqlite` |
+| `@limidus/kdb-client` | Network driver. Wire codec + transports + the Component 40 operation set, hand-written TS. | 1 | `mongodb` |
+| `@limidus/kdb-codegen` | Types generated **from the KDB schema**, plus a typed SQL builder over them. | 2 | Prisma / Kysely |
+| `@limidus/kdb-embed` | The engine itself, in-process in the browser or Node. Not a client. | 3 | PouchDB / `wa-sqlite` |
 
 Phases 2 and 3 are specified here (§10, §11) rather than deferred to separate components, because
-their existence changes decisions in Phase 1 — notably that `@kdb/client` must not invent its own
+their existence changes decisions in Phase 1 — notably that `@limidus/kdb-client` must not invent its own
 schema representation (§10.2) and must keep its operation interface separable from its transport
-so `@kdb/embed` can implement the same interface locally (§11.3).
+so `@limidus/kdb-embed` can implement the same interface locally (§11.3).
 
 ### 1.3 Why the ODM layer is deliberately *not* mongoose-shaped
 
@@ -130,7 +130,7 @@ a backstop (§7.5), independent of that server-side fix.
 ## 3. Package layout
 
 ```
-packages/kdb-client/           # @kdb/client — Phase 1, this component's core deliverable
+packages/kdb-client/           # @limidus/kdb-client — Phase 1, this component's core deliverable
   src/
     wire/frame.ts              # header encode/decode, length prefix, bounds checks
     wire/envelope.ts           # payloadEnvelope <-> typed messages
@@ -152,7 +152,7 @@ rather than `(value, error)` tuples, `AbortSignal` rather than `context.Context`
 errors rather than sentinel returns.
 
 ```ts
-// @kdb/client
+// @limidus/kdb-client
 
 export interface ConnectOptions {
   /** "user:secret", matching wire.HandshakePayload.Token. Omit against auth.AllowAll. */
@@ -399,7 +399,7 @@ canonical encoder that is 99% right is 100% broken, and only differential testin
 
 Note the consequence for the API: `crypto.subtle.digest` is async, so `getWithHash`, `replaceIf`
 and `compareAndSwap` are async for a reason beyond the network round trip. They stay async even
-in `@kdb/embed`, where there is no round trip at all.
+in `@limidus/kdb-embed`, where there is no round trip at all.
 
 ### 6.4 Document ids are UUIDs
 
@@ -424,7 +424,7 @@ string on the wire, so this validation is the client's job, not the codec's.
    nothing at all for an unrecognized message. A driver that can hang forever on a server bug is
    not shippable.
 6. **SQL rows are strings.** `sqlResult.rows` is `string[][]` on the wire. `query<T>` maps columns
-   to object keys but does **not** invent types — the coercion belongs in `@kdb/codegen` (§10),
+   to object keys but does **not** invent types — the coercion belongs in `@limidus/kdb-codegen` (§10),
    where the schema is known. Phase 1 must not guess, because a driver that silently parses
    `"0123"` as the number `123` corrupts data.
 7. **Reconnection is the caller's, in Phase 1.** `close()` and connection-loss errors are honest;
@@ -521,14 +521,14 @@ adds a third consumer of the same fixtures.
     a Workers-style runtime — the last of these being what catches an accidental Node built-in
     import (§2.2).
 
-## 10. Phase 2 — `@kdb/codegen`
+## 10. Phase 2 — `@limidus/kdb-codegen`
 
 ### 10.1 What it generates
 
 `kdb schema codegen --namespace <ns> --out src/kdb.ts` reads the namespace's `kdb-schema`
 (already serializable as `EmbedSchemaDto` JSON, already consumed by `KdbBrowser.openWithSchema`)
 and emits TypeScript: one interface per document type, correctly nullable, plus a typed handle
-that narrows `@kdb/client`'s `unknown` bodies and `string[][]` rows to real types.
+that narrows `@limidus/kdb-client`'s `unknown` bodies and `string[][]` rows to real types.
 
 ### 10.2 Why generation rather than declaration
 
@@ -538,7 +538,7 @@ client type cannot drift from it without the generator noticing at build time. A
 mongoose-style schema can, and will, and the drift will surface as a runtime write rejection in
 production rather than a compile error in CI.
 
-This also settles a Phase 1 constraint: **`@kdb/client` must not define any schema type of its
+This also settles a Phase 1 constraint: **`@limidus/kdb-client` must not define any schema type of its
 own.** Its bodies stay `unknown`. Everything typed is generated on top.
 
 ### 10.3 The typed SQL surface
@@ -554,7 +554,7 @@ The generated handle exposes `baseVersion`, `commit`, and the branch operations 
 rather than hiding them behind an ORM's illusion of mutable objects. This is the part of KDB with
 no MongoDB analogue at all, and the part a client should be making *legible*.
 
-## 11. Phase 3 — `@kdb/embed`
+## 11. Phase 3 — `@limidus/kdb-embed`
 
 Included here as a phased deliverable of this component, not deferred to a separate one, so that
 Phase 1's interface stays compatible with it (§11.3). It is later, not lesser: an embedded engine
@@ -604,10 +604,10 @@ Known blockers either path must clear first, all already recorded in the finish-
 
 ### 11.3 The Phase 1 constraint this imposes
 
-`@kdb/client`'s operation set must be expressible as an **interface** that both a network client
+`@limidus/kdb-client`'s operation set must be expressible as an **interface** that both a network client
 and an embedded runtime can implement — `putJSON`, `get`, `query`, `commit`, `getWithHash` all
 make sense locally. Phase 1 should therefore define `KdbOperations` as a standalone interface that
-`Client` implements, so `@kdb/embed` can satisfy the same contract and application code can move
+`Client` implements, so `@limidus/kdb-embed` can satisfy the same contract and application code can move
 between local-first and server-backed without a rewrite. This costs nothing in Phase 1 and is
 awkward to retrofit.
 
@@ -616,14 +616,14 @@ cancellation — stay on `Client`, outside that interface.
 
 ## 12. Non-goals
 
-- **Peer-sync, stream-subscribe and DAG messages in `@kdb/client`.** Codes `0x02`–`0x0D` are a
-  peer's vocabulary, not a client's. They belong to `@kdb/embed` (Phase 3), which is what actually
+- **Peer-sync, stream-subscribe and DAG messages in `@limidus/kdb-client`.** Codes `0x02`–`0x0D` are a
+  peer's vocabulary, not a client's. They belong to `@limidus/kdb-embed` (Phase 3), which is what actually
   holds a local DAG to sync. The client's decoder tolerates them; it does not speak them.
 - **A hand-declared, mongoose-style client-side schema.** §1.3, §10.2.
 - **Automatic reconnection with request replay** in Phase 1. §7.7.
 - **An ORM with change tracking, lazy loading, or `populate`.** KDB has SQL and joins; a typed
   builder over them (§10.3) is the better shape.
-- **Compiling the Kotlin or Go wire codec to JS for `@kdb/client`.** §13.1.
+- **Compiling the Kotlin or Go wire codec to JS for `@limidus/kdb-client`.** §13.1.
 - **A `pg`/`mysql2`-compatible driver interface.** Nothing in the ecosystem would consume it.
 - **Client-side query caching or connection pooling.** One long-lived connection; caching is the
   application's.
@@ -644,7 +644,7 @@ wrap it. For the *network client* this is the wrong trade, for four reasons that
 4. **The codec is small.** §5 fits in a table. The only intricate piece is §6.3's narrow record
    encoder. The shortcut is not saving much.
 
-None of this applies to `@kdb/embed`, where the artifact *is* the engine and compilation is the
+None of this applies to `@limidus/kdb-embed`, where the artifact *is* the engine and compilation is the
 only sane approach. Different problems, different answers.
 
 The cost of hand-writing is a third implementation to keep in sync. §9.1's shared fixtures are the
@@ -658,7 +658,7 @@ before the live-server tests, not after.
   re-export). The subpath split is what keeps the core edge-compatible.
 - Hand-written `.d.ts` shipped from source; TypeScript is the source language.
 - No runtime dependencies. Every primitive needed is a platform global in all targets.
-- Published as `@kdb/client`. The finish-up plan currently lists npm publishing as deferred
+- Published as `@limidus/kdb-client`. The finish-up plan currently lists npm publishing as deferred
   (item 2.10, and the Phase-4 deferred list); this component is the thing that changes that, and
   the release workflow needs an npm publish step added alongside the existing artifact steps.
 
@@ -680,7 +680,7 @@ way, which is the actual safety net.
 5. `Client`: connect, sessions, correlation, then documents, then SQL, then conditionals, then
    leases.
 6. Live interop (§9.2) against the Go server; then the JVM server for the subset it implements.
-7. Publish `@kdb/client`. Phase 2 and 3 follow as their own work.
+7. Publish `@limidus/kdb-client`. Phase 2 and 3 follow as their own work.
 
 ### 13.5 Implementation status
 
@@ -718,7 +718,7 @@ the byte level and unproven end to end; the package README states that limitatio
 
 Both are implemented, each in its own package, tested end to end (CI jobs `ts-codegen`, `ts-embed`).
 
-**`@kdb/codegen`** (`packages/kdb-codegen`, §10). Departures from what §10 anticipated:
+**`@limidus/kdb-codegen`** (`packages/kdb-codegen`, §10). Departures from what §10 anticipated:
 
 - The entry point is a Node binary, `kdb-codegen --schema … --out …`, not `kdb schema codegen`: the
   server has no message that exports a namespace's schema, so the input is the `EmbedSchemaDto` JSON
@@ -731,13 +731,13 @@ Both are implemented, each in its own package, tested end to end (CI jobs `ts-co
   exposes what exists — `get` returns the commit, `commit` takes it as `baseVersion` — and invents
   nothing. Branch operations arrive when the client grows them.
 
-**`@kdb/embed`** (`packages/kdb-embed`, `go/wasm/embed`, §11). §11.2 is decided: **Go → WASM**.
+**`@limidus/kdb-embed`** (`packages/kdb-embed`, `go/wasm/embed`, §11). §11.2 is decided: **Go → WASM**.
 The decisive finding is that `server.FrameHost` is already the transport-independent seam, so the
 module is the server's own engine behind a pair of JS callbacks, not a second implementation; the
 TypeScript side is a `LoopbackTransport` under the unchanged `Client`. `openEmbedded` therefore
 returns a `Client` (hence a `KdbOperations`, per §11.3) and inherits every behaviour for free.
 
-- Verified three ways: the same `@kdb/codegen` suite passes against it and against the Go server; a
+- Verified three ways: the same `@limidus/kdb-codegen` suite passes against it and against the Go server; a
   differential test runs a 23-step script against both and requires identical results, error classes
   and messages; and `test/browser/smoke.html` passes in Chromium.
 - Namespaces are routed by a `NamespaceSet`, one in-memory runtime per listed namespace. A bare
@@ -762,13 +762,13 @@ returns a `Client` (hence a `KdbOperations`, per §11.3) and inherits every beha
 
 ## 14. Estimated lines
 
-Phase 1, `@kdb/client`: **1,600–2,400 NBNC**, split roughly as — 250 wire framing and envelope,
+Phase 1, `@limidus/kdb-client`: **1,600–2,400 NBNC**, split roughly as — 250 wire framing and envelope,
 200 message definitions, 150 the `jsonByteArray` convention and JSON helpers, 250 the canonical
 content-hash encoder (§6.3, the densest part per line), 200 transports, 500 the client and its
 operations, 150 the error taxonomy, plus 600–900 of tests, of which the conformance fixtures
 (§9.1) are the larger and more valuable half.
 
-Phase 2, `@kdb/codegen`: 800–1,200, dominated by the SQL builder rather than the type emitter.
+Phase 2, `@limidus/kdb-codegen`: 800–1,200, dominated by the SQL builder rather than the type emitter.
 
-Phase 3, `@kdb/embed`: not estimable until §11.2 is decided; the blockers listed there are larger
+Phase 3, `@limidus/kdb-embed`: not estimable until §11.2 is decided; the blockers listed there are larger
 than the packaging work either way.

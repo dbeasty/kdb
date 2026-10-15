@@ -278,7 +278,7 @@ whole run unless `v$(cat VERSION)` equals `$GITHUB_REF_NAME`, before anything el
 Cutting a release is still a manual `VERSION` bump + commit + `git tag -a vX.Y.Z && git push
 origin vX.Y.Z` — no `cut-release.sh` helper exists yet (open item, not blocking; see §7).
 
-**The version bump touches more than `VERSION`.** `@kdb/client` is published with the server's
+**The version bump touches more than `VERSION`.** `@limidus/kdb-client` is published with the server's
 version, and `packages/kdb-client/test/version.test.ts` fails CI unless they match. One release
 commit changes all of:
 
@@ -286,7 +286,7 @@ commit changes all of:
 - `packages/kdb-client/package.json` and `package-lock.json` (two `"version"` lines)
 - `packages/kdb-client/src/version.ts` (`CLIENT_VERSION`)
 - `packages/kdb-client/README.md` (the two version pins in "Versioning")
-- `packages/kdb-replica/package.json` and `package-lock.json` (the `@kdb/client` dependency; the
+- `packages/kdb-replica/package.json` and `package-lock.json` (the `@limidus/kdb-client` dependency; the
   replica's own version is independent)
 - `docs/releases/vX.Y.Z.md`
 
@@ -305,6 +305,26 @@ Notes for changes that land on `main` between releases accumulate in
 to `docs/releases/vX.Y.Z.md` and writes the release's summary on top. A known issue listed in a
 shipped release's notes stays there — those notes describe that release — and the fix is recorded
 in the next release's notes, which say which earlier known issue it closes.
+
+**Publishing `@limidus/kdb-client` to npm** uses npm trusted publishing: the `npm-client` job
+proves it is this repository's `release.yml` with its OIDC token, so no npm token is stored
+anywhere, and npm attaches provenance on its own. Until the package's first version exists on the
+registry the step only warns and skips. One-time setup, in this order:
+
+1. The `@limidus` scope is the npm organization `limidus`. The previous name, `@kdb/client`, could
+   not be published: the npm name `kdb` belongs to someone else.
+2. Publish the first version by hand, with an npm account that is a member of `limidus`
+   (`npm login` asks for its two-factor code), from a checkout whose `packages/kdb-client` already
+   carries the `@limidus` name and the released server's version - for the first one, `main` right
+   after the rename merged (0.9.0; the `v0.9.0` tag itself still says `@kdb/client`):
+   `cd packages/kdb-client && npm ci && npm run build && npm publish --access public`.
+3. On npmjs.com, open `@limidus/kdb-client` → **Settings** → **Trusted Publisher** → GitHub
+   Actions: organization or user `dbeasty`, repository `kdb`, workflow filename `release.yml`
+   (environment empty). Then, under **Publishing access**, require two-factor authentication and
+   disallow tokens: from here only the workflow publishes.
+
+Every later tag publishes from CI. The job installs npm 11.5.1 or later, which trusted publishing
+needs, because Node 22 ships npm 10.
 
 ---
 

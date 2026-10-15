@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import type { KdbOperations } from "@kdb/client";
+import type { KdbOperations } from "@limidus/kdb-client";
 import { KdbCoercionError, coerceValue } from "../src/index.ts";
 import { users } from "./generated/kdb.ts";
 

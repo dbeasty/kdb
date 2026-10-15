@@ -2,7 +2,7 @@
  * The replica's storage: a small ordered key-value interface, so the same engine runs over
  * IndexedDB in a browser, a directory on Node, and memory in tests.
  *
- * It is deliberately not `@kdb/embed`'s `FsBackend`, which loads a whole file tree into memory.
+ * It is deliberately not `@limidus/kdb-embed`'s `FsBackend`, which loads a whole file tree into memory.
  * A replica must hold namespaces larger than its memory, so nothing here loads the store whole.
  * What it keeps from that design is the durability rule: `apply` is one atomic transaction, and
  * its promise resolves only once the transaction is durable.

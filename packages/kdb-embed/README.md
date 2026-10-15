@@ -1,4 +1,4 @@
-# `@kdb/embed`
+# `@limidus/kdb-embed`
 
 The KDB engine running in-process — in the browser, Node, or anywhere WebAssembly runs. Implements
 [Component 63](../../docs/kdb-spec-layer12-component63-ts-client-sdk.md) Phase 3 (§11).
@@ -6,12 +6,12 @@ The KDB engine running in-process — in the browser, Node, or anywhere WebAssem
 It is **not a reimplementation**. It is the Go engine the server runs (SQL planner, transaction
 engines, unique keys, document locks, error classification), compiled to WebAssembly and fronted by
 the server's own `FrameHost` — the seam the TCP, WebSocket and gRPC listeners plug into. A loopback
-transport carries the same wire frames a WebSocket would. So `openEmbedded` returns a `@kdb/client`
-`Client`, and anything written against `KdbOperations` — including everything `@kdb/codegen`
+transport carries the same wire frames a WebSocket would. So `openEmbedded` returns a `@limidus/kdb-client`
+`Client`, and anything written against `KdbOperations` — including everything `@limidus/kdb-codegen`
 generates — runs unchanged against a server or against this.
 
 ```ts
-import { openEmbedded } from "@kdb/embed";
+import { openEmbedded } from "@limidus/kdb-embed";
 
 const db = await openEmbedded({ namespace: "app/users" });
 
@@ -29,7 +29,7 @@ await db.close();
 | Documents, conditional writes, `compareAndSwap`, multi-document `commit`, SQL, leases | Same engine as the server |
 | Behaves like the Go server | Checked by a differential test: a 23-step script run against both must match, including error classes and messages |
 | Runs in a browser | Verified in Chromium: `test/browser/smoke.html`, and `persist.html` on real IndexedDB across real reloads |
-| Typed layer | `@kdb/codegen`'s whole suite passes against it |
+| Typed layer | `@limidus/kdb-codegen`'s whole suite passes against it |
 | **Durable** | **Opt-in** with `persist` (below). Without it the database is in memory and is gone when the page reloads or the process exits. |
 | Peer-sync / replication against a server | Not implemented. Embedded databases are local-only. |
 | Cross-namespace transactions | Not available in memory (they need the durable host's decision log). |
@@ -66,7 +66,7 @@ tab close, and a crash can lose only writes that were never acknowledged — nev
   file is never persisted, so a tab that died holding it cannot lock the database out.
 - **SQL schemas are not restored on reopen.** A `CREATE TABLE` schema (constraints, required columns)
   is not persisted by the engine — the Go service behaves the same — so re-apply it at start. With
-  `@kdb/codegen`, `await db.users.ensure()` does that idempotently. Documents and rows are persisted.
+  `@limidus/kdb-codegen`, `await db.users.ensure()` does that idempotently. Documents and rows are persisted.
 - **Backends:** IndexedDB by default. Pass `persist.backend` (any `FsBackend` with an atomic `apply`) for
   anything else — OPFS, a server, a file. `MemoryBackend` is for tests.
 - Not part of this: syncing a persistent database with a server, and migrating the storage format.
@@ -104,4 +104,4 @@ npm test        # the above, then the suite
 
 The build uses the `kdb_lite` Go tag, which swaps the AWS S3 client for a stub; the persistent
 engine links that client and it alone was ~21 MB of the binary, for a network path a browser never
-takes. `@kdb/client` (and `@kdb/codegen` for the tests) must be built first; they are `file:` dependencies.
+takes. `@limidus/kdb-client` (and `@limidus/kdb-codegen` for the tests) must be built first; they are `file:` dependencies.

@@ -158,7 +158,7 @@ plane (`--control-addr`) requires an `Authorization` header on every request.
 | `kdb-inspect` | `go/cmd/kdb-inspect` | Offline tooling (takes the exclusive lock): `verify`, `repair-segments`, `migrate-history`, `restore`, `backup`, `backup-verify`, `backup-list`, `backup-fetch`, `dump-wire` |
 | Go client SDK | `go/kdb/client` | Network client for the SQL wire (put/get/upsert/commit/CAS/leases/query/search/history/revert; router follows `NOT_HOME`) |
 | `database/sql` driver | `go/kdb/driver` | **Embedded only** (`kdb://memory:///cat/ns`, `kdb://file:///root[/cat/ns]?readOnly=true`). Imports no client or server code |
-| TypeScript client | `packages/kdb-client` | Zero-dependency `@kdb/client`, wire-compatible, golden-tested with `kdb-tsfixtures`, live-tested against `kdb-tsinterop` |
+| TypeScript client | `packages/kdb-client` | Zero-dependency `@limidus/kdb-client`, wire-compatible, golden-tested with `kdb-tsfixtures`, live-tested against `kdb-tsinterop` |
 | JDBC driver | `kdb-jdbc` (Kotlin) | `jdbc:kdb:` URLs; MEMORY, FILE, NETWORK modes (network over WebSocket, default port 7444) |
 | Hibernate dialect | `kdb-hibernate` | A thin `KdbDialect` (limit/offset, if-exists flags); no type mapping |
 | Go WASM demo | `go/wasm/demo` | `KdbBrowser.openMemory(...)`: in-memory embed only; a demo, not a client |

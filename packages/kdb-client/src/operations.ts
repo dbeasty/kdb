@@ -2,7 +2,7 @@
  * The operation seam (Component 63 §11.3).
  *
  * `KdbOperations` is deliberately separate from `Client`: every method here makes sense against
- * a local engine as well as a remote one, so an embedded runtime (@kdb/embed, Phase 3) can
+ * a local engine as well as a remote one, so an embedded runtime (@limidus/kdb-embed, Phase 3) can
  * implement the same contract and application code can move between local-first and
  * server-backed without a rewrite. This costs nothing now and is awkward to retrofit later.
  *
@@ -179,7 +179,7 @@ export interface KdbOperations {
    * Runs one SELECT and maps each row to an object keyed by column name.
    *
    * Values are strings: `sqlResult.rows` is `string[][]` on the wire, and this layer does not
-   * guess at types. Coercion belongs in @kdb/codegen (Phase 2), where the schema is known -
+   * guess at types. Coercion belongs in @limidus/kdb-codegen (Phase 2), where the schema is known -
    * a driver that silently parsed "0123" as 123 would corrupt data.
    */
   query<T = Row>(ns: string, sql: string, args?: unknown[], options?: CallOptions): Promise<T[]>;

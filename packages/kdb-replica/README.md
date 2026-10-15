@@ -1,11 +1,11 @@
-# @kdb/replica
+# @limidus/kdb-replica
 
 A client-side KDB replica for browsers and Node. It holds namespaces locally, syncs them with a KDB
 node over peer sync v2 (the same messages nodes use), and keeps working offline. The design is in
 [docs/kdb-client-replica-plan.md](../../docs/kdb-client-replica-plan.md).
 
 ```ts
-import { openReplica, IndexedDbStore } from "@kdb/replica";
+import { openReplica, IndexedDbStore } from "@limidus/kdb-replica";
 
 const db = await openReplica({
   store: await IndexedDbStore.open("my-app"),

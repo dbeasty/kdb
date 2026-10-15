@@ -10,7 +10,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/wire"
 )
 
-// The ack names the server's release so a client published for one release (@kdb/client) can
+// The ack names the server's release so a client published for one release (@limidus/kdb-client) can
 // refuse to talk to another.
 func TestHandshakeAckCarriesServerVersion(t *testing.T) {
 	ack := handshakeAck(wire.HandshakeMessage{}, true, "", nil)

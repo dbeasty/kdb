@@ -9,7 +9,7 @@
  * they are acknowledged.
  */
 
-import type { Transport } from "@kdb/client";
+import type { Transport } from "@limidus/kdb-client";
 import { fromUtf8, randomUuid, utf8 } from "./bytes.ts";
 import type { Op } from "./commit.ts";
 import { ReplicaNamespace } from "./namespace.ts";

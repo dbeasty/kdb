@@ -1,13 +1,13 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>@kdb/embed browser smoke</title>
+<title>@limidus/kdb-embed browser smoke</title>
 <!--
   Serve the packages/ directory (so kdb-client and kdb-embed are siblings), then open
   /kdb-embed/test/browser/smoke.html. Result lands in #result as JSON and in document.title.
     cd packages && python3 -m http.server 8123
 -->
 <script type="importmap">
-  { "imports": { "@kdb/client": "/kdb-client/dist/index.js" } }
+  { "imports": { "@limidus/kdb-client": "/kdb-client/dist/index.js" } }
 </script>
 <pre id="result">running…</pre>
 <script type="module">

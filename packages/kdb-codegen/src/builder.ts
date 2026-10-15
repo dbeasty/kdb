@@ -8,7 +8,7 @@
  * Identifiers come from the generated schema, validated by the generator, never from the caller.
  */
 
-import type { CallOptions, KdbOperations } from "@kdb/client";
+import type { CallOptions, KdbOperations } from "@limidus/kdb-client";
 import { coerceValue } from "./coerce.ts";
 import type {
   AllColumns,

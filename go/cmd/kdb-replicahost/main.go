@@ -1,4 +1,4 @@
-// Command kdb-replicahost is the KDB node @kdb/replica's live interop tests sync against
+// Command kdb-replicahost is the KDB node @limidus/kdb-replica's live interop tests sync against
 // (docs/kdb-client-replica-plan.md §11). It is a real sync node - syncnode.Node, serving peer sync
 // v2 over WebSocket exactly as a cloud mounting Node.Handler does - with bearer-token auth, and a
 // line protocol on stdin so a test can write to it and read it back.

@@ -21,7 +21,7 @@ export function connectWebSocket(
     return Promise.reject(
       new KdbTransportError(
         "kdb: no global WebSocket available - use Node 22+, a browser, Bun, Deno or a Workers " +
-          "runtime, or connect over tcp:// via @kdb/client/tcp on Node",
+          "runtime, or connect over tcp:// via @limidus/kdb-client/tcp on Node",
       ),
     );
   }

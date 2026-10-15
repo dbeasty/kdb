@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { KdbNotFoundError } from "@kdb/client";
+import { KdbNotFoundError } from "@limidus/kdb-client";
 import { MemoryBackend, openEmbedded } from "../src/index.ts";
 
 const NS = "app/users";

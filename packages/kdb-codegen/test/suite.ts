@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it, before, after } from "node:test";
-import type { KdbOperations } from "@kdb/client";
+import type { KdbOperations } from "@limidus/kdb-client";
 import { bind } from "./generated/kdb.ts";
 
 export interface Target {

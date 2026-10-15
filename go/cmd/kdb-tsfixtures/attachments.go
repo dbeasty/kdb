@@ -1,6 +1,6 @@
 package main
 
-// Attachment fixtures for @kdb/replica (docs/kdb-client-replica-plan.md §9, model of
+// Attachment fixtures for @limidus/kdb-replica (docs/kdb-client-replica-plan.md §9, model of
 // docs/kdb-attachments-plan.md): ref, set and scheme-1 content hashes; attachment tables built
 // by Go's AttachmentTable from op sequences, with their roots; and commits carrying attachment
 // ops and roots. The replica verifies every commit's attachment root as it does the tree hash.

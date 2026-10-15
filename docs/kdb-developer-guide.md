@@ -88,7 +88,7 @@ kdb/
     testdata/golden/        cross-language fixtures (codec, physical, conflict_corpus, search)
   kdb-*/                    ~60 Kotlin modules, one Gradle project each (below)
   kdb-integration/          Kotlin integration tests + the Python end-to-end suite (e2e/)
-  packages/kdb-client/      @kdb/client - a third, TypeScript wire implementation
+  packages/kdb-client/      @limidus/kdb-client - a third, TypeScript wire implementation
   docs/                     architecture, LLD, per-layer specs, plans, benchmarks, releases/
   deploy/                   compose.yaml and a systemd unit
   .github/workflows/        ci.yml, e2e-nightly.yml, benchmark.yml, release.yml

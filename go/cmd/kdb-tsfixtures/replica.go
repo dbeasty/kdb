@@ -1,6 +1,6 @@
 package main
 
-// Fixtures for @kdb/replica (docs/kdb-client-replica-plan.md): commit payloads and hashes, document
+// Fixtures for @limidus/kdb-replica (docs/kdb-client-replica-plan.md): commit payloads and hashes, document
 // tree roots, and a commit chain with a merge, all from the Go code that produces them on a node.
 // The replica verifies every commit hash and every tree hash it is sent, so a TS encoder or trie
 // that is 99% right would refuse real data: these vectors are what prove the last 1%.

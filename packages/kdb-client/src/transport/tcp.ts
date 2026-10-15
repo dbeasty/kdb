@@ -1,5 +1,5 @@
 /**
- * TCP transport - Node only, behind the `@kdb/client/tcp` subpath export.
+ * TCP transport - Node only, behind the `@limidus/kdb-client/tcp` subpath export.
  *
  * This file is the reason for the subpath split: it is the only part of the package that
  * touches a Node built-in, and keeping it out of the main entry point is what lets the core

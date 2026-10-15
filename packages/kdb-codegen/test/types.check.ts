@@ -2,7 +2,7 @@
  * Compile-time assertions. This file is never run: `npm run typecheck` fails if any `@ts-expect-error`
  * stops erroring (a type got looser) or any plain line starts erroring (a type got tighter).
  */
-import type { KdbOperations } from "@kdb/client";
+import type { KdbOperations } from "@limidus/kdb-client";
 import { bind, type User } from "./generated/kdb.ts";
 
 declare const ops: KdbOperations;
