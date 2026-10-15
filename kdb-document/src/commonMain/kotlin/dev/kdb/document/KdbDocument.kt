@@ -9,6 +9,7 @@ import dev.kdb.codec.toKdbUuid
 import dev.kdb.document.internal.sha256Digest
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlin.LazyThreadSafetyMode
@@ -65,6 +66,59 @@ public data class KdbDocument(
                 }
             }
         return KdbDocument(id, jsonParser.encodeToString(JsonObject.serializer(), merged))
+    }
+
+    /**
+     * Carries the root-level change from [before] to this document over onto [onto]: keys this
+     * document added or changed take its value, keys it dropped are removed, and every other key
+     * keeps [onto]'s value. [onto]'s key order is kept and new keys follow in this document's order
+     * (as [merge] orders them). A null [before] is a creation, so every key counts as changed; a
+     * null [onto] is an empty document. Values are compared by their JSON text, as Go compares
+     * them, so both engines agree on what changed. Go: Document.RebasedOnto.
+     *
+     * A logged write is the whole stored document, so this is how a merge re-applies one branch's
+     * write without overwriting the other branch's concurrent changes to other fields.
+     */
+    public fun rebasedOnto(
+        before: KdbDocument?,
+        onto: KdbDocument?,
+    ): KdbDocument {
+        val after = parseObject(json, "invalid document json")
+        val prev = before?.let { parseObject(it.json, "invalid base document json") } ?: JsonObject(emptyMap())
+        val target = onto?.let { parseObject(it.json, "invalid target document json") } ?: JsonObject(emptyMap())
+        val rebased =
+            buildJsonObject {
+                for ((k, v) in target) {
+                    when {
+                        k !in after -> if (k !in prev) put(k, v)
+                        changed(after[k], prev[k]) -> put(k, after.getValue(k))
+                        else -> put(k, v)
+                    }
+                }
+                for ((k, v) in after) {
+                    if (k !in target && changed(v, prev[k])) put(k, v)
+                }
+            }
+        return KdbDocument(id, jsonParser.encodeToString(JsonObject.serializer(), rebased))
+    }
+
+    /** An absent value differs from every present one, JSON null included. */
+    private fun changed(
+        a: JsonElement?,
+        b: JsonElement?,
+    ): Boolean = if (a == null || b == null) (a == null) != (b == null) else a.toString() != b.toString()
+
+    private fun parseObject(
+        text: String,
+        what: String,
+    ): JsonObject {
+        val el =
+            try {
+                jsonParser.parseToJsonElement(text)
+            } catch (e: Throwable) {
+                throw DocumentDecodeException(what, docId = id, cause = e)
+            }
+        return el as? JsonObject ?: throw DocumentDecodeException("document root must be a JSON object", docId = id)
     }
 
     public fun withJson(newJson: String): KdbDocument {
