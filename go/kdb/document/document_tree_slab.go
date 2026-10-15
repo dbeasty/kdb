@@ -198,6 +198,8 @@ type trieSlab struct {
 	created, cycleCreated uint64
 	gcCycle               uint64
 	cycles                [1]metrics.Sample
+	nudged                bool          // requested the collection in flight
+	pace                  chan struct{} // set by counted: a collection to wait for, after unlocking
 }
 
 const (
@@ -391,11 +393,25 @@ func (s *trieSlab) allocLeaf() uint32 {
 // heap would reach twice at its GC goal. It must not wait until the slab has to grow: free slots
 // left by the last cycle absorb the next cycle's garbage first, so a slab that collected only
 // when it grew would end every cycle one floor larger than the last.
+//
+// The requested collection must also finish before the writer is far ahead of it. A writer that
+// allocates little heap never assists the collector, so the collector gets only its background
+// share of the CPU; with several CPUs a cycle takes a millisecond or so, but at one
+// (GOMAXPROCS=1: a single-core VM, a container limited to one CPU) it took hundreds, the writer
+// made hundreds of thousands of records meanwhile, and those still counted as live when the next
+// trigger was set - so each trigger was larger than the last and the slab grew without bound.
+// So the collection a slab requests must be done by its next check (slabNudgeEvery records on),
+// and a slab that comes due while another slab's request is running must not outrun that one:
+// either way the writer waits for it before going on (slabPace). It gives up the CPU only when
+// the collector is behind, which at several CPUs it practically never is (a cycle takes a few
+// hundred records' time). And a cycle the slab requested counts its garbage from the request,
+// not from when the cycle is seen to end: what the writer made in between may have outlived it.
 const slabNudgeFloor = 4 << 20
 
 const slabNudgeEvery = 4096 // records created between checks
 
-var slabGCRunning atomic.Bool
+// slabGCDone is the requested collection in flight: closed when it finishes, nil when none is.
+var slabGCDone atomic.Pointer[chan struct{}]
 
 func (s *trieSlab) counted() {
 	s.created++
@@ -407,7 +423,13 @@ func (s *trieSlab) counted() {
 	}
 	metrics.Read(s.cycles[:])
 	if c := s.cycles[0].Value.Uint64(); c != s.gcCycle {
-		s.gcCycle, s.cycleCreated = c, s.created
+		// A cycle this slab requested counts from the request: what was made since may have
+		// outlived it, and is not live.
+		s.gcCycle = c
+		if !s.nudged {
+			s.cycleCreated = s.created
+		}
+		s.nudged = false
 		return
 	}
 	since := s.created - s.cycleCreated
@@ -422,12 +444,31 @@ func (s *trieSlab) counted() {
 		// A file-backed slab's resident records are bounded by its budget, and so is its garbage.
 		floor = min(floor, uint64(f.opts.ResidentBytes/2))
 	}
-	if since*recBytes > max(floor, live*recBytes/2) && slabGCRunning.CompareAndSwap(false, true) {
-		s.cycleCreated = s.created
+	trigger := max(floor, live*recBytes/2)
+	if w := slabGCDone.Load(); w != nil {
+		if since*recBytes > trigger || s.nudged && since >= slabNudgeEvery {
+			s.pace = *w
+		}
+		return
+	}
+	if since*recBytes <= trigger {
+		return
+	}
+	done := make(chan struct{})
+	if slabGCDone.CompareAndSwap(nil, &done) {
+		s.cycleCreated, s.nudged = s.created, true
 		go func() {
 			runtime.GC()
-			slabGCRunning.Store(false)
+			slabGCDone.Store(nil)
+			close(done)
 		}()
+	}
+}
+
+// slabPace waits for the collection w (from trieSlab.pace) if there is one. Never under s.mu.
+func slabPace(w chan struct{}) {
+	if w != nil {
+		<-w
 	}
 }
 

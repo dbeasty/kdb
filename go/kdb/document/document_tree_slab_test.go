@@ -669,3 +669,46 @@ func randomEntriesFrom(r *rand.Rand, ids []codec.UUID) map[codec.UUID]codec.Hash
 	}
 	return m
 }
+
+// TestSlabReuseOnOneCPU: dropped versions are reused at one CPU as at many. The slab's background
+// collection shares the only CPU with the writer, which allocates almost no heap and so never
+// assists it; unpaced, each cycle took hundreds of milliseconds, the writer outran it by hundreds
+// of thousands of records, and the slab grew without bound (171 MB at 3M updates of a 200,000-
+// document tree, against a flat 39 MB at four CPUs).
+func TestSlabReuseOnOneCPU(t *testing.T) {
+	if testing.Short() {
+		t.Skip("allocates tens of MB")
+	}
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	const n = 200000
+	r := rand.New(rand.NewSource(5))
+	packed := make([]byte, n*PackedTreeEntrySize)
+	r.Read(packed)
+	items := packedItems(packed)
+	sort.Slice(items, func(a, b int) bool { return bytes.Compare(items[a].key[:], items[b].key[:]) < 0 })
+	tree, err := BuildTrieDocumentTreePacked(packed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	built := tree.trie.slab.stats().Bytes
+	ids := make([]codec.UUID, 1000)
+	for i := range ids {
+		ids[i] = keyUUID(&items[r.Intn(n)].key)
+	}
+	for i := 0; i < 600000; i++ {
+		var h codec.Hash
+		r.Read(h.Bytes[:])
+		if tree, err = tree.With(ids[i%len(ids)], h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := tree.trie.slab.stats()
+	t.Logf("built %.1f MB of chunks; after 600,000 updates at one CPU %.1f MB, %d free nodes, %d free leaves",
+		float64(built)/(1<<20), float64(st.Bytes)/(1<<20), st.FreeNodes, st.FreeLeaves)
+	// Settles at about 1.55 times the built tree (slabNudgeFloor's rule plus a chunk), at one CPU
+	// as at four.
+	if float64(st.Bytes) > 1.8*float64(built) {
+		t.Fatalf("%d bytes of chunks after updates at one CPU, %d built: dropped versions are not being reused", st.Bytes, built)
+	}
+	runtime.KeepAlive(packed)
+}
