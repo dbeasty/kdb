@@ -36,7 +36,9 @@ func (d *InMemoryCommitDag) GraphResidentBytes() int64 {
 	if s.goMode {
 		b += int64(len(s.goNodes)) * (hashKey + int64(unsafe.Sizeof(goNode{})) + hashMapEntryOverhead)
 	} else {
-		b += int64(len(s.chunks)) * slotsPerChunk * graphRecordSize
+		for _, c := range s.chunks {
+			b += int64(cap(c))
+		}
 		b += int64(len(s.index)) * (hashKey + 4 + hashMapEntryOverhead)
 		b += int64(cap(s.free)) * 4
 	}

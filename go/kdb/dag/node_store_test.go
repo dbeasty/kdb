@@ -1,7 +1,9 @@
 package dag
 
 import (
+	"fmt"
 	"reflect"
+	"runtime"
 	"testing"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -14,12 +16,37 @@ func h(b byte) codec.Hash { var x codec.Hash; x.Bytes[0] = b; return x }
 // not scan: if a chunk ever became something other than raw bytes, every commit would be traced
 // again and nothing else would notice.
 func TestResidentChunksArePointerFree(t *testing.T) {
-	elem := reflect.TypeOf(nodeStore{}.chunks).Elem().Elem() // *[N]byte -> [N]byte
-	if elem.Kind() != reflect.Array || elem.Elem().Kind() != reflect.Uint8 {
-		t.Fatalf("resident chunks are %s, want an array of bytes", elem)
+	elem := reflect.TypeOf(nodeStore{}.chunks).Elem() // []byte
+	if elem.Kind() != reflect.Slice || elem.Elem().Kind() != reflect.Uint8 {
+		t.Fatalf("resident chunks are %s, want byte slices", elem)
 	}
-	if elem.Len() != slotsPerChunk*graphRecordSize {
-		t.Fatalf("chunk holds %d bytes, want %d records of %d", elem.Len(), slotsPerChunk, graphRecordSize)
+}
+
+// A namespace of a few commits must not pay for a full chunk, and growth must keep every record.
+func TestFirstChunkStartsSmallAndGrows(t *testing.T) {
+	s := newNodeStore()
+	s.setChunkSlots(64)
+	s.put(document.Commit{Hash: h(1), Message: "m"}, 1)
+	if got := cap(s.chunks[0]); got != minChunkSlots*graphRecordSize {
+		t.Fatalf("first chunk %d bytes, want %d", got, minChunkSlots*graphRecordSize)
+	}
+	for i := 2; i <= 200; i++ {
+		var x codec.Hash
+		x.Bytes[0], x.Bytes[1] = byte(i), byte(i>>8)
+		s.put(document.Commit{Hash: x, Message: "m"}, uint32(i))
+	}
+	if got := len(s.chunks[0]); got != 64*graphRecordSize {
+		t.Fatalf("first chunk %d bytes, want it grown to %d", got, 64*graphRecordSize)
+	}
+	if len(s.chunks) != 4 {
+		t.Fatalf("%d chunks for 200 commits at 64 a chunk, want 4", len(s.chunks))
+	}
+	for i := 2; i <= 200; i++ {
+		var x codec.Hash
+		x.Bytes[0], x.Bytes[1] = byte(i), byte(i>>8)
+		if c, ok := s.commit(x); !ok || c.Message != "m" {
+			t.Fatalf("commit %d lost across growth", i)
+		}
 	}
 }
 
@@ -137,4 +164,56 @@ func viewOfByName(t *testing.T, b *dagBuilder) graphView {
 		}
 	}
 	return v
+}
+
+// The regression this guards: every namespace's first commit allocated a full 1 MiB chunk, so a
+// server holding thousands of small namespaces (one per match, say) held gigabytes of mostly
+// empty graph. A small namespace must cost kilobytes, by the accounting and by the real heap.
+func TestThousandsOfSmallNamespacesStaySmall(t *testing.T) {
+	const n = 2000
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	dags := make([]*InMemoryCommitDag, n)
+	for i := range dags {
+		d, err := NewInMemoryCommitDag(fmt.Sprintf("match/%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		dags[i] = d
+	}
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	if per := dags[0].GraphResidentBytes(); per > 16<<10 {
+		t.Fatalf("a fresh namespace accounts %d bytes of graph, want a few KiB", per)
+	}
+	if per := (int64(after.HeapAlloc) - int64(before.HeapAlloc)) / n; per > 64<<10 {
+		t.Fatalf("a fresh namespace holds %d heap bytes, want well under the old 1 MiB chunk", per)
+	}
+	runtime.KeepAlive(dags)
+}
+
+func TestChunkBytesSettingBoundsTheChunk(t *testing.T) {
+	d, err := NewInMemoryCommitDag("ns")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := d.GraphSettings()
+	s.ChunkBytes = 100 // below one growth step: clamped, not honoured literally
+	if got := s.normalized().ChunkBytes; got != minChunkSlots*graphRecordSize {
+		t.Fatalf("ChunkBytes clamped to %d, want %d", got, minChunkSlots*graphRecordSize)
+	}
+	s.ChunkBytes = 64 * graphRecordSize
+	d2, _ := NewInMemoryCommitDag("ns2")
+	d2.SetGraphSettings(s)
+	for i := 0; i < 200; i++ {
+		var x codec.Hash
+		x.Bytes[0], x.Bytes[1] = byte(i+1), byte((i+1)>>8)
+		d2.nodes.put(document.Commit{Hash: x}, 1)
+	}
+	for i, c := range d2.nodes.chunks {
+		if len(c) > 64*graphRecordSize {
+			t.Fatalf("chunk %d is %d bytes, over the configured %d", i, len(c), 64*graphRecordSize)
+		}
+	}
 }

@@ -694,6 +694,12 @@ func envOnlySpecs() []envOnlySpec {
 			},
 		},
 		{
+			key: "graph.chunkBytes", env: "KDB_GRAPH_CHUNK_BYTES",
+			scope: ScopeNamespace, mutability: MutabilityNamespaceReopen, unit: "bytes",
+			help:  "size of a full chunk of in-memory commit records (default 1 MiB). A namespace's first chunk starts at 4 KiB and doubles to this, so it is the allocation step for large namespaces; lower it to cut the overshoot where memory is tight. Ignored when graph.memory is go",
+			parse: bytes,
+		},
+		{
 			key: "graph.maxSegments", env: "KDB_GRAPH_MAX_SEGMENTS",
 			scope: ScopeNamespace, mutability: MutabilityNamespaceReopen, unit: "segments",
 			help:  "how many graph segment files may accumulate before the next write rewrites them all as one (a full compaction). Ignored when graph.file is off",

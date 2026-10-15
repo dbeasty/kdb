@@ -39,9 +39,14 @@ type nodeStore struct {
 	// chunks hold records in fixed-size blocks rather than one growing slice: a single slice
 	// doubles its capacity as it fills, so up to half of it is empty, and every doubling copies
 	// the whole thing at the moment the DAG is busiest admitting commits.
-	chunks []*[slotsPerChunk * graphRecordSize]byte
-	used   uint32 // slots ever handed out; free holds the ones since returned
-	free   []uint32
+	//
+	// Every chunk but the first is chunkSlots records. The first starts at minChunkSlots and
+	// doubles to chunkSlots, so a namespace of a few commits costs kilobytes, not the full chunk
+	// - a server holding thousands of small namespaces paid 1 MiB each for its first commit.
+	chunks     [][]byte
+	chunkSlots uint32 // records per full chunk; zero means DefaultGraphChunkSlots
+	used       uint32 // slots ever handed out; free holds the ones since returned
+	free       []uint32
 
 	// namespaces interns Commit.NamespaceID for the resident tier (a record's ns index). A DAG
 	// holds one namespace, so this is almost always a single entry; it is a table only so a
@@ -100,7 +105,9 @@ func (s *nodeStore) setGoMode(on bool) {
 		held = append(held, c)
 		gens = append(gens, s.generation(h))
 	})
+	chunkSlots := s.chunkSlots
 	*s = newNodeStore()
+	s.chunkSlots = chunkSlots
 	s.goMode = on
 	if on {
 		s.goNodes = make(map[codec.Hash]goNode)
@@ -133,12 +140,53 @@ func (s *nodeStore) forEachResident(fn func(codec.Hash)) {
 	}
 }
 
-const slotsPerChunk = 4096
+func (s *nodeStore) slotsPerChunk() uint32 {
+	if s.chunkSlots == 0 {
+		return DefaultGraphChunkSlots
+	}
+	return s.chunkSlots
+}
+
+// setChunkSlots sets the full chunk size in records (zero is the default), repacking any records
+// already held: SetGraphSettings runs after the genesis commit is stored. Slot numbers are
+// unchanged, so the index stays valid.
+func (s *nodeStore) setChunkSlots(n uint32) {
+	if n == s.chunkSlots {
+		return
+	}
+	old := *s
+	s.chunks, s.chunkSlots = nil, n
+	for i := uint32(0); i < old.used; i++ {
+		s.ensureSlot(i)
+		copy(s.at(i), old.at(i))
+	}
+}
 
 func (s *nodeStore) at(i uint32) []byte {
-	c := s.chunks[i/slotsPerChunk]
-	off := int(i%slotsPerChunk) * graphRecordSize
+	per := s.slotsPerChunk()
+	c := s.chunks[i/per]
+	off := int(i%per) * graphRecordSize
 	return c[off : off+graphRecordSize]
+}
+
+// ensureSlot makes slot i addressable, allocating or growing a chunk as needed.
+func (s *nodeStore) ensureSlot(i uint32) {
+	per := s.slotsPerChunk()
+	ci := int(i / per)
+	for len(s.chunks) <= ci {
+		if len(s.chunks) == 0 {
+			s.chunks = append(s.chunks, make([]byte, min(per, minChunkSlots)*graphRecordSize))
+		} else {
+			s.chunks = append(s.chunks, make([]byte, per*graphRecordSize))
+		}
+	}
+	if need := (int(i%per) + 1) * graphRecordSize; ci == 0 && len(s.chunks[0]) < need {
+		// Only the first chunk is short. Double it, copying at most one chunk's records.
+		n := min(max(2*len(s.chunks[0]), need), int(per)*graphRecordSize)
+		grown := make([]byte, n)
+		copy(grown, s.chunks[0])
+		s.chunks[0] = grown
+	}
 }
 
 func newNodeStore() nodeStore {
@@ -304,9 +352,7 @@ func (s *nodeStore) put(c document.Commit, gen uint32) {
 		} else {
 			i = s.used
 			s.used++
-			if int(i/slotsPerChunk) == len(s.chunks) {
-				s.chunks = append(s.chunks, new([slotsPerChunk * graphRecordSize]byte))
-			}
+			s.ensureSlot(i)
 		}
 		s.index[c.Hash] = i
 	}
@@ -858,22 +904,18 @@ func shrunk[K comparable, V any](m map[K]V) map[K]V {
 // compactSlab gives back the chunks an attach emptied. Slots are renumbered, so this may only
 // run where nothing holds a slot index - which, under the DAG's write lock, is everywhere.
 func (s *nodeStore) compactSlab() {
-	if len(s.free) < slotsPerChunk {
+	if uint32(len(s.free)) < s.slotsPerChunk() {
 		return
 	}
-	var chunks []*[slotsPerChunk * graphRecordSize]byte
-	var used uint32
-	for h, i := range s.index {
-		j := used
-		used++
-		if int(j/slotsPerChunk) == len(chunks) {
-			chunks = append(chunks, new([slotsPerChunk * graphRecordSize]byte))
-		}
-		off := int(j%slotsPerChunk) * graphRecordSize
-		copy(chunks[j/slotsPerChunk][off:off+graphRecordSize], s.at(i))
+	old := *s
+	s.chunks, s.used, s.free = nil, 0, nil
+	for h, i := range old.index {
+		j := s.used
+		s.used++
+		s.ensureSlot(j)
+		copy(s.at(j), old.at(i))
 		s.index[h] = j
 	}
-	s.chunks, s.used, s.free = chunks, used, nil
 }
 
 // segmentOpsEvicted reports a segment commit whose record says it wrote operations and which has

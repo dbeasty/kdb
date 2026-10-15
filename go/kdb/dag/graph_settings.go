@@ -22,6 +22,15 @@ const DefaultGraphRebuildCommits = 50_000
 // the resident tier, so this bounds history-read cost; it is not a memory bound.
 const DefaultGraphMaxSegments = 8
 
+// DefaultGraphChunkSlots is how many commit records a full resident chunk holds: 4096 of
+// graphRecordSize bytes, 1 MiB. A namespace's first chunk starts at minChunkSlots and doubles to
+// this, so the figure bounds the allocation granularity of a large namespace, not the cost of a
+// small one.
+const DefaultGraphChunkSlots = 4096
+
+// minChunkSlots is the first resident chunk's initial size in records (4 KiB).
+const minChunkSlots = 16
+
 // GraphMemory is how the DAG holds commits in memory.
 type GraphMemory string
 
@@ -107,6 +116,12 @@ type GraphSettings struct {
 	// rewrite. Zero means DefaultGraphMaxSegments. Ignored when FileEnabled is off.
 	MaxSegments int
 
+	// ChunkBytes is the size of a full resident chunk of commit records (rounded down to whole
+	// records, at least one chunk-growth step). Zero means 1 MiB. A namespace's first chunk
+	// starts small and doubles up to this, so lowering it matters for memory-tight apps with
+	// big namespaces; larger chunks mean fewer allocations. Ignored under GraphMemoryGo.
+	ChunkBytes int
+
 	// Memory selects how commits are held in memory; empty means GraphMemoryKDB. FileEnabled
 	// forces GraphMemoryKDB, since segments are those same records on disk.
 	Memory GraphMemory
@@ -144,6 +159,11 @@ func (s GraphSettings) normalized() GraphSettings {
 		s.RebuildCommits = 0
 		s.MaxSegments = 0
 	}
+	if s.ChunkBytes <= 0 {
+		s.ChunkBytes = 0 // the default, resolved where the chunks are made
+	} else {
+		s.ChunkBytes = max(s.ChunkBytes/graphRecordSize, minChunkSlots) * graphRecordSize
+	}
 	if s.AnchorInterval < 0 {
 		s.AnchorInterval = 0
 	}
@@ -164,6 +184,7 @@ func (d *InMemoryCommitDag) SetGraphSettings(s GraphSettings) {
 	defer d.mu.Unlock()
 	was := d.graph.AncestryPruning
 	d.graph = s.normalized()
+	d.nodes.setChunkSlots(uint32(d.graph.ChunkBytes / graphRecordSize)) // 0 stays the default
 	d.nodes.setGoMode(d.graph.Memory == GraphMemoryGo)
 	if d.graph.AncestryPruning && !was {
 		d.recomputeGenerationsLocked()
