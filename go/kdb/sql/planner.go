@@ -249,6 +249,15 @@ func (v *validator) check(e Expr, allowAliases, allowAggregates bool) error {
 			if name == "array_length" && len(ex.Args) != 1 {
 				return NewPlanningError("ARRAY_LENGTH takes exactly one argument", "")
 			}
+			if name == "exists" || name == "all_values" {
+				if len(ex.Args) != 1 {
+					return NewPlanningError(strings.ToUpper(name)+" takes exactly one path", "")
+				}
+				if _, ok := ex.Args[0].(ExprColumnRef); !ok {
+					return NewPlanningError(strings.ToUpper(name)+" takes a path, not an expression", "")
+				}
+				return v.check(ex.Args[0], false, false)
+			}
 			if name != "array_length" && len(ex.Args) < 2 {
 				return NewPlanningError(strings.ToUpper(name)+" takes a path and at least one value", "")
 			}

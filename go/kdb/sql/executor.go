@@ -1569,8 +1569,12 @@ func projectRow(projections []Projection, env *evalEnv, d *evalDoc) []Cell {
 	for _, proj := range projections {
 		switch p := proj.(type) {
 		case ProjColumn:
-			out = append(out, env.cell(ExprColumnRef{Name: p.Name}, d))
+			out = append(out, env.projectedColumn(p.Name, d))
 		case ProjExpression:
+			if ref, ok := p.Expr.(ExprColumnRef); ok {
+				out = append(out, env.projectedColumn(ref.Name, d))
+				continue
+			}
 			c := env.cell(p.Expr, d)
 			if c == nil {
 				c = CellNull{}
@@ -1645,8 +1649,10 @@ func expressionSQLType(e Expr) string {
 			return "VARCHAR"
 		case "avg":
 			return "DOUBLE"
-		case "array_contains", "array_contains_any":
+		case "array_contains", "array_contains_any", "exists":
 			return "BOOLEAN"
+		case "all_values":
+			return "JSON"
 		}
 	case ExprBinary, ExprUnary, ExprIn, ExprBetween:
 		return "BOOLEAN"

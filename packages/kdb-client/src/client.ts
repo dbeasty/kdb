@@ -584,6 +584,27 @@ export class Client implements KdbOperations {
     } while (continuation !== undefined);
   }
 
+  /**
+   * queryRawPages with typed cells, as queryValues returns them: a SELECT read in pages of at most
+   * pageSize rows (0: the largest the server allows), every page from the same snapshot, with
+   * NULLs, numbers, booleans and JSON decoded.
+   */
+  async *queryValuesPages(
+    ns: string,
+    sql: string,
+    args: unknown[] = [],
+    pageSize = 0,
+    options: CallOptions = {},
+  ): AsyncGenerator<{ columns: string[]; rows: SqlValue[][] }, void, undefined> {
+    const size = pageSize > 0 ? Math.floor(pageSize) : 2 ** 30;
+    let continuation: string | undefined;
+    do {
+      const page = await this.#execSql(ns, sql, args, options, { pageSize: size, continuation });
+      yield { columns: page.columns, rows: typedRows(page.rows, page.cellKinds) };
+      continuation = page.continuation;
+    } while (continuation !== undefined);
+  }
+
   async queryAll<T = Row>(
     ns: string,
     sql: string,

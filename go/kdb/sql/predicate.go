@@ -405,6 +405,25 @@ func (env *evalEnv) functionCell(call ExprFunctionCall, d *evalDoc) Cell {
 			}
 		}
 		return CellBool{Value: wantAll}
+	case "exists":
+		// The path reaches a value - JSON null included. An absent path reaches none.
+		ref, ok := call.Args[0].(ExprColumnRef)
+		if len(call.Args) != 1 || !ok {
+			return CellNull{}
+		}
+		return CellBool{Value: len(env.columnValues(ref.Name, d, false)) > 0}
+	case "all_values":
+		// Every value the path reaches, as one JSON array - a path through an array of objects
+		// (`subs.u`) projects each element's value, where a bare column projects the first.
+		ref, ok := call.Args[0].(ExprColumnRef)
+		if len(call.Args) != 1 || !ok {
+			return CellNull{}
+		}
+		vals := env.columnValues(ref.Name, d, false)
+		if len(vals) == 0 {
+			return CellNull{}
+		}
+		return CellJSON{JSON: kdbjson.ToJSONString(kdbjson.ArrayValue{Elements: append([]kdbjson.Value(nil), vals...)})}
 	case "array_length":
 		if len(call.Args) != 1 {
 			return CellNull{}
@@ -739,4 +758,21 @@ func ParseFilter(expr string) (Expr, error) {
 		return nil, NewParseError("not a filter expression", expr, 0)
 	}
 	return sel.Query.Where, nil
+}
+
+// projectedColumn is a selected column's cell. It differs from the cell a predicate compares in
+// one way (qtask production plan U8): a JSON boolean is a CellBool, which the wire types as a
+// boolean - its text is still "1"/"0", so an untyped client reads what it always did - where a
+// predicate keeps comparing it as 0/1. A path through an array still projects its first value
+// (kdb-spec-layer16 §3.5); ALL_VALUES(path) projects them all.
+func (env *evalEnv) projectedColumn(name string, d *evalDoc) Cell {
+	c := env.cell(ExprColumnRef{Name: name}, d)
+	if l, ok := c.(CellLong); ok && (l.Value == 0 || l.Value == 1) && !isReservedColumn(env.columnName(name)) {
+		if vals := env.columnValues(name, d, false); len(vals) > 0 {
+			if b, ok := vals[0].(kdbjson.BoolValue); ok {
+				return CellBool{Value: b.V}
+			}
+		}
+	}
+	return c
 }

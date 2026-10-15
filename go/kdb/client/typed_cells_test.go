@@ -40,8 +40,9 @@ func TestQueryValuesReturnsTypedCells(t *testing.T) {
 			if len(cols) != 5 || len(rows) != 2 {
 				t.Fatalf("cols %v, %d rows", cols, len(rows))
 			}
-			// A BOOLEAN column is stored as an integer cell, so it reads back as 1/0.
-			want := [][]any{{"a", int64(42), 1.5, int64(1), ""}, {"b", int64(-7), 0.25, int64(0), nil}}
+			// A BOOLEAN column reads back as a boolean (qtask production plan U8); its wire text is
+			// still 1/0, typed BOOL.
+			want := [][]any{{"a", int64(42), 1.5, true, ""}, {"b", int64(-7), 0.25, false, nil}}
 			for i := range want {
 				for j := range want[i] {
 					if rows[i][j] != want[i][j] {

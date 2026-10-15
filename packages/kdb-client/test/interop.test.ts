@@ -409,4 +409,20 @@ for (const jsonOnly of [false, true]) describe(`live interop against the Go serv
     const counted = await client.queryValues(NS, "SELECT COUNT(*) FROM players WHERE name = 'Alice'");
     assert.deepEqual(counted.rows, [[1]]);
   });
+
+  it("pages typed cells with queryValuesPages", async () => {
+    // The `page%` rows an earlier case wrote: typed like queryValues, paged like queryRawPages.
+    const names: unknown[] = [];
+    let pages = 0;
+    for await (const page of client.queryValuesPages(NS, "SELECT name, _doc FROM players WHERE name LIKE 'page%'", [], 50)) {
+      pages++;
+      assert.ok(page.rows.length <= 50);
+      for (const row of page.rows) {
+        names.push(row[0]);
+        assert.equal(typeof row[1], "object"); // _doc decoded, not text
+      }
+    }
+    assert.ok(pages >= 3);
+    assert.equal(names.length, 130);
+  });
 });

@@ -177,6 +177,37 @@ func (c *Client) QueryRawPages(ctx context.Context, ns string, sqlText string, a
 	}
 }
 
+// QueryValuesPages is QueryRawPages with typed cells, as QueryValues returns them: a SELECT read
+// in pages of at most pageSize rows, every page from the same snapshot, each handed to fn with
+// NULLs, numbers, booleans and JSON decoded.
+func (c *Client) QueryValuesPages(ctx context.Context, ns string, sqlText string, args []any, pageSize int, fn func(columns []string, rows [][]any) error) error {
+	st, err := c.ensureNamespace(ctx, ns)
+	if err != nil {
+		return err
+	}
+	if pageSize <= 0 {
+		pageSize = 1 << 30 // clamped by the server to its result bound
+	}
+	token := ""
+	for {
+		result, err := c.execSqlPaged(ctx, ns, st.sessionID, sqlText, args, pageSize, token)
+		if err != nil {
+			return err
+		}
+		rows, err := typedRows(result.Rows, result.cellKinds)
+		if err != nil {
+			return err
+		}
+		if err := fn(result.Columns, rows); err != nil {
+			return err
+		}
+		if result.continuation == "" {
+			return nil
+		}
+		token = result.continuation
+	}
+}
+
 type sqlExecResult struct {
 	continuation string
 	Columns      []string

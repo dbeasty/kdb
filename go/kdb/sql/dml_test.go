@@ -24,7 +24,7 @@ func TestUpdateSetsPathsAndCountsRows(t *testing.T) {
 	if !ok || w.DocID != corpusID(1) {
 		t.Fatalf("op: %+v", res.Operations[0])
 	}
-	f.expect(`SELECT status, meta.reviewed, priority, tags FROM tasks WHERE title = 'alpha'`, `done|1|NULL|["x","y"]`)
+	f.expect(`SELECT status, meta.reviewed, priority, tags FROM tasks WHERE title = 'alpha'`, `done|true|NULL|["x","y"]`)
 	f.expect(`SELECT _doc FROM tasks WHERE title = 'alpha'`,
 		`{"title":"alpha","status":"done","priority":null,"tags":["x","y"],"projectIds":["p1","p2"],"collaborators":[{"userId":"u1"},{"userId":"u2"}],"steps":[{"text":"plan"},{"text":"deploy staging"}],"flag":true,"score":1.5,"meta":{"reviewed":true}}`)
 	// Nothing matched: zero rows, no ops.
@@ -79,7 +79,7 @@ func TestUpdateDocReplacesWholeDocument(t *testing.T) {
 	// absent from the replacement body (here "status") survive. Removing them needs a
 	// replace-capable write op in the document/transaction layer, which this layer cannot
 	// express; the assignment itself is correct.
-	f.expectWithParams(`SELECT title, fresh FROM tasks WHERE kdb_id = ?`, []sql.Parameter{sql.ParamString{Value: corpusID(4).String()}}, "zeta|1")
+	f.expectWithParams(`SELECT title, fresh FROM tasks WHERE kdb_id = ?`, []sql.Parameter{sql.ParamString{Value: corpusID(4).String()}}, "zeta|true")
 	for _, q := range []string{
 		`UPDATE tasks SET _doc = 'not json' WHERE title = 'alpha'`,
 		`UPDATE tasks SET _doc = '[1,2]' WHERE title = 'alpha'`,

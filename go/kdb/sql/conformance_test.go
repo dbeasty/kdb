@@ -354,11 +354,12 @@ func TestConformanceDistinct(t *testing.T) {
 	// LIMIT bounds distinct rows, not pre-dedup rows (§3.3).
 	f.expect(`SELECT DISTINCT status FROM tasks ORDER BY status LIMIT 2`, "blocked", "done")
 	f.expect(`SELECT DISTINCT status FROM tasks ORDER BY status LIMIT 2 OFFSET 1`, "done", "open")
-	f.expect(`SELECT DISTINCT status, flag FROM tasks ORDER BY status, flag`, "blocked|NULL", "done|NULL", "done|0", "open|1")
+	// A projected JSON boolean is a boolean cell (on the wire still "1"/"0", typed BOOL).
+	f.expect(`SELECT DISTINCT status, flag FROM tasks ORDER BY status, flag`, "blocked|NULL", "done|NULL", "done|false", "open|true")
 	if got := f.rows(`SELECT DISTINCT status FROM tasks`); len(got) != 3 {
 		t.Fatalf("unordered DISTINCT: %v", got)
 	}
-	f.expect(`SELECT DISTINCT flag FROM tasks WHERE flag`, "1")
+	f.expect(`SELECT DISTINCT flag FROM tasks WHERE flag`, "true")
 }
 
 // --- LIMIT / OFFSET ----------------------------------------------------------------------
