@@ -70,6 +70,7 @@ func restoreCmd(args []string) error {
 		sources = append(sources, recovery.Source{Label: label, Shim: shim})
 	}
 
+	var restoredFrom *backup.Manifest
 	if fromBackup != "" {
 		store, err := backupStore(fromBackup)
 		if err != nil {
@@ -84,6 +85,7 @@ func restoreCmd(args []string) error {
 		if err != nil {
 			return fmt.Errorf("fetching backup %s: %w", backupID, err)
 		}
+		restoredFrom = m
 		fmt.Printf("fetched backup %s (%d commits) as restore source\n", m.BackupID, m.CommitCount)
 		shim, err := openDirShim(fetchDir)
 		if err != nil {
@@ -106,6 +108,12 @@ func restoreCmd(args []string) error {
 	result, err := recovery.HybridRestore(sources, namespace, comp, outShim)
 	if err != nil {
 		return err
+	}
+	if restoredFrom != nil && len(restoredFrom.Definitions) > 0 {
+		if err := backup.WriteRestoredDefinitions(outDir, restoredFrom); err != nil {
+			return fmt.Errorf("writing the backup's definitions: %w", err)
+		}
+		fmt.Println("  definitions (schema, constraints, indexes): restored; kdb-service applies them when it opens the namespace")
 	}
 
 	fmt.Printf("restored namespace %s to %s\n", namespace, outDir)

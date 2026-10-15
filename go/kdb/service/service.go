@@ -803,6 +803,11 @@ func Main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+	// A namespace restored from a backup that carried its definitions: adopt them once, so its
+	// indexes and unique constraints come back without the application declaring them again.
+	if dataDir != "" {
+		adoptRestoredDefinitions(dataDir, namespace, node.Meta())
+	}
 	replicator := node.Replicator()
 	if replicator != nil {
 		if admin != nil {

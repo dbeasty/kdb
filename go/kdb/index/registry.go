@@ -219,8 +219,9 @@ func (r *Registry) PrepareWrite(docID codec.UUID, jsonText string) (*PreparedWri
 	epoch := r.epoch.Load()
 	r.mu.RUnlock()
 	pw := &PreparedWrite{registry: r, docID: docID, jsonText: jsonText, epoch: epoch}
+	doc := &parsedDoc{jsonText: jsonText}
 	for _, e := range entries {
-		p, err := e.store.PrepareDocument(docID, jsonText)
+		p, err := doc.prepare(e.store, docID)
 		if err != nil {
 			return nil, err
 		}
@@ -367,8 +368,9 @@ func (r *Registry) RebuildFromScan(scan ScanFunc, headCommit codec.Hash, only []
 	var applyErr error
 	err := scan(func(docID codec.UUID, jsonText string) bool {
 		stats.Documents++
+		doc := &parsedDoc{jsonText: jsonText}
 		for _, e := range selected {
-			p, err := e.store.PrepareDocument(docID, jsonText)
+			p, err := doc.prepare(e.store, docID)
 			if err != nil {
 				stats.Skipped++
 				if stats.FirstError == nil {
@@ -432,6 +434,7 @@ func (r *Registry) CatchUpStores(ids []codec.UUID, headCommit codec.Hash, change
 	var applyErr error
 	err := changes(func(c DocumentChange) bool {
 		stats.Documents++
+		doc := &parsedDoc{jsonText: c.JSONText}
 		for _, e := range selected {
 			if c.Deleted {
 				if err := e.store.Delete(c.DocID, headCommit); err != nil {
@@ -440,7 +443,7 @@ func (r *Registry) CatchUpStores(ids []codec.UUID, headCommit codec.Hash, change
 				}
 				continue
 			}
-			p, err := e.store.PrepareDocument(c.DocID, c.JSONText)
+			p, err := doc.prepare(e.store, c.DocID)
 			if err != nil {
 				// As a rebuild does: a stored document the index cannot take is left out of it -
 				// and out means its previous entry goes too.

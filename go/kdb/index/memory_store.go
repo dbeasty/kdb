@@ -3,6 +3,7 @@ package index
 import (
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
+	"github.com/limidus/kdb/go/kdb/json"
 )
 
 // MemoryStore is the hash/btree index. Hash and btree share one implementation (event_log.go):
@@ -112,6 +113,14 @@ func (s *MemoryStore) PrepareDocument(docID codec.UUID, jsonText string) (Prepar
 	}
 	root, err := ParseDocument(jsonText)
 	if err != nil {
+		return nil, err
+	}
+	return s.PrepareParsedDocument(docID, jsonText, root)
+}
+
+// PrepareParsedDocument implements ParsedDocumentStore.
+func (s *MemoryStore) PrepareParsedDocument(docID codec.UUID, _ string, root json.Value) (PreparedPut, error) {
+	if err := s.requireKeyedType(); err != nil {
 		return nil, err
 	}
 	fieldType := s.descriptor.StringOption(OptionFieldType, "")
