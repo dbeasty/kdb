@@ -2,6 +2,8 @@ package dev.kdb.document
 
 import dev.kdb.codec.KdbHash
 import dev.kdb.codec.KdbUuid
+import dev.kdb.document.internal.runEach
+import dev.kdb.document.internal.sha256OnlyChild
 
 /**
  * Incremental hashing engine behind DocumentTree. Byte-for-byte mirror of
@@ -106,15 +108,10 @@ private fun internalHash(children: Array<TrieNode?>): ByteArray {
 
 /**
  * internalHash for the one case compression needs: an internal node with a
- * single occupied slot. The buffer starts zeroed and TRIE_ZERO is all-zero, so
- * the absent siblings need no writing.
+ * single occupied slot. TRIE_ZERO is all-zero, so the preimage is constant but
+ * for the child (see sha256OnlyChild).
  */
-private fun internalHashOfOnlyChild(nib: Int, childHash: ByteArray): ByteArray {
-    val buf = ByteArray(1 + 16 * 32)
-    buf[0] = 0x01
-    childHash.copyInto(buf, 1 + nib * 32)
-    return kdbSha256(buf)
-}
+private fun internalHashOfOnlyChild(nib: Int, childHash: ByteArray): ByteArray = sha256OnlyChild(nib, childHash)
 
 /**
  * The hash of the subtree rooted at [depth] holding exactly the one entry -
@@ -260,13 +257,72 @@ internal fun trieGet(root: TrieNode?, id: KdbUuid): KdbHash? {
     return null
 }
 
-/** Constructs a trie from scratch (O(n)); see trieBuild's Go counterpart. */
+/**
+ * Builds the trie for a whole set of entries at once, as Go's trieBuild does: the ids sorted once,
+ * then each node built and hashed exactly once. Inserting them one at a time gives the same trie,
+ * node for node, but rehashes every node on an entry's path per insert and refolds a compressed
+ * leaf's whole spine each time a later entry splits it - about twice the hashing.
+ */
 internal fun trieBuild(entries: Map<KdbUuid, KdbHash>): TrieNode? {
-    var root: TrieNode? = null
-    for ((id, h) in entries) {
-        root = trieInsert(root, id, h)
+    if (entries is TrieEntries) return entries.root
+    if (entries.isEmpty()) return null
+    val ids = entries.keys.toTypedArray()
+    ids.sortWith(UUID_ORDER)
+    val hashes = Array(ids.size) { entries.getValue(ids[it]) }
+    if (ids.size < PARALLEL_BUILD_MIN) return trieBuildSorted(ids, hashes, 0, ids.size, 0)
+    // The top-level subtrees share nothing they write, so where there are threads they are built
+    // at once, as Go builds them on separate goroutines.
+    val runs = ArrayList<IntArray>(16)
+    var start = 0
+    while (start < ids.size) {
+        val nib = nibbleOf(ids[start], 0)
+        var end = start + 1
+        while (end < ids.size && nibbleOf(ids[end], 0) == nib) end++
+        runs += intArrayOf(nib, start, end)
+        start = end
     }
-    return root
+    val subtrees = runEach(runs.size) { trieBuildSorted(ids, hashes, runs[it][1], runs[it][2], 1) }
+    val children = arrayOfNulls<TrieNode>(16)
+    for ((k, run) in runs.withIndex()) children[run[0]] = subtrees[k]
+    return TrieNode(hash = internalHash(children), children = children)
+}
+
+// Below this, splitting the build costs more than it saves (Go's threshold too).
+private const val PARALLEL_BUILD_MIN = 4096
+
+private val UUID_ORDER =
+    Comparator<KdbUuid> { a, b ->
+        val c = a.msb.toULong().compareTo(b.msb.toULong())
+        if (c != 0) c else a.lsb.toULong().compareTo(b.lsb.toULong())
+    }
+
+/**
+ * The subtree at [depth] over ids[from, to), which are sorted and share their first [depth]
+ * nibbles. One entry is a leaf standing for the whole subtree; more is an internal node over the
+ * runs sharing the next nibble - a run of all of them included, the single-child chain an insert's
+ * split builds.
+ */
+private fun trieBuildSorted(
+    ids: Array<KdbUuid>,
+    hashes: Array<KdbHash>,
+    from: Int,
+    to: Int,
+    depth: Int,
+): TrieNode {
+    if (to - from == 1 || depth == TRIE_DEPTH) {
+        val id = ids[to - 1]
+        return newLeafNode(uuidBytes(id), id, hashes[to - 1], depth)
+    }
+    val children = arrayOfNulls<TrieNode>(16)
+    var start = from
+    while (start < to) {
+        val nib = nibbleOf(ids[start], depth)
+        var end = start + 1
+        while (end < to && nibbleOf(ids[end], depth) == nib) end++
+        children[nib] = trieBuildSorted(ids, hashes, start, end, depth + 1)
+        start = end
+    }
+    return TrieNode(hash = internalHash(children), children = children)
 }
 
 internal fun trieTreeHash(root: TrieNode?): KdbHash = KdbHash(nodeHash(root))
