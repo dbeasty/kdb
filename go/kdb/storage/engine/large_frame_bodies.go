@@ -26,11 +26,12 @@ import (
 // Correctness never rests on this. Every record is checked against the content hash it is
 // filed under, and a missing record falls back to the location or the scan as before.
 
-// fileBodiesOfLargeCommit files the bodies of a commit's changed versions by value when they add
-// up to the large-commit threshold, and reports whether it did (the caller files locations
-// otherwise). Bodies come from docsByHash, which pins every version until its commit is logged,
+// fileBodiesOfLargeCommit files the records of a commit's changed versions when their bodies add
+// up to the large-commit threshold - by value for every version whose frame holds at least the
+// threshold of other versions' bytes, by location for the rest - and reports whether it did (the
+// caller files locations otherwise). Bodies come from docsByHash, which pins every version until its commit is logged,
 // so all of them are found; one that is not makes the whole commit fall back to locations.
-func (e *ServerEngine) fileBodiesOfLargeCommit(changed []TreeChange) bool {
+func (e *ServerEngine) fileBodiesOfLargeCommit(changed []TreeChange, segmentSeq, frameOffset int64) bool {
 	threshold := e.config.ResolvedLargeCommitBodyBytes()
 	if threshold <= 0 || e.memTable == nil || e.HistoryStrategy() != storage.HistoryStrategyObjects {
 		return false
@@ -48,10 +49,19 @@ func (e *ServerEngine) fileBodiesOfLargeCommit(changed []TreeChange) bool {
 	if total < threshold {
 		return false
 	}
+	filed := 0
 	for i, c := range changed {
+		// What a read of this version through the frame would decompress besides the version
+		// itself. A commit of one large document costs its reader nothing extra: it keeps its
+		// location, and the log stays its only copy.
+		if total-int64(len(docs[i].JSON)) < threshold {
+			e.putDocumentLocation(c.ContentHash, segmentSeq, frameOffset)
+			continue
+		}
 		e.memTable.Put(c.ContentHash, []byte(docs[i].JSON))
+		filed++
 	}
-	e.largeCommitBodies.Add(int64(len(changed)))
+	e.largeCommitBodies.Add(int64(filed))
 	return true
 }
 
@@ -76,6 +86,14 @@ func (e *ServerEngine) documentFromLargeFrame(docID codec.UUID, contentHash code
 	err := pr.ReadPayloadAt(storage.DeltaSegmentRef{NamespaceID: dr.namespaceID, SequenceNumber: segmentSeq}, frameOffset, func(payload []byte) error {
 		large := int64(len(payload)) >= threshold
 		return document.ScanAllCommitWrites(payload, func(id codec.UUID, patch []byte) bool {
+			if large && int64(len(payload)-len(patch)) < threshold {
+				// One version is most of the frame: reading it through the frame costs about
+				// what it costs by value, so it keeps its location (and its single copy).
+				if id == docID && !found && hasher.HashBytes(id, patch) == contentHash {
+					doc, found = documentFromPatch(docID, string(patch)), true
+				}
+				return true
+			}
 			if !large && (found || id != docID) {
 				// A small frame is read as before: only the version asked for is hashed.
 				return !found

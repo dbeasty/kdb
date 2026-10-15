@@ -67,6 +67,11 @@ func classifyError(err error) (wire.ErrorCode, *int) {
 		// as much next time.
 		return wire.ErrorCodeResourceExhausted, nil
 	}
+	var retained *sql.RetainedLimitError
+	if errors.As(err, &retained) {
+		// The query held more than one query may: the same query holds as much next time.
+		return wire.ErrorCodeResourceExhausted, nil
+	}
 	var tooLarge *ReplyTooLargeError
 	if errors.As(err, &tooLarge) {
 		return wire.ErrorCodeResourceExhausted, nil

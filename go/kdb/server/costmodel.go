@@ -267,6 +267,13 @@ type ScanEstimateInput struct {
 	MaxRows int
 	// RowBudget is the current admission row budget (rows-examined bound); 0 = unbounded.
 	RowBudget int
+	// PageSize is the rows a paged request returns per page; 0 = unpaged. A streaming query
+	// holds one page.
+	PageSize int
+	// Candidates is how many documents the query's index access path yields
+	// (sql.CandidateEstimator), or -1 when unknown (a full scan). No plan holds more documents
+	// than its candidates, whatever the namespace's size.
+	Candidates int
 }
 
 // EstimateScan sizes a SELECT before it runs: learned cell when reliable, structural otherwise.
@@ -303,7 +310,14 @@ func (m *CostModel) structuralScanLocked(in ScanEstimateInput) int64 {
 		docBytes = int64(r.quantile(0.95))
 	}
 
+	if in.Shape.CountOnly {
+		// Counted, never held (sql.Executor.tryCountOnly).
+		return m.base[ClassScan]
+	}
 	rows := int64(in.TreeSize)
+	if in.Candidates >= 0 && int64(in.Candidates) < rows {
+		rows = int64(in.Candidates)
+	}
 	if in.Shape.HasOrderBy || in.Shape.HasAggregate {
 		if in.RowBudget > 0 && int64(in.RowBudget) < rows {
 			rows = int64(in.RowBudget)
@@ -312,6 +326,9 @@ func (m *CostModel) structuralScanLocked(in ScanEstimateInput) int64 {
 		bound := int64(in.MaxRows)
 		if in.Shape.Limit > 0 && int64(in.Shape.Limit) < bound {
 			bound = int64(in.Shape.Limit)
+		}
+		if in.PageSize > 0 && int64(in.PageSize)+1 < bound {
+			bound = int64(in.PageSize) + 1
 		}
 		if bound > 0 && bound < rows {
 			rows = bound

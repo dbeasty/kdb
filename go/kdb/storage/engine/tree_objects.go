@@ -795,7 +795,7 @@ func (e *ServerEngine) RecordCommitLocation(treeHash codec.Hash, segmentSeq, fra
 	if !ok {
 		return
 	}
-	if e.fileBodiesOfLargeCommit(changed) {
+	if e.fileBodiesOfLargeCommit(changed, segmentSeq, frameOffset) {
 		return
 	}
 	for _, c := range changed {

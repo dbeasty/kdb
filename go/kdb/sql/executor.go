@@ -72,7 +72,25 @@ func (e *Executor) executeSelect(query SelectQuery, plan PhysicalPlan, residual 
 	offset := query.Offset
 
 	grouped := isGroupedQuery(query)
-	pushLimit := !grouped && len(query.OrderBy) == 0 && !query.Distinct
+	// ORDER BY kdb_id (ascending) is the order a keyset scan already produces: read the rows in
+	// id order, starting past any `kdb_id > 'x'` bound, and stop at the LIMIT, instead of
+	// materializing every candidate to sort it. This is the shape of a client paging a filtered
+	// read by its last id (WHERE ... AND kdb_id > ? ORDER BY kdb_id LIMIT n).
+	ctxIn, keysetIn := ctx, ctx.keyset
+	idOrder := !grouped && !query.Distinct && !ctx.noIDOrder && isKdbIDOrder(query.OrderBy, env)
+	if idOrder && !ctx.keyset {
+		if _, ok := e.Storage.(storage.OrderedScanner); ok {
+			ctx.keyset = true
+		} else {
+			idOrder = false
+		}
+	}
+	if ctx.keyset {
+		if lo := kdbIDLowerBound(query.Where, env); lo != nil && (ctx.scanAfter == nil || bytes.Compare(lo.Bytes(), ctx.scanAfter.Bytes()) > 0) {
+			ctx.scanAfter = lo
+		}
+	}
+	pushLimit := !grouped && (len(query.OrderBy) == 0 || idOrder) && !query.Distinct
 	// How many ids a full scan needs before it may stop. Only a query with nothing to filter
 	// afterwards and nothing that needs every row can stop early; everything else must see the
 	// whole namespace, because the residual WHERE runs after id resolution. Stopping a scan at
@@ -82,7 +100,11 @@ func (e *Executor) executeSelect(query SelectQuery, plan PhysicalPlan, residual 
 	// A keyset page's scan applies the residual itself and keeps only matching documents in id
 	// order, so it can stop at the page however selective the WHERE is - except when the scan
 	// hands back bare ids (scanIDsOnly) and the residual runs afterwards.
-	if pushLimit && (residual == nil || (ctx.keyset && !e.scanIDsOnly)) {
+	//
+	// The same holds for any scan or id list that applies the residual as it reads and yields
+	// rows in the order they are returned: the first `want` matches are the answer, so reading on
+	// past them only burned I/O (a page of 200 over a user's 8,000 tasks read all 8,000).
+	if pushLimit && (residual == nil || !e.scanIDsOnly) {
 		// Rows wanted: the LIMIT, but never more than one past the result bound (so an
 		// overflow is detectable without reading the rest of the namespace), after skipping
 		// OFFSET rows.
@@ -102,6 +124,12 @@ func (e *Executor) executeSelect(query SelectQuery, plan PhysicalPlan, residual 
 	}
 	src, err := e.chooseAccessPath(query.Where, query.OrderBy, env, ctx, stopAt, residual)
 	if err != nil {
+		if idOrder && !keysetIn && errors.Is(err, storage.ErrOrderedScanUnsupported) {
+			// The adapter under this namespace cannot scan in order after all: sort instead.
+			retry := ctxIn
+			retry.noIDOrder = true
+			return e.executeSelect(query, plan, residual, retry)
+		}
 		return QueryResult{}, err
 	}
 	label := src.label
@@ -124,7 +152,7 @@ func (e *Executor) executeSelect(query SelectQuery, plan PhysicalPlan, residual 
 			ids = applyLimitOffset(ids, limit, offset)
 			limited = true
 		}
-		docs, err = e.materialize(ids, residual, env, ctx)
+		docs, err = e.materializeUpTo(ids, residual, env, ctx, stopAt)
 		if err != nil {
 			return QueryResult{}, err
 		}
@@ -140,7 +168,7 @@ func (e *Executor) executeSelect(query SelectQuery, plan PhysicalPlan, residual 
 		rows = e.plainRows(query, env, docs)
 	}
 	var rowDocIDs []codec.UUID
-	if ctx.keyset && !grouped && len(query.OrderBy) == 0 && !query.Distinct {
+	if ctx.keyset && !grouped && (len(query.OrderBy) == 0 || idOrder) && !query.Distinct {
 		rowDocIDs = make([]codec.UUID, len(docs))
 		for i, d := range docs {
 			rowDocIDs[i] = d.doc.ID
@@ -159,6 +187,9 @@ func (e *Executor) executeSelect(query SelectQuery, plan PhysicalPlan, residual 
 	}
 	for _, r := range rows {
 		ctx.Stats.addRetained(rowBytes(r))
+	}
+	if err := ctx.overRetainedLimit(); err != nil {
+		return QueryResult{}, err
 	}
 	if rows == nil {
 		rows = []QueryRow{}
@@ -251,7 +282,8 @@ func (e *Executor) keysetEligible(query SelectQuery, page PageRequest) bool {
 	if page.OffsetOnly || (page.Offset > 0 && page.After == nil) {
 		return false
 	}
-	if len(query.OrderBy) > 0 || query.Distinct || isGroupedQuery(query) || query.Offset > 0 {
+	ordered := len(query.OrderBy) > 0 && !isKdbIDOrder(query.OrderBy, newEvalEnv(schema.KdbSchema{}, nil, query.From))
+	if ordered || query.Distinct || isGroupedQuery(query) || query.Offset > 0 {
 		return false
 	}
 	_, ok := e.Storage.(storage.OrderedScanner)
@@ -723,6 +755,9 @@ func (e *Executor) executeSingleRowSelect(query SelectQuery, ctx QueryContext) (
 	rows = applyLimitOffset(rows, limit, query.Offset)
 	for _, r := range rows {
 		ctx.Stats.addRetained(rowBytes(r))
+	}
+	if err := ctx.overRetainedLimit(); err != nil {
+		return QueryResult{}, err
 	}
 	return QueryResult{Columns: columnsFor(query, ctx.Schema), Rows: rows}, nil
 }
@@ -1251,6 +1286,13 @@ func flipOp(op BinaryOp) BinaryOp {
 // materialize fetches each id once and keeps the documents the residual accepts. Every fetch
 // counts toward DocsRead; rows examined and the row budget apply to residual evaluation.
 func (e *Executor) materialize(ids []codec.UUID, residual Expr, env *evalEnv, ctx QueryContext) ([]*evalDoc, error) {
+	return e.materializeUpTo(ids, residual, env, ctx, 0)
+}
+
+// materializeUpTo is materialize that stops once it holds stopAt accepted documents (0: never) -
+// for ids already in the order the rows are returned in, where the first stopAt matches are the
+// whole answer.
+func (e *Executor) materializeUpTo(ids []codec.UUID, residual Expr, env *evalEnv, ctx QueryContext, stopAt int) ([]*evalDoc, error) {
 	atCommit, err := e.atCommit(ctx)
 	if err != nil {
 		return nil, err
@@ -1281,9 +1323,65 @@ func (e *Executor) materialize(ids []codec.UUID, residual Expr, env *evalEnv, ct
 			continue
 		}
 		ctx.Stats.addRetained(int64(len(doc.JSON)) + retainedRowOverheadBytes)
+		if err := ctx.overRetainedLimit(); err != nil {
+			return nil, err
+		}
 		out = append(out, ed)
+		if stopAt > 0 && len(out) >= stopAt {
+			break
+		}
 	}
 	return out, nil
+}
+
+// isKdbIDOrder reports an ORDER BY that is exactly `kdb_id` ascending.
+func isKdbIDOrder(order []OrderItem, env *evalEnv) bool {
+	if len(order) != 1 || !order[0].Ascending {
+		return false
+	}
+	col, ok := order[0].Expr.(ExprColumnRef)
+	return ok && env.columnName(col.Name) == colKdbID
+}
+
+// kdbIDLowerBound is the tightest `kdb_id > '<uuid>'` among where's top-level conjuncts, as the
+// id a keyset scan may start after - or nil. Only a bound written as the id's canonical text
+// qualifies: kdb_id compares as a string, and canonical UUID text sorts exactly as the id's
+// bytes do, so skipping ids at or below it skips only rows the predicate would reject. Anything
+// else (>=, an empty string, upper case, not a UUID) is left to the residual WHERE.
+func kdbIDLowerBound(where Expr, env *evalEnv) *codec.UUID {
+	var best *codec.UUID
+	for _, c := range conjuncts(where) {
+		b, ok := c.(ExprBinary)
+		if !ok {
+			continue
+		}
+		col, other, op := b.Left, b.Right, b.Op
+		if _, isCol := col.(ExprColumnRef); !isCol {
+			col, other, op = b.Right, b.Left, flipOp(b.Op)
+		}
+		ref, isCol := col.(ExprColumnRef)
+		if !isCol || op != BinaryOpGT || env.columnName(ref.Name) != colKdbID {
+			continue
+		}
+		switch other.(type) {
+		case ExprLiteral, ExprParameter:
+		default:
+			continue
+		}
+		str, ok := env.cell(other, newEvalDoc(emptyDoc)).(CellString)
+		if !ok {
+			continue
+		}
+		id, err := codec.ParseUUID(str.Value)
+		if err != nil || id.String() != str.Value {
+			continue
+		}
+		if best == nil || bytes.Compare(id.Bytes(), best.Bytes()) > 0 {
+			idCopy := id
+			best = &idCopy
+		}
+	}
+	return best
 }
 
 // matchingDocs resolves and materializes every document a WHERE clause accepts, using the
@@ -1367,6 +1465,9 @@ func (e *Executor) fullScan(ctx QueryContext, stopAt int, residual Expr, env *ev
 				continue
 			}
 			ctx.Stats.addRetained(int64(len(d.JSON)) + retainedRowOverheadBytes)
+			if err := ctx.overRetainedLimit(); err != nil {
+				return err
+			}
 			docs = append(docs, ed)
 			if stopAt > 0 && len(docs) >= stopAt {
 				// Stop the scan outright rather than merely stopping appending: a query that

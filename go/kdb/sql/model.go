@@ -412,8 +412,17 @@ type QueryContext struct {
 	// document id.
 	keyset    bool
 	scanAfter *codec.UUID
+	// noIDOrder turns off serving ORDER BY kdb_id as a keyset scan, for the retry after an
+	// adapter turned out not to scan in order.
+	noIDOrder bool
+
 	// attach is the query's attachment table access, set by ExecuteSelect (attachments.go).
 	attach *attachEnv
+	// RetainedLimit bounds the bytes a query may hold while it runs (ExecStats.RetainedBytes:
+	// the documents it keeps and the rows it builds); past it the query fails with a
+	// RetainedLimitError instead of growing until the process runs out of memory. 0: no limit.
+	// Requires Stats.
+	RetainedLimit int64
 }
 
 // PageRequest asks for rows [Offset, Offset+Size) of a SELECT's result, in the order the query

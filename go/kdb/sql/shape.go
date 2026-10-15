@@ -3,6 +3,8 @@ package sql
 import (
 	"fmt"
 	"strings"
+
+	"github.com/limidus/kdb/go/kdb/schema"
 )
 
 // QueryShape is a literal-free structural fingerprint of a SELECT, for admission control's
@@ -28,6 +30,23 @@ type QueryShape struct {
 	Limit int
 	// HasPredicate: a WHERE clause exists, so rows examined can exceed rows retained.
 	HasPredicate bool
+	// CountOnly: every projection is COUNT(*), with no grouping - answered by counting, holding
+	// no documents (Executor.tryCountOnly).
+	CountOnly bool
+}
+
+// isCountOnlyQuery reports a SELECT of nothing but COUNT(*), ungrouped and not DISTINCT.
+func isCountOnlyQuery(q SelectQuery) bool {
+	if q.Distinct || len(q.GroupBy) > 0 || len(q.Projections) == 0 {
+		return false
+	}
+	for _, p := range q.Projections {
+		pe, ok := p.(ProjExpression)
+		if !ok || !isCountStar(pe.Expr) {
+			return false
+		}
+	}
+	return true
 }
 
 // ShapeOfSelect derives the shape of a parsed SELECT.
@@ -37,6 +56,13 @@ func ShapeOfSelect(q SelectQuery) QueryShape {
 		HasAggregate: QueryHasAggregates(q),
 		HasPredicate: q.Where != nil,
 	}
+	// ORDER BY kdb_id is served as an id-ordered scan that stops at the LIMIT (executeSelect):
+	// it streams, so it is sized like an unordered query.
+	if shape.HasOrderBy && !q.Distinct && !isGroupedQuery(q) && isKdbIDOrder(q.OrderBy, newEvalEnv(schema.KdbSchema{}, nil, q.From)) {
+		shape.HasOrderBy = false
+	}
+	// COUNT(*) alone is counted without holding the documents (tryCountOnly).
+	shape.CountOnly = isCountOnlyQuery(q)
 	if q.Limit != nil {
 		shape.Limit = *q.Limit
 	}

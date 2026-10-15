@@ -758,15 +758,28 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 	adm := rt.admission
 	if sel, ok := stmt.(sql.StmtSelect); ok && adm != nil {
 		scanIn = ScanEstimateInput{
-			Namespace: namespaceID,
-			Shape:     sql.ShapeOfSelect(sel.Query),
-			TreeSize:  rt.treeSizeAt(*head),
-			MaxRows:   rt.MaxResultRows(),
-			RowBudget: int(adm.ScanRowBudget()),
+			Namespace:  namespaceID,
+			Shape:      sql.ShapeOfSelect(sel.Query),
+			TreeSize:   rt.treeSizeAt(*head),
+			MaxRows:    rt.MaxResultRows(),
+			RowBudget:  int(adm.ScanRowBudget()),
+			Candidates: -1,
+		}
+		if page != nil {
+			scanIn.PageSize = page.Size
+		}
+		if est, ok := rt.SQLEngine().(sql.CandidateEstimator); ok {
+			scanIn.Candidates = est.EstimateCandidates(sel.Query, sql.QueryContext{
+				NamespaceID: namespaceID, Schema: rt.Schema(), AtCommit: head, Parameters: params,
+			})
 		}
 		estimate = adm.Costs().EstimateScan(scanIn)
+		grantBytes := estimate
+		if max := adm.MaxQueryBytes(); max > 0 && grantBytes > max {
+			grantBytes = max
+		}
 		actx, cancel := context.WithTimeout(context.Background(), readAcquireTimeout)
-		g, err := adm.AcquireBytes(actx, ClassScan, estimate)
+		g, err := adm.AcquireBytes(actx, ClassScan, grantBytes)
 		cancel()
 		if err != nil {
 			return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
@@ -788,6 +801,9 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 		RowBudget: int(rt.admission.ScanRowBudget()),
 		Stats:     stats,
 		Page:      page,
+		// What the query really holds is charged as it runs, and stops it at the most one query
+		// may hold - the grant above is an estimate and may be capped (Admission.MaxQueryBytes).
+		RetainedLimit: rt.admission.MaxQueryBytes(),
 	}
 	result, err := rt.SQLEngine().Execute(msg.SQL, ctx)
 	if err != nil {
