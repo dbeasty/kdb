@@ -100,6 +100,18 @@ func FieldVector(root json.Value, fieldPath string) (vec []float32, present bool
 	return nil, false, nil
 }
 
+// NaturalKeyMapping reports whether KeyFromJSONValue maps values under fieldType exactly as it
+// does with no field type: a string to a StringKey, an integer to an Int64Key, any other number
+// to a Float64Key, a boolean to a BoolKey and null to a NullKey. The SQL ordered top-k relies on
+// it: those keys order among themselves as the SQL comparator orders the values.
+func NaturalKeyMapping(fieldType string) bool {
+	switch strings.ToUpper(fieldType) {
+	case "TIMESTAMP", "UUID", "INT32", "INT64", "FLOAT64":
+		return false
+	}
+	return true
+}
+
 // KeyFromJSONValue converts a scalar JSON value to an index key. fieldType is the schema
 // field's codec type label ("" when unknown) and only refines the natural mapping: a
 // TIMESTAMP string becomes a TimestampKey, an INT32 number an Int32Key, a UUID string a
