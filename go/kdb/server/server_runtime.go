@@ -875,7 +875,15 @@ func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal aut
 	var releaseOnce sync.Once
 	releaseNow := func() { releaseOnce.Do(release) }
 	defer releaseNow()
+	return s.commitAtGateFront(tx, call, releaseNow)
+}
 
+// commitAtGateFront is runTransaction's work at the front of the write gate, which the caller
+// holds: index preparation, the engine call, and - on success - queueing the commit for
+// durability, releasing the gate (releaseNow) as soon as its log position is fixed, then waiting
+// for it to be durable and notifying. Shared with CommitImmediate, whose transaction is only
+// known once it holds the gate.
+func (s *KdbServerRuntime) commitAtGateFront(tx document.Transaction, call func() (transactionResult, error), releaseNow func()) (document.Commit, error) {
 	// Index extraction and validation happen before the commit lands (Component 68): a value
 	// the indexes cannot accept rejects the transaction here, rather than leaving index state
 	// disagreeing with the documents it describes.

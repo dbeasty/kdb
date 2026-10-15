@@ -632,11 +632,59 @@ export class Client implements KdbOperations {
     args: unknown[] = [],
     options: CallOptions = {},
   ): Promise<number> {
+    const result = await this.#execAutoCommit(ns, sql, args, options);
+    return result.rowsAffected;
+  }
+
+  /**
+   * Runs `UPDATE ... [ORDER BY ...] [LIMIT n] RETURNING ...` and returns the rows RETURNING
+   * produced - one per updated document, as it is after the update - with typed cells, as
+   * queryValues types them. It is the atomic queue claim (MongoDB's findOneAndUpdate):
+   *
+   *     UPDATE docs SET status = 'processing', attempts = attempts + 1
+   *      WHERE _c = 'jobs' AND status = 'pending' AND attempts < 3
+   *      ORDER BY createdAt LIMIT 1 RETURNING kdb_id, _doc
+   *
+   * The server selects the documents and commits the update in one step under its write gate, so
+   * concurrent claims never take the same document and never fail with a version conflict because
+   * another claim committed first. No match returns no rows and writes nothing. Any other DML
+   * statement is run and auto-committed as exec runs it, returning no rows.
+   */
+  async execReturning(
+    ns: string,
+    sql: string,
+    args: unknown[] = [],
+    options: CallOptions = {},
+  ): Promise<{ columns: string[]; rows: SqlValue[][]; rowsAffected: number }> {
+    const result = await this.#execAutoCommit(ns, sql, args, options);
+    return {
+      columns: result.columns,
+      rows: typedRows(result.rows, result.cellKinds),
+      rowsAffected: result.rowsAffected,
+    };
+  }
+
+  /** exec and execReturning: one statement, and its commit when the server left one pending. */
+  async #execAutoCommit(
+    ns: string,
+    sql: string,
+    args: unknown[],
+    options: CallOptions,
+  ): Promise<{ columns: string[]; rows: string[][]; cellKinds: string | undefined; rowsAffected: number }> {
     // The sqlExec and its auto-commit are one unit of work on a session that holds a single
     // pending transaction, so nothing else may use that session between them. See SessionLock.
     return this.#sessionLock(ns).exclusive(async () => {
       const result = await this.#execSql(ns, sql, args, options);
-      if (result.readOnly) return result.rowsAffected;
+      if (result.readOnly) {
+        if (result.rowsAffected > 0 && result.resolvedCommitHex) {
+          // A write the server committed on its own (an UPDATE with ORDER BY, LIMIT or
+          // RETURNING): the commit it made is the head this client now knows.
+          const state = await this.#ensureNamespace(ns, options);
+          state.head = result.resolvedCommitHex;
+          this.#namespaces.set(ns, state);
+        }
+        return result;
+      }
 
       // A write statement is not durable until it is committed, and this call is one
       // client-visible unit of work rather than two, so the auto-commit happens here. The
@@ -652,7 +700,7 @@ export class Client implements KdbOperations {
       this.#handleCommitReply(ns, state, reply);
       // The count comes from the statement, not the commit: the commit reports the operations
       // it applied, which is not the number of rows a DELETE matched.
-      return result.rowsAffected;
+      return result;
     });
   }
 
@@ -1215,6 +1263,7 @@ export class Client implements KdbOperations {
     rowsAffected: number;
     continuation: string | undefined;
     cellKinds: string | undefined;
+    resolvedCommitHex: string | undefined;
   }> {
     const state = await this.#ensureNamespace(ns, options);
     const reply = await this.#request(
@@ -1242,6 +1291,7 @@ export class Client implements KdbOperations {
       rowsAffected: result.rowsAffected ?? 0,
       continuation: result.continuation || undefined,
       cellKinds: result.cellKinds || undefined,
+      resolvedCommitHex: result.resolvedCommitHex || undefined,
     };
   }
 

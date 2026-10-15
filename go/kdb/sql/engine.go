@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/storage"
@@ -18,6 +19,42 @@ type Engine interface {
 type IndexDDLExecutor interface {
 	CreateIndex(stmt StmtCreateIndex, ctx QueryContext) error
 	DropIndex(stmt StmtDropIndex, ctx QueryContext) error
+}
+
+// ImmediateUpdater is implemented by every engine NewEngine builds. It is the two halves of an
+// immediate UPDATE (UpdateStatement.Immediate) that the server runs around its write gate: find
+// candidates at a read head before the gate, then decide and build the writes among them at the
+// live head inside it.
+type ImmediateUpdater interface {
+	// UpdateCandidates: see DMLExecutor.UpdateCandidates.
+	UpdateCandidates(upd UpdateStatement, ctx QueryContext, k int) (ids []codec.UUID, complete bool, err error)
+	// ExecuteUpdateAmong: see DMLExecutor.ExecuteUpdateAmong.
+	ExecuteUpdateAmong(upd UpdateStatement, ctx QueryContext, among []codec.UUID) (DMLResult, error)
+}
+
+func (e *defaultEngine) UpdateCandidates(upd UpdateStatement, ctx QueryContext, k int) ([]codec.UUID, bool, error) {
+	if ctx.attach == nil {
+		ctx.attach = e.executor.newAttachEnv(ctx)
+	}
+	ids, complete, err := e.dml.UpdateCandidates(upd, ctx, k)
+	if err == nil {
+		err = ctx.attach.err
+	}
+	return ids, complete, err
+}
+
+func (e *defaultEngine) ExecuteUpdateAmong(upd UpdateStatement, ctx QueryContext, among []codec.UUID) (DMLResult, error) {
+	if ctx.attach == nil {
+		ctx.attach = e.executor.newAttachEnv(ctx)
+	}
+	res, err := e.dml.ExecuteUpdateAmong(upd, ctx, among)
+	if err == nil {
+		err = ctx.attach.err
+	}
+	if err != nil {
+		return DMLResult{}, err
+	}
+	return res, nil
 }
 
 type defaultEngine struct {
@@ -117,7 +154,14 @@ func (e *defaultEngine) ExecuteDML(sqlText string, ctx QueryContext) (DMLResult,
 		}
 		return DMLResult{Operations: ops, RowsAffected: len(ids), GeneratedIDs: ids}, nil
 	case StmtUpdate:
-		ops, err = e.dml.ExecuteUpdate(s.Update, ctx)
+		res, err := e.dml.ExecuteUpdateAmong(s.Update, ctx, nil)
+		if err == nil {
+			err = ctx.attach.err
+		}
+		if err != nil {
+			return DMLResult{}, err
+		}
+		return res, nil
 	case StmtDelete:
 		ops, err = e.dml.ExecuteDelete(s.Delete, ctx)
 	default:

@@ -228,6 +228,24 @@ _, err = tx.Commit(ctx)                          // both namespaces or neither
 
 `BEGIN` / `COMMIT` / `ROLLBACK` sent as SQL text do the same on any wire session.
 
+A work queue claims a job with one statement, the way MongoDB's `findOneAndUpdate` does. An
+`UPDATE` with `ORDER BY`, `LIMIT` or `RETURNING` is not buffered on the session: the server picks
+the documents and commits the update in one step under its write gate, against the live head, so
+concurrent claims never take the same job and never fail with a version conflict because another
+claim committed first. `RETURNING` hands back each updated document as it is after the update; no
+match returns no rows. `SET` values can use `+`, `-`, `*` and `/`.
+
+```go
+cols, rows, err := c.ExecReturning(ctx, "app/docs", `UPDATE docs SET status = 'processing', attempts = attempts + 1
+    WHERE _c = 'jobs' AND status = 'pending' AND attempts < 3
+    ORDER BY createdAt LIMIT 1 RETURNING kdb_id, _doc`, nil)
+// len(rows) == 0: nothing to do. rows[0][0] is the id, rows[0][1] the job (json.RawMessage).
+```
+
+The TypeScript client's `execReturning(ns, sql, args)` returns `{ columns, rows, rowsAffected }`
+the same way. Such a statement commits on its own, so it is refused inside a transaction that has
+already buffered writes, and it acts on the session's own namespace only.
+
 One `kdb-service` listener serves every namespace under its data root: `PutJSON`, `Commit`,
 `Upsert`, leases, SQL, history and search all act on the namespace they name. A write to a
 namespace that does not exist creates it; a read does not.

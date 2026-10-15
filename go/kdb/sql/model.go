@@ -116,6 +116,28 @@ type UpdateStatement struct {
 	Where       Expr
 	// Attachments are the SET list's attachment items (attachments.go).
 	Attachments []AttachmentChange
+	// OrderBy, Limit and Returning are the claim clauses: UPDATE ... [ORDER BY ...] [LIMIT n]
+	// [RETURNING ...]. ORDER BY with LIMIT picks which matching documents are updated; RETURNING
+	// projects each updated document as it is after the update. A statement carrying any of them
+	// is Immediate: the server selects, updates and commits it in one step under its write gate
+	// (the MongoDB findOneAndUpdate a work queue needs), instead of buffering it on the session.
+	OrderBy   []OrderItem
+	Limit     *int
+	Returning []Projection
+}
+
+// Immediate reports an UPDATE that carries ORDER BY, LIMIT or RETURNING - one the server runs
+// as its own atomic, auto-committed statement rather than buffering on the session.
+func (u UpdateStatement) Immediate() bool {
+	return len(u.OrderBy) > 0 || u.Limit != nil || len(u.Returning) > 0
+}
+
+// ImmediateUpdate returns stmt's UPDATE when it is Immediate.
+func ImmediateUpdate(stmt Statement) (UpdateStatement, bool) {
+	if s, ok := stmt.(StmtUpdate); ok && s.Update.Immediate() {
+		return s.Update, true
+	}
+	return UpdateStatement{}, false
 }
 
 // Assignment is one SET target = value pair.
@@ -235,6 +257,16 @@ type ExprBinary struct {
 }
 
 func (ExprBinary) isExpr() {}
+
+// ExprArith is `left + right`, `-`, `*` or `/` over numbers: integer when both sides are
+// integers (division truncates), floating point otherwise, NULL when either side is not a
+// number or a division is by zero. What makes `SET attempts = attempts + 1` work.
+type ExprArith struct {
+	Op          byte // '+', '-', '*' or '/'
+	Left, Right Expr
+}
+
+func (ExprArith) isExpr() {}
 
 type ExprUnary struct {
 	Op   UnaryOp
@@ -510,6 +542,10 @@ type DMLResult struct {
 	Operations   []document.Op
 	RowsAffected int
 	GeneratedIDs []string
+	// Columns and Rows are an UPDATE's RETURNING result: one row per updated document, as it is
+	// after the update. Empty without RETURNING.
+	Columns []ResultColumn
+	Rows    []QueryRow
 }
 
 // QueryRow is one result row.

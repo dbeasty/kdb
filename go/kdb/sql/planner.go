@@ -182,6 +182,11 @@ func rejectColumnRefs(expr Expr) error {
 			return err
 		}
 		return rejectColumnRefs(e.Right)
+	case ExprArith:
+		if err := rejectColumnRefs(e.Left); err != nil {
+			return err
+		}
+		return rejectColumnRefs(e.Right)
 	case ExprUnary:
 		return rejectColumnRefs(e.Expr)
 	case ExprFunctionCall:

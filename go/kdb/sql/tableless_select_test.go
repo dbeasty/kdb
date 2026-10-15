@@ -205,10 +205,10 @@ func TestTablelessSelectRejectsWhatItCannotMean(t *testing.T) {
 		{"SELECT COUNT(*)", "requires a FROM clause"},
 		{"SELECT 1 WHERE name = 'x'", "requires a FROM clause"},
 		{"SELECT 1 ORDER BY name", "requires a FROM clause"},
-		// Not a FROM-clause error: there is no arithmetic operator, so `+ name` is trailing
-		// input the parser cannot account for. It used to be silently dropped, making this
-		// statement quietly mean `SELECT 1`.
-		{"SELECT 1 + name", "unexpected trailing input"},
+		// Arithmetic parses now (UPDATE ... SET n = n + 1), so this is a FROM-clause error. Before
+		// that it was trailing input; it used to be silently dropped, making this statement
+		// quietly mean `SELECT 1`.
+		{"SELECT 1 + name", "requires a FROM clause"},
 	}
 
 	for _, tc := range cases {
