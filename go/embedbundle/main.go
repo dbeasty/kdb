@@ -94,6 +94,10 @@ func run() error {
 		return err
 	}
 	fmt.Printf("closure: %d packages\n", len(pkgs))
+	pkgs, err = addTestSupport(moduleDir, modulePath, pkgs)
+	if err != nil {
+		return err
+	}
 
 	bundleName := fmt.Sprintf("kdb-go-embed-%s", *version)
 	stageRoot := filepath.Join(*out, bundleName)
@@ -204,6 +208,96 @@ func closure(moduleDir, modulePath string, entryPoints []string) ([]string, erro
 	}
 	sort.Strings(pkgs)
 	return pkgs, nil
+}
+
+// addTestSupport adds the test-only helper packages (such as kdb/internal/testtime) that the
+// closure's tests import, when such a package needs nothing outside the closure itself. Without
+// it every test file importing one is skipped, and the tests in the same package that use that
+// file's helpers no longer compile, which fails the bundle's own `go vet` / `go test`.
+// It repeats until no package is added, so a helper importing another helper comes along too.
+func addTestSupport(moduleDir, modulePath string, pkgs []string) ([]string, error) {
+	inClosure := make(map[string]bool, len(pkgs))
+	for _, p := range pkgs {
+		inClosure[p] = true
+	}
+	rejected := map[string]bool{}
+	for {
+		candidates, err := outOfClosureTestImports(moduleDir, modulePath, pkgs, inClosure)
+		if err != nil {
+			return nil, err
+		}
+		added := false
+		for _, c := range candidates {
+			if rejected[c] {
+				continue
+			}
+			deps, err := goOutput(moduleDir, "list", "-deps", c)
+			if err != nil {
+				return nil, fmt.Errorf("go list -deps %s: %w", c, err)
+			}
+			selfContained := true
+			for _, d := range strings.Fields(deps) {
+				if d != c && (d == modulePath || strings.HasPrefix(d, modulePath+"/")) && !inClosure[d] {
+					selfContained = false
+					break
+				}
+			}
+			if !selfContained {
+				rejected[c] = true
+				continue
+			}
+			fmt.Printf("adding test-support package %s: imported by closure tests, needs nothing outside it\n", c)
+			inClosure[c] = true
+			pkgs = append(pkgs, c)
+			added = true
+		}
+		if !added {
+			sort.Strings(pkgs)
+			return pkgs, nil
+		}
+	}
+}
+
+// outOfClosureTestImports lists, sorted, the modulePath packages outside the closure that the
+// closure packages' _test.go files import.
+func outOfClosureTestImports(moduleDir, modulePath string, pkgs []string, inClosure map[string]bool) ([]string, error) {
+	set := map[string]bool{}
+	for _, pkg := range pkgs {
+		rel := strings.TrimPrefix(strings.TrimPrefix(pkg, modulePath), "/")
+		if rel == "" {
+			continue
+		}
+		dir := filepath.Join(moduleDir, filepath.FromSlash(rel))
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), "_test.go") {
+				continue
+			}
+			path := filepath.Join(dir, e.Name())
+			f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
+			if err != nil {
+				return nil, fmt.Errorf("parsing imports of %s: %w", path, err)
+			}
+			for _, imp := range f.Imports {
+				p, err := strconv.Unquote(imp.Path.Value)
+				if err != nil {
+					return nil, fmt.Errorf("%s: bad import literal %s: %w", path, imp.Path.Value, err)
+				}
+				if (p == modulePath || strings.HasPrefix(p, modulePath+"/")) && !inClosure[p] {
+					set[p] = true
+				}
+			}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for p := range set {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 func wrapStderr(err error) error {
