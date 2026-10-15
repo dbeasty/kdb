@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // NewRegistryAuthEngine returns an Engine backed by store instead of a fixed set of credentials
@@ -29,6 +30,20 @@ func (e *registryAuthEngine) Authorizer() Authorizer {
 type registryAuthenticator struct{ store *RegistryAuthStore }
 
 func (a registryAuthenticator) Authenticate(_ context.Context, creds Credentials) (Principal, error) {
+	// A revocable access token (tokens.go), presented as the bearer token or as the password.
+	for _, t := range []*string{creds.Token, creds.Password} {
+		if t != nil && IsAccessToken(*t) {
+			_, record, err := a.store.verifyToken(*t, time.Now())
+			if err != nil {
+				return Principal{}, err
+			}
+			roles := make(map[string]struct{}, len(record.Roles))
+			for _, r := range record.Roles {
+				roles[r] = struct{}{}
+			}
+			return Principal{ID: record.ID, Roles: roles}, nil
+		}
+	}
 	user, password, err := resolveUserAndSecret(creds)
 	if err != nil {
 		return Principal{}, err

@@ -3,6 +3,7 @@ package service
 import (
 	"encoding/json"
 	"log/slog"
+	"net"
 	"strings"
 	"time"
 
@@ -57,4 +58,18 @@ func namespaceMatchesAny(list, ns string) bool {
 		}
 	}
 	return false
+}
+
+// isLoopbackAddr reports whether a host:port listen address binds only the loopback interface.
+// An empty host (":7702") binds every interface, so it is not loopback.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

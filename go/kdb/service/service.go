@@ -50,6 +50,10 @@ func Main() {
 	if len(os.Args) > 1 && os.Args[1] == "user" {
 		os.Exit(runUserCommand(os.Args[2:]))
 	}
+	if len(os.Args) > 2 && os.Args[1] == "token" {
+		// kdb-service token create|revoke|list: the same registry, through runUserCommand.
+		os.Exit(runUserCommand(append([]string{"token-" + os.Args[2]}, os.Args[3:]...)))
+	}
 
 	fs := flag.NewFlagSet("kdb-service", flag.ExitOnError)
 	flagVals := config.DefaultServiceSettings()
@@ -73,6 +77,8 @@ func Main() {
 	var expireField string
 	var expireGrace, expireInterval time.Duration
 	fs.StringVar(&expireField, "expire-field", "", "document expiry (kdb-spec-layer16 §9.5): the top-level field (or dotted path) holding each document's expiry timestamp as an RFC 3339 string or epoch milliseconds. Documents whose timestamp has passed are hidden from reads at head and deleted by a periodic sweep; empty (default) disables expiry")
+	var controlOpen bool
+	fs.BoolVar(&controlOpen, "control-open", false, "serve --control-addr on a non-loopback address without --rbac. Without --rbac the control plane cannot tell one caller from another, so by default it refuses to start anywhere but loopback")
 	var expireNamespaces string
 	fs.StringVar(&expireNamespaces, "expire-namespaces", "", "comma-separated namespaces or patterns (peersync syntax, e.g. qtask/*) that also get the --expire-field policy when they are opened on demand. Empty (default): expiry applies to --namespace alone, since it deletes data")
 	fs.DurationVar(&expireGrace, "expire-grace", 0, "how long a document stays readable past its --expire-field timestamp before it counts as expired")
@@ -118,7 +124,7 @@ func Main() {
 	fs.IntVar(&flagVals.AttachmentDeltaStepMB, "attachment-delta-step-mb", flagVals.AttachmentDeltaStepMB, "how many MiB one maintenance pass reads diffing replaced attachment versions into deltas; a larger version is diffed over several passes (0: 4096)")
 	fs.BoolVar(&flagVals.AttachmentDeltas, "attachment-deltas", flagVals.AttachmentDeltas, "re-store a replaced attachment version as a delta against its successor when that saves space; false keeps every version as the original file, whole, and maintenance turns deltas already stored back into whole files")
 	fs.IntVar(&flagVals.MaintenanceMaxDefer, "maintenance-max-defer", flagVals.MaintenanceMaxDefer, "how many consecutive ticks write load may postpone a due maintenance pass before it runs anyway; -1 never forces one through, which risks a busy server never reclaiming")
-	fs.StringVar(&flagVals.ControlAddr, "control-addr", flagVals.ControlAddr, "control-plane HTTP listen address (host:port) serving the JSON control API and, unless --control-ui=false, the embedded control UI: namespaces, commit history, per-commit diffs, schema, and the resolved configuration with provenance. Unlike --admin-addr it authenticates every request against the same auth engine the wire listeners use - but that engine is still the static \"user:pass\" bearer until real tokens land, so bind this privately (empty to disable)")
+	fs.StringVar(&flagVals.ControlAddr, "control-addr", flagVals.ControlAddr, "control-plane HTTP listen address (host:port) serving the JSON control API and, unless --control-ui=false, the embedded control UI: namespaces, commit history, per-commit diffs, schema, and the resolved configuration with provenance. Unlike --admin-addr it authenticates every request against the same auth engine the wire listeners use; without --rbac that engine accepts any credentials, so a non-loopback address is refused unless --control-open (empty to disable). With --rbac, issue clients revocable access tokens: kdb-service token create")
 	fs.BoolVar(&flagVals.ControlWrite, "control-write", flagVals.ControlWrite, "allow the control plane's mutating endpoints. Off by default: turning the control plane on is not, by itself, a decision to let a browser write to the database. Nothing mutating is implemented yet, so today this only decides whether such a request is refused as forbidden or reported as not-yet-built")
 	fs.BoolVar(&flagVals.ControlUI, "control-ui", flagVals.ControlUI, "serve the embedded single-page control UI on --control-addr; false leaves the JSON API alone on that listener")
 	fs.StringVar(&flagVals.ControlBackupDir, "control-backup-dir", flagVals.ControlBackupDir, "directory the control plane writes backups to (empty disables backups through it). Keep it off the data volume: a backup that shares a disk with the thing it is backing up is not a backup")
@@ -641,6 +647,12 @@ func Main() {
 
 	var controlSrv *control.Server
 	controlStatus := "disabled"
+	if controlAddr != "" && !rbac && !controlOpen && !isLoopbackAddr(controlAddr) {
+		fmt.Fprintf(os.Stderr, "Error: --control-addr %s is not a loopback address and --rbac is off, so the control plane "+
+			"would accept any credentials from the network. Bind it to 127.0.0.1, enable --rbac (and use access tokens), "+
+			"or pass --control-open to accept that knowingly\n", controlAddr)
+		os.Exit(2)
+	}
 	if controlAddr != "" {
 		// Every other namespace already under this data root, opened read-through for the control
 		// plane. Discovery rather than configuration: an operator opening the UI wants to see what
