@@ -59,7 +59,10 @@ jobs:
           go-version-file: go/go.mod
           cache-dependency-path: go/go.sum
       - name: Go tests (race)
-        run: cd go && go test -race ./...
+        # The nightly's full race run (e2e-nightly.yml go-race-full) uses the same limit: under -race
+        # on a GitHub runner, embed and integration take past Go's default 10m per package, which
+        # killed v0.8.0's first release run before it built anything.
+        run: cd go && go test -race -timeout 45m ./...
       - name: Go vet + gofmt
         run: cd go && go vet ./... && test -z "$(gofmt -l .)"
 
