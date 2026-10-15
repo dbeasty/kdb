@@ -12,21 +12,31 @@ import dev.kdb.codec.toUuidVal
 /**
  * Materialised doc id → content hash map at a commit.
  *
- * trieRoot is intentionally a body property, not a primary-constructor
- * one: it backs incremental with/without updates (O(delta) via
- * DocumentTreeTrie.kt instead of O(entries.size)) but must NOT affect
- * this data class's generated equals/hashCode/copy/toString, which
- * existing code relies on comparing by treeHash/entries alone. Trees
- * built via build() from a flat map (e.g. wire decode) don't carry a
- * trieRoot - with/without fall back to a one-time O(n) trieBuild in that
- * case, then are incremental from then on. Always correct either way;
- * only the constant differs.
+ * [with] and [without] are O(delta): both the tree hash and [entries] come from one persistent
+ * trie (DocumentTreeTrie.kt) that shares every untouched subtree with the previous version.
+ * [entries] is a read-only [Map] view over that trie rather than a copied map - copying was
+ * O(entries.size) per insert, which made every committed put cost the size of its namespace.
+ * Lookups walk the trie (a few levels; leaves are compressed), iteration is in UUID order, and
+ * the view compares equal to any [Map] with the same contents, so this data class's
+ * equals/hashCode/copy/toString are unchanged.
+ *
+ * A tree constructed directly from some other map (the primary constructor, or copy) builds its
+ * trie once, O(n), on its first with/without; everything derived from it is incremental.
  */
 public data class DocumentTree(
     public val treeHash: KdbHash,
     public val entries: Map<KdbUuid, KdbHash>,
 ) {
-    internal var trieRoot: TrieNode? = null
+    // UNBUILT until a tree over a foreign map first needs its trie; a trie view carries its own.
+    private var builtRoot: Any? = UNBUILT
+
+    internal val trieRoot: TrieNode?
+        get() {
+            if (entries is TrieEntries) return entries.root
+            val cached = builtRoot
+            if (cached !== UNBUILT) return cached as TrieNode?
+            return trieBuild(entries).also { builtRoot = it }
+        }
 
     public val size: Int get() = entries.size
 
@@ -59,36 +69,37 @@ public data class DocumentTree(
         docId: KdbUuid,
         contentHash: KdbHash,
     ): DocumentTree {
-        val root = trieInsert(trieRootOrBuild(), docId, contentHash)
-        val newEntries = entries + (docId to contentHash)
-        return DocumentTree(trieTreeHash(root), newEntries).also { it.trieRoot = root }
+        val old = trieRoot
+        val existing = trieGet(old, docId)
+        if (existing == contentHash) return this
+        val root = trieInsert(old, docId, contentHash)
+        return DocumentTree(trieTreeHash(root), TrieEntries(root, if (existing == null) size + 1 else size))
     }
 
     public fun without(docId: KdbUuid): DocumentTree {
-        val root = trieDelete(trieRootOrBuild(), docId)
-        val newEntries = entries - docId
-        return DocumentTree(trieTreeHash(root), newEntries).also { it.trieRoot = root }
-    }
-
-    private fun trieRootOrBuild(): TrieNode? {
-        val cached = trieRoot
-        if (cached != null || entries.isEmpty()) return cached
-        return trieBuild(entries)
+        val old = trieRoot
+        if (trieGet(old, docId) == null) return this
+        val root = trieDelete(old, docId)
+        return DocumentTree(trieTreeHash(root), TrieEntries(root, size - 1))
     }
 
     public companion object {
+        // Ahead of EMPTY: constructing EMPTY reads it.
+        private val UNBUILT = Any()
+
         public val EMPTY: DocumentTree = build(emptyMap())
 
         /**
          * Builds a tree with content-addressed tree hash from a flat map,
          * building a full trie from scratch (O(n) - see trieBuild). Used
          * for trees not derived incrementally via with/without (e.g. wire
-         * decode); the result still carries a trieRoot, so any subsequent
-         * with/without on it is O(delta).
+         * decode). The result's entries are the trie view, not [entries]
+         * itself: the map is not retained, so later changes to it do not
+         * show through, and any subsequent with/without is O(delta).
          */
         public fun build(entries: Map<KdbUuid, KdbHash>): DocumentTree {
             val root = trieBuild(entries)
-            return DocumentTree(trieTreeHash(root), entries).also { it.trieRoot = root }
+            return DocumentTree(trieTreeHash(root), TrieEntries(root, entries.size))
         }
 
         public fun fromKdbValue(value: KdbValue): DocumentTree {
@@ -106,6 +117,55 @@ public data class DocumentTree(
             }
             return build(m)
         }
+    }
+}
+
+/**
+ * [DocumentTree.entries]: a read-only map over a trie, O(1) to make from the trie it views. The
+ * root hash names the contents, so two views compare in O(1); against any other map, AbstractMap's
+ * entry-by-entry comparison applies.
+ */
+internal class TrieEntries(
+    val root: TrieNode?,
+    override val size: Int,
+) : AbstractMap<KdbUuid, KdbHash>() {
+    // 0 doubles as "not computed": one field, so a racing reader at worst computes it again.
+    private var hash = 0
+
+    override fun get(key: KdbUuid): KdbHash? = trieGet(root, key)
+
+    override fun containsKey(key: KdbUuid): Boolean = trieGet(root, key) != null
+
+    override fun isEmpty(): Boolean = root == null
+
+    override val entries: Set<Map.Entry<KdbUuid, KdbHash>>
+        get() = object : AbstractSet<Map.Entry<KdbUuid, KdbHash>>() {
+            override val size: Int get() = this@TrieEntries.size
+
+            override fun iterator(): Iterator<Map.Entry<KdbUuid, KdbHash>> = TrieLeafIterator(root)
+
+            override fun contains(element: Map.Entry<KdbUuid, KdbHash>): Boolean = trieGet(root, element.key) == element.value
+        }
+
+    override fun equals(other: Any?): Boolean {
+        if (other is TrieEntries) {
+            return size == other.size && (root?.hash ?: EMPTY_HASH).contentEquals(other.root?.hash ?: EMPTY_HASH)
+        }
+        return super.equals(other)
+    }
+
+    override fun hashCode(): Int {
+        // Map's contract fixes this to the sum over every entry, O(n); immutable, so pay it once.
+        var h = hash
+        if (h == 0) {
+            h = super.hashCode()
+            hash = h
+        }
+        return h
+    }
+
+    private companion object {
+        val EMPTY_HASH = ByteArray(0)
     }
 }
 
