@@ -13,6 +13,7 @@ Run workflow). Nothing was dropped: what a PR skips, the nightly runs.
 | Kotlin | `kotlin-test (jvm / js / native)`: `build`'s tasks per target, Gradle build cache | `kotlin-build`: plain `./gradlew build` |
 | kill -9 | 1 iteration (`TestServerKill9…`), `TestIndexSnapshotsSurviveKill9` skipped | 3 iterations in `go-race-full`, plus the 150/60-iteration `kill9-soak` |
 | Go↔Kotlin interop | one case (`TestKotlinPutThenGoGet_InteropDelta`), plus `go-interop` and `e2e-interop` | every `TestKotlin*` in `kdb/integration`, Linux and Windows |
+| Go source bundle | `bundle-check`: built, then build/vet/cross-compile standalone | (full `go test` of it runs in `release.yml` only) |
 | pytest e2e | `e2e (1..3)`: the default selection dealt over three jobs | `e2e-slow`, `e2e-upgrade` |
 
 ## The `-short` convention
@@ -54,6 +55,14 @@ Kotlin, per target as the PR jobs run it, or whole as the nightly does:
 ./gradlew jsTest jsJar jsBrowserDistribution --build-cache --parallel
 ./gradlew linuxX64Test --build-cache --parallel
 ./gradlew build
+```
+
+The embeddable source bundle, built and compiled standalone (`bundle-check`; tests vetted, not
+run), or with its tests run as the release does:
+
+```bash
+make bundle-check
+make bundle-verify
 ```
 
 One e2e shard (from `kdb-integration/e2e`, after `make build-go`):
