@@ -308,23 +308,33 @@ in the next release's notes, which say which earlier known issue it closes.
 
 **Publishing `@limidus/kdb-client` to npm** uses npm trusted publishing: the `npm-client` job
 proves it is this repository's `release.yml` with its OIDC token, so no npm token is stored
-anywhere, and npm attaches provenance on its own. Until the package's first version exists on the
-registry the step only warns and skips. One-time setup, in this order:
+anywhere, and npm attaches provenance on its own. The job installs npm 11.5.1 or later, which
+trusted publishing needs, because Node 22 ships npm 10. Every tag publishes from CI; nobody
+publishes by hand.
 
-1. The `@limidus` scope is the npm organization `limidus`. The previous name, `@kdb/client`, could
-   not be published: the npm name `kdb` belongs to someone else.
-2. Publish the first version by hand, with an npm account that is a member of `limidus`
-   (`npm login` asks for its two-factor code), from a checkout whose `packages/kdb-client` already
-   carries the `@limidus` name and the released server's version - for the first one, `main` right
-   after the rename merged (0.9.0; the `v0.9.0` tag itself still says `@kdb/client`):
-   `cd packages/kdb-client && npm ci && npm run build && npm publish --access public`.
-3. On npmjs.com, open `@limidus/kdb-client` → **Settings** → **Trusted Publisher** → GitHub
-   Actions: organization or user `dbeasty`, repository `kdb`, workflow filename `release.yml`
-   (environment empty). Then, under **Publishing access**, require two-factor authentication and
-   disallow tokens: from here only the workflow publishes.
+The one-time setup is done (2026-10-16):
+- The `@limidus` scope is the npm organization `limidus`. The previous name, `@kdb/client`, could
+  not be published: the npm name `kdb` belongs to someone else.
+- The first version, 0.9.1, was published by hand from the tarball on the `v0.9.1` GitHub release
+  (`npm publish limidus-kdb-client-0.9.1.tgz --access public`). npm refuses any publish from an
+  account without two-factor authentication, whatever the package settings say.
+- On npmjs.com, `@limidus/kdb-client` → **Settings** → **Trusted Publisher** is GitHub Actions:
+  organization or user `dbeasty`, repository `kdb`, workflow filename `release.yml`, environment
+  empty. **Publishing access** requires two-factor authentication and disallows tokens.
+- `packages/kdb-client/package.json`'s `repository` names `github.com/dbeasty/kdb`. npm checks it
+  against the workflow's repository when it attaches provenance, so keep it if the repository
+  moves.
 
-Every later tag publishes from CI. The job installs npm 11.5.1 or later, which trusted publishing
-needs, because Node 22 ships npm 10.
+**If the publish step fails with `404 Not Found - PUT …/@limidus%2fkdb-client`,** npm did not
+accept the workflow as a trusted publisher. `actions/setup-node` then leaves a placeholder token,
+and npm answers that with 404, not 401. Check the Trusted Publisher entry above: owner,
+repository and workflow file name must match exactly. This is what happened to v0.9.2, which was
+tagged before the entry was saved. Once the entry is right, re-run only the failed job (`gh run
+rerun <run id> --failed`); it rebuilds the package from the same tag. That works only for a tag
+whose `package.json` already has `repository` (added after v0.9.2): without it npm rejects the
+provenance with a 422. For an older tag, publish its release tarball by hand instead, as for
+0.9.1. Never publish a version by hand that CI is about to publish: npm refuses a version that
+already exists, so that job would then fail.
 
 ---
 
