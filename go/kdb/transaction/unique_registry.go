@@ -299,11 +299,12 @@ func UniqueKeysFor(namespaceID string, sch schema.KdbSchema, doc document.Docume
 	}
 	var out []UniqueKey
 	seen := make(map[UniqueKey]struct{})
+	body := newFieldReader(doc.JSON)
 	for _, fields := range sch.UniqueTuples() {
 		choices := make([][]any, 0, len(fields))
 		complete := true
 		for _, name := range fields {
-			raw, err := schema.FieldValue(doc.JSON, name)
+			raw, err := body.value(name)
 			if err != nil {
 				return nil, err
 			}
@@ -331,6 +332,46 @@ func UniqueKeysFor(namespaceID string, sch schema.KdbSchema, doc document.Docume
 		}
 	}
 	return out, nil
+}
+
+// fieldReader reads the constraint fields of one document body. It scans the top level once,
+// without decoding any value, and decodes only the members a constraint names: a document
+// carrying a 6 KB embedding next to its one unique field costs a byte scan of the embedding, not
+// a decode of it - and a schema with thirteen constraints costs one scan, not thirteen whole-body
+// json.Unmarshal calls (#316, where that was 93% of a 75 s open). A body the scan cannot walk, and
+// a dotted path, go through schema.FieldValue, which decodes the whole body and so reports a
+// malformed one exactly as before.
+type fieldReader struct {
+	json    string
+	members []schema.TopLevelMember
+	ok      bool
+}
+
+func newFieldReader(json string) fieldReader {
+	members, ok := schema.TopLevelMembers(json)
+	return fieldReader{json: json, members: members, ok: ok}
+}
+
+// value is schema.FieldValue(r.json, name): the decoded value, or nil when absent or null. A
+// repeated key yields its last occurrence, as encoding/json's map decode does.
+func (r fieldReader) value(name string) (any, error) {
+	if !r.ok || strings.IndexByte(name, '.') >= 0 {
+		return schema.FieldValue(r.json, name)
+	}
+	idx := -1
+	for i := range r.members {
+		if r.members[i].Key == name {
+			idx = i
+		}
+	}
+	if idx < 0 {
+		return nil, nil
+	}
+	var v any
+	if err := json.Unmarshal([]byte(r.json[r.members[idx].Start:r.members[idx].End]), &v); err != nil {
+		return nil, err
+	}
+	return v, nil
 }
 
 // multikeyValues is what one constraint part claims: nothing for an absent or null value, each

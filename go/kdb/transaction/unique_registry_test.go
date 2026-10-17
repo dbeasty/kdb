@@ -2,6 +2,7 @@ package transaction_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -160,5 +161,47 @@ func TestRegistryRebuildIsCleanOnDistinctValues(t *testing.T) {
 	}
 	if r.Len() != 3 {
 		t.Fatalf("expected 3 claimed keys, got %d", r.Len())
+	}
+}
+
+// TestUniqueKeysForReadsFieldsLikeAWholeDecode pins the single-scan field reader (#316) to what
+// decoding the whole body gave: the last of a repeated key, an escaped key, numbers in any
+// spelling, arrays, nested paths through a constraints-only schema, and a malformed body still
+// reported as an error rather than read as "holds nothing".
+func TestUniqueKeysForReadsFieldsLikeAWholeDecode(t *testing.T) {
+	sch, err := schema.BuildWithConstraints(nil, []schema.UniqueConstraint{
+		{Fields: []string{"email"}},
+		{Fields: []string{"org", "profile.slug"}},
+	}, 1, codec.Timestamp{}, "reader")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct{ body, want string }{
+		{`{"email":"first","email":"last"}`, `email=["last"]`},
+		{`{"email":"esc"}`, `email=["esc"]`},
+		{`{"pad":"` + strings.Repeat(`x\"{[`, 50) + `","email":"after"}`, `email=["after"]`},
+		{`{"email":["a","a",null,"b"]}`, `email=["a"] email=["b"]`},
+		{`{"email":{"k":[1,2]}}`, `email=[{"k":[1,2]}]`},
+		{`{"org":"o","profile":{"slug":"s"}}`, `(org, profile.slug)=["o","s"]`},
+		{`{"org":1.0,"profile":{"slug":2}}`, `(org, profile.slug)=[1,2]`},
+		{`{"email":null,"org":"o"}`, ``},
+	}
+	for _, c := range cases {
+		keys, err := transaction.UniqueKeysFor(uniqueNS, sch, doc(t, c.body))
+		if err != nil {
+			t.Fatalf("%s: %v", c.body, err)
+		}
+		var got []string
+		for _, k := range keys {
+			got = append(got, k.FieldName()+"="+k.Value)
+		}
+		if strings.Join(got, " ") != c.want {
+			t.Errorf("%s: got %q, want %q", c.body, strings.Join(got, " "), c.want)
+		}
+	}
+	for _, bad := range []string{`{"email":"a"`, `{"email":}`, `{"email":tru}`} {
+		if _, err := transaction.UniqueKeysFor(uniqueNS, sch, doc(t, bad)); err == nil {
+			t.Errorf("%s: a malformed body claimed nothing instead of failing", bad)
+		}
 	}
 }
