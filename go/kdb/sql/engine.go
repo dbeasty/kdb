@@ -98,7 +98,17 @@ func (e *defaultEngine) Execute(sqlText string, ctx QueryContext) (QueryResult, 
 		if err != nil {
 			return QueryResult{}, err
 		}
-		return e.executor.ExecuteSelect(s.Query, plan, residual, ctx)
+		if !s.Explain {
+			return e.executor.ExecuteSelect(s.Query, plan, residual, ctx)
+		}
+		if ctx.Stats == nil {
+			ctx.Stats = &ExecStats{}
+		}
+		res, err := e.executor.ExecuteSelect(s.Query, plan, residual, ctx)
+		if err != nil {
+			return QueryResult{}, err
+		}
+		return explainResult(res, ctx.Stats), nil
 	case StmtCreateTable:
 		sch, err := e.ddl.ExecuteCreateTable(s.DDL, ctx)
 		if err != nil {
@@ -174,4 +184,30 @@ func (e *defaultEngine) ExecuteDML(sqlText string, ctx QueryContext) (DMLResult,
 		return DMLResult{}, err
 	}
 	return DMLResult{Operations: ops, RowsAffected: rowsAffected(ops)}, nil
+}
+
+// explainResult is EXPLAIN's answer: one row naming the access path the query took (the Plan
+// label - "fullscan", "index:eq(status)", "index:eq(status)+order(createdAt)" for an ordered BTREE
+// walk, "...+topk(order(updatedAt) abandoned)" for one given up for the bounded top-k) and what
+// it cost: rows returned, rows examined, documents read.
+func explainResult(res QueryResult, st *ExecStats) QueryResult {
+	plan := res.Plan
+	if plan == "" {
+		plan = "unknown"
+	}
+	return QueryResult{
+		Columns: []ResultColumn{
+			{Name: "plan", SQLType: "VARCHAR", Source: ColumnSourceExpression},
+			{Name: "rows", SQLType: "BIGINT", Source: ColumnSourceExpression},
+			{Name: "rows_examined", SQLType: "BIGINT", Source: ColumnSourceExpression},
+			{Name: "docs_read", SQLType: "BIGINT", Source: ColumnSourceExpression},
+		},
+		Rows: []QueryRow{{Values: []Cell{
+			CellString{Value: plan},
+			CellLong{Value: int64(len(res.Rows))},
+			CellLong{Value: int64(st.RowsExamined)},
+			CellLong{Value: int64(st.DocsRead)},
+		}}},
+		Plan: res.Plan,
+	}
 }
