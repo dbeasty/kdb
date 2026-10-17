@@ -401,7 +401,7 @@ Documented precisely because each of these will surprise someone:
 
 | # | Behaviour | Detail |
 |---|-----------|--------|
-| 1 | **`FROM` is not resolved against a catalog** | the table name is parsed and validated syntactically; rows always come from the connection's namespace |
+| 1 | **`FROM` names a namespace only when one matches** | on kdb-service (and the `database/sql` driver), `a.b` is namespace `a/b`, and an unqualified table `t` is `<session catalog>/t` **if that namespace exists**; any other name means the session's own namespace. So `FROM docs` in a `qtask/other` session reads `qtask/docs` once that exists, even if it is empty. Offline `kdb query` never routes. Qualify table names (`FROM qtask.other`) when it matters. See [cross-namespace transactions §7.1](kdb-cross-namespace-transactions-plan.md#71-which-namespace-a-statement-touches) |
 | 2 | **`DISTINCT` is parsed but not applied** in the Go executor | it participates in the query shape fingerprint only |
 | 3 | **Historical reads return current documents** | `AtCommit` selects the commit whose tree hash is used, but `ServerEngine.GetDocument` ignores the tree hash and returns current committed state; full historical materialization is a known gap |
 | 4 | **No index usage in the Go planner** | every SELECT is a full scan; the versioned index engine exists but is not wired into planning |

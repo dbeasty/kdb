@@ -665,6 +665,11 @@ a Go server gets the Go grammar:
 Things that commonly surprise people (full list in
 [Part 5 §7](kdb-lld-query.md#7-semantics-limits-and-gotchas)):
 
+- Over the wire, an unqualified table that matches another namespace in the session's catalog
+  reads **that** namespace: `SELECT COUNT(*) FROM docs` in a `qtask/other` session counts
+  `qtask/docs` if it exists, and returns 0 if it is empty. Any other table name means the
+  session's own namespace. Offline `kdb query` never routes, so the two can disagree. Qualify the
+  table (`FROM qtask.other`) to be sure.
 - `INSERT` always mints a new document id — write at a chosen id with `PutJSON`/`Upsert`.
 - The Go planner does **full scans only**; bound them with `LIMIT` and a `--scan-row-budget`.
 - `NULL = NULL` is true in the Go comparator; use `IS NULL` for standard semantics.
