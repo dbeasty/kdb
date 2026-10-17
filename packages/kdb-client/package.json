@@ -3,6 +3,11 @@
   "version": "0.9.2",
   "description": "TypeScript client for KDB - wire codec, transports and the document/SQL/lease operation set.",
   "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dbeasty/kdb.git",
+    "directory": "packages/kdb-client"
+  },
   "type": "module",
   "engines": {
     "node": ">=20"

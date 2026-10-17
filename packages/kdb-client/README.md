@@ -176,7 +176,7 @@ it is the first thing to re-run when a frame stops decoding.
 ## Versioning and compatibility
 
 `@limidus/kdb-client` is published once per KDB release **with the server's version number** (`0.9.2` of
-the package speaks to `0.7.x` servers). The handshake enforces it: the server reports its release
+the package speaks to `0.9.x` servers). The handshake enforces it: the server reports its release
 in `handshakeAck.serverVersion`, and `connect` fails with a `KdbProtocolError` when that is not a
 release this client was published for (same major; while the major is 0, same minor). A server
 that reports no version (older than 0.7.0, or the JVM engine) is refused too, and a from-source
