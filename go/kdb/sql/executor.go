@@ -1653,9 +1653,22 @@ func expressionSQLType(e Expr) string {
 			return "BOOLEAN"
 		case "all_values":
 			return "JSON"
+		case "coalesce":
+			return commonSQLType(ex.Args)
 		}
 	case ExprBinary, ExprUnary, ExprIn, ExprBetween:
 		return "BOOLEAN"
+	case ExprCase:
+		// One type when every branch agrees on it; JSON (any value) otherwise. A CASE with no
+		// ELSE can also be NULL, which every type admits.
+		branches := make([]Expr, 0, len(ex.Whens)+1)
+		for _, w := range ex.Whens {
+			branches = append(branches, w.Then)
+		}
+		if ex.Else != nil {
+			branches = append(branches, ex.Else)
+		}
+		return commonSQLType(branches)
 	case ExprLiteral:
 		switch ex.Cell.(type) {
 		case CellString:
@@ -1669,4 +1682,25 @@ func expressionSQLType(e Expr) string {
 		}
 	}
 	return "JSON"
+}
+
+// commonSQLType is the result type of an expression that yields one of exprs: their type when
+// they all share one, JSON when they do not. A NULL literal fits any type, so `CASE ... ELSE NULL`
+// keeps its branches' type.
+func commonSQLType(exprs []Expr) string {
+	common := ""
+	for _, e := range exprs {
+		if lit, ok := e.(ExprLiteral); ok && isNullCell(lit.Cell) {
+			continue
+		}
+		t := expressionSQLType(e)
+		if common != "" && t != common {
+			return "JSON"
+		}
+		common = t
+	}
+	if common == "" {
+		return "JSON"
+	}
+	return common
 }

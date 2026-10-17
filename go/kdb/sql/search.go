@@ -171,6 +171,14 @@ func forEachChild(e Expr, visit func(Expr)) {
 		visit(ex.Expr)
 		visit(ex.Low)
 		visit(ex.High)
+	case ExprCase:
+		for _, w := range ex.Whens {
+			visit(w.Cond)
+			visit(w.Then)
+		}
+		if ex.Else != nil {
+			visit(ex.Else)
+		}
 	case ExprMatch:
 		visit(ex.Query)
 	case ExprSimilarity:

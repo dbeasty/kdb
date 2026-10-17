@@ -988,6 +988,9 @@ func (p *rdParser) parseVectorLiteral() (Expr, error) {
 }
 
 func (p *rdParser) parseIdentifierExpr() (Expr, error) {
+	if c, ok, err := p.parseCase(); ok || err != nil {
+		return c, err
+	}
 	name, err := p.readIdentifier()
 	if err != nil {
 		return nil, err
@@ -1027,6 +1030,58 @@ func (p *rdParser) parseIdentifierExpr() (Expr, error) {
 		return nil, err
 	}
 	return p.buildFunctionCall(lower, args)
+}
+
+// parseCase reads a CASE expression at the current position. ok=false, having consumed nothing,
+// when the input there is not one: CASE is not a reserved word elsewhere, so `case` stays usable
+// as a column name - `CASE WHEN` always starts the searched form, and `CASE <expr> WHEN` the
+// simple form, which is rewritten to the searched one with `<expr> = <value>` conditions.
+func (p *rdParser) parseCase() (Expr, bool, error) {
+	save, last, params := p.pos, p.lastKeyword, p.nextParamIndex
+	if !p.matchKeyword("CASE") {
+		return nil, false, nil
+	}
+	var operand Expr
+	if !p.peekKeyword("WHEN") {
+		e, err := p.parseExpr()
+		if err != nil || !p.peekKeyword("WHEN") {
+			p.pos, p.lastKeyword, p.nextParamIndex = save, last, params
+			return nil, false, nil
+		}
+		operand = e
+	}
+	var c ExprCase
+	for p.matchKeyword("WHEN") {
+		cond, err := p.parseExpr()
+		if err != nil {
+			return nil, true, err
+		}
+		if operand != nil {
+			cond = ExprBinary{Op: BinaryOpEQ, Left: operand, Right: cond}
+		}
+		if !p.matchKeyword("THEN") {
+			return nil, true, p.parseError("expected THEN" + p.foundSuffix())
+		}
+		then, err := p.parseExpr()
+		if err != nil {
+			return nil, true, err
+		}
+		c.Whens = append(c.Whens, CaseWhen{Cond: cond, Then: then})
+	}
+	if len(c.Whens) == 0 {
+		return nil, true, p.parseError("CASE needs at least one WHEN" + p.foundSuffix())
+	}
+	if p.matchKeyword("ELSE") {
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, true, err
+		}
+		c.Else = e
+	}
+	if !p.matchKeyword("END") {
+		return nil, true, p.parseError("expected END to close CASE" + p.foundSuffix())
+	}
+	return c, true, nil
 }
 
 // buildFunctionCall turns the search functions into their dedicated AST nodes and leaves every

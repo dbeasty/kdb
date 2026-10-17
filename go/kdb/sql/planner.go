@@ -153,7 +153,7 @@ func validateTablelessSelect(query SelectQuery) error {
 			// An aggregate over no rows is a different question from `SELECT 1`, and answering
 			// it would mean deciding what COUNT(*) over a synthetic row means. Refused until
 			// something actually needs it.
-			if _, ok := p.Expr.(ExprFunctionCall); ok {
+			if containsAggregate(p.Expr) {
 				return NewPlanningError("aggregate requires a FROM clause", "")
 			}
 		}
@@ -195,6 +195,14 @@ func rejectColumnRefs(expr Expr) error {
 				return err
 			}
 		}
+	case ExprCase:
+		var firstErr error
+		forEachChild(e, func(c Expr) {
+			if firstErr == nil {
+				firstErr = rejectColumnRefs(c)
+			}
+		})
+		return firstErr
 	}
 	return nil
 }
@@ -250,6 +258,18 @@ func (v *validator) check(e Expr, allowAliases, allowAggregates bool) error {
 				}
 			}
 			return nil
+		case name == "coalesce":
+			if len(ex.Args) == 0 {
+				return NewPlanningError("COALESCE takes at least one argument", "")
+			}
+			// Aggregates stay out: outside a bare aggregate projection, a grouped query evaluates
+			// an expression on the group's first row, so COALESCE(SUM(x), 0) would not sum.
+			for _, a := range ex.Args {
+				if err := v.check(a, false, false); err != nil {
+					return err
+				}
+			}
+			return nil
 		case isScalarFunction(name):
 			if name == "array_length" && len(ex.Args) != 1 {
 				return NewPlanningError("ARRAY_LENGTH takes exactly one argument", "")
@@ -275,6 +295,15 @@ func (v *validator) check(e Expr, allowAliases, allowAggregates bool) error {
 		default:
 			return NewPlanningError("unknown function: "+name, "")
 		}
+	case ExprCase:
+		// No aggregates inside, for the reason COALESCE refuses them.
+		var firstErr error
+		forEachChild(e, func(c Expr) {
+			if firstErr == nil {
+				firstErr = v.check(c, false, false)
+			}
+		})
+		return firstErr
 	case ExprMatch:
 		return v.check(ex.Query, false, false)
 	case ExprSimilarity:
