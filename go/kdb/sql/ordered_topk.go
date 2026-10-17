@@ -219,6 +219,21 @@ func UnindexedDocsFromStore(store index.Store, ctx QueryContext, field string, i
 	return out, true, nil
 }
 
+// The walk's budget. It reads index entries in namespace-wide key order, so how many it passes
+// before the page settles depends on where the candidates' keys fall among everyone else's -
+// which nothing at plan time knows: the same query is 7x faster walking when the candidates sort
+// early and 5x slower when they sort behind most of the namespace (#318). The bounded top-k it
+// competes with costs one document read per candidate, and passing an index entry costs about a
+// tenth of a read (BenchmarkOrderedWalkVsTopK: ~75 ns against ~750 ns in memory; reads from disk
+// cost more). So the walk gives up once it has passed walkEntriesPerCandidate entries per
+// candidate: a walk that would settle sooner is kept, and one that would not adds about half the
+// top-k's own cost to it (+65% in the benchmark's worst case, in memory; less where reads come
+// from disk) - the documents it read are handed over, not read again.
+const (
+	walkEntriesPerCandidate = 4
+	walkEntriesFloor        = 256
+)
+
 // maxOrderedCandidates bounds the candidate list the ordered top-k indexes by id; past it,
 // topKDocs streams them.
 const maxOrderedCandidates = 1 << 21
@@ -284,8 +299,14 @@ func (c *keyGroupCursor) head(oi OrderedKeyIndex, ctx QueryContext, field string
 // btreeTopK serves the top k of the candidates ids by walking the BTREE on the first ORDER BY
 // column (see the comment at the top of this file). ok=false means it does not apply, or gave up
 // part way; fetched then holds every document it read (nil for one that does not exist), for
-// topKDocs to reuse rather than read again.
-func (e *Executor) btreeTopK(query SelectQuery, residual Expr, env *evalEnv, ctx QueryContext, k int, ids []codec.UUID, atCommit codec.Hash, treeHash codec.Hash, fetched map[codec.UUID]*document.Document) ([]*evalDoc, bool, error) {
+// topKDocs to reuse rather than read again. abandoned reports a walk that started and was given
+// up for exceeding its budget (walkEntriesPerCandidate), so the plan label can say so.
+func (e *Executor) btreeTopK(query SelectQuery, residual Expr, env *evalEnv, ctx QueryContext, k int, ids []codec.UUID, atCommit codec.Hash, treeHash codec.Hash, fetched map[codec.UUID]*document.Document) (docs []*evalDoc, ok, abandoned bool, err error) {
+	docs, ok, err = e.btreeTopKWalk(query, residual, env, ctx, k, ids, atCommit, treeHash, fetched, &abandoned)
+	return docs, ok, abandoned, err
+}
+
+func (e *Executor) btreeTopKWalk(query SelectQuery, residual Expr, env *evalEnv, ctx QueryContext, k int, ids []codec.UUID, atCommit codec.Hash, treeHash codec.Hash, fetched map[codec.UUID]*document.Document, abandoned *bool) ([]*evalDoc, bool, error) {
 	field := orderedField(query, env)
 	if field == "" || k <= 0 || len(ids) <= k || len(ids) > maxOrderedCandidates {
 		return nil, false, nil
@@ -371,7 +392,7 @@ func (e *Executor) btreeTopK(query SelectQuery, residual Expr, env *evalEnv, ctx
 	}
 
 	walked := 0
-	walkCap := 32*len(ids) + 1<<16
+	walkCap := walkEntriesPerCandidate*len(ids) + walkEntriesFloor
 	visit := func(g *IndexKeyGroup) (bool, error) {
 		switch c := g.Key.(type) {
 		case CellLong:
@@ -385,6 +406,7 @@ func (e *Executor) btreeTopK(query SelectQuery, residual Expr, env *evalEnv, ctx
 		}
 		walked += len(g.IDs)
 		if walked > walkCap {
+			*abandoned = true
 			return false, nil
 		}
 		for _, id := range g.IDs {

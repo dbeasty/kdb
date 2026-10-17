@@ -60,6 +60,17 @@ func (p *rdParser) parseStatement() (Statement, error) {
 			return nil, err
 		}
 		return StmtSelect{Query: q}, nil
+	case p.matchKeyword("EXPLAIN"):
+		// ANALYZE is accepted and changes nothing: EXPLAIN always runs the query (StmtSelect).
+		p.matchKeyword("ANALYZE")
+		if !p.matchKeyword("SELECT") {
+			return nil, p.parseError("EXPLAIN takes a SELECT" + p.foundSuffix())
+		}
+		q, err := p.parseSelectQuery()
+		if err != nil {
+			return nil, err
+		}
+		return StmtSelect{Query: q, Explain: true}, nil
 	case p.matchKeyword("INSERT"):
 		ins, err := p.parseInsert()
 		if err != nil {
@@ -111,7 +122,7 @@ func (p *rdParser) parseStatement() (Statement, error) {
 		p.matchWorkOrTransaction()
 		return StmtRollback{}, nil
 	default:
-		return nil, p.parseError("expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, BEGIN, COMMIT, or ROLLBACK")
+		return nil, p.parseError("expected SELECT, EXPLAIN, INSERT, UPDATE, DELETE, CREATE, DROP, BEGIN, COMMIT, or ROLLBACK")
 	}
 }
 

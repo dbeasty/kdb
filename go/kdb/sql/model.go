@@ -11,7 +11,14 @@ type Statement interface {
 	isStatement()
 }
 
-type StmtSelect struct{ Query SelectQuery }
+// StmtSelect is a SELECT. Explain marks `EXPLAIN [ANALYZE] SELECT ...`: the query runs exactly as
+// it would without it, and the result is one row describing how it ran (see explainResult) rather
+// than the query's rows - so a client sees the plan the executor actually chose, including a
+// choice it only makes part way through (an abandoned ordered walk), not a prediction of it.
+type StmtSelect struct {
+	Query   SelectQuery
+	Explain bool
+}
 
 func (StmtSelect) isStatement() {}
 

@@ -113,10 +113,12 @@ func (e *Executor) topKDocs(query SelectQuery, residual Expr, env *evalEnv, ctx 
 		// documents (ordered_topk.go). When it does not apply, or gives up part way, the
 		// documents it read are reused here rather than read again.
 		fetched := map[codec.UUID]*document.Document{}
-		if docs, ok, err := e.btreeTopK(query, residual, env, ctx, k, ids, atCommit, treeHash, fetched); err != nil {
+		if docs, ok, abandoned, err := e.btreeTopK(query, residual, env, ctx, k, ids, atCommit, treeHash, fetched); err != nil {
 			return nil, "", err
 		} else if ok {
 			return docs, label + "+order(" + orderedField(query, env) + ")", nil
+		} else if abandoned {
+			label += "+topk(order(" + orderedField(query, env) + ") abandoned)"
 		}
 		for i, id := range ids {
 			if residual != nil && ctx.RowBudget > 0 && i >= ctx.RowBudget {
