@@ -31,6 +31,6 @@
     "@limidus/kdb-client": "file:../kdb-client"
   },
   "dependencies": {
-    "@limidus/kdb-client": "^0.9.1"
+    "@limidus/kdb-client": "^0.9.2"
   }
 }
