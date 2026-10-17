@@ -298,6 +298,23 @@ type ExprBetween struct {
 
 func (ExprBetween) isExpr() {}
 
+// ExprCase is `CASE WHEN cond THEN result [WHEN ...] [ELSE result] END`: the result of the first
+// WHEN whose condition holds, else Else, else NULL when there is no ELSE. The simple form,
+// `CASE operand WHEN value THEN result ... END`, is parsed into this one with each condition
+// `operand = value`, so it compares the way `=` does everywhere else.
+type ExprCase struct {
+	Whens []CaseWhen
+	Else  Expr // nil: no ELSE, so NULL
+}
+
+// CaseWhen is one `WHEN Cond THEN Then` arm of an ExprCase.
+type CaseWhen struct {
+	Cond Expr
+	Then Expr
+}
+
+func (ExprCase) isExpr() {}
+
 // ExprMatch is MATCH(index_or_field, query) - a full-text predicate (true for hits) or a score
 // projection (BM25, 0 for non-hits). Requires a FULLTEXT index (kdb-spec-layer16 §9.1).
 type ExprMatch struct {

@@ -173,6 +173,20 @@ func writeExprSkeleton(b *strings.Builder, e Expr) {
 		b.WriteByte('(')
 		writeExprSkeleton(b, ex.Expr)
 		b.WriteString(" between ? and ?)")
+	case ExprCase:
+		b.WriteString("case(")
+		for _, w := range ex.Whens {
+			b.WriteString("when ")
+			writeExprSkeleton(b, w.Cond)
+			b.WriteString(" then ")
+			writeExprSkeleton(b, w.Then)
+			b.WriteByte(' ')
+		}
+		if ex.Else != nil {
+			b.WriteString("else ")
+			writeExprSkeleton(b, ex.Else)
+		}
+		b.WriteByte(')')
 	case ExprMatch:
 		fmt.Fprintf(b, "match(%s,?)", ex.IndexOrField)
 	case ExprSimilarity:

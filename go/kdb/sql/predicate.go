@@ -221,6 +221,16 @@ func (env *evalEnv) cell(expr Expr, d *evalDoc) Cell {
 		return CellBool{Value: env.predicate(expr, d)}
 	case ExprArith:
 		return arith(e.Op, env.cell(e.Left, d), env.cell(e.Right, d))
+	case ExprCase:
+		for _, w := range e.Whens {
+			if env.predicate(w.Cond, d) {
+				return env.cell(w.Then, d)
+			}
+		}
+		if e.Else == nil {
+			return CellNull{}
+		}
+		return env.cell(e.Else, d)
 	default:
 		return CellNull{}
 	}
@@ -349,7 +359,7 @@ func (env *evalEnv) predicate(expr Expr, d *evalDoc) bool {
 			}
 		}
 		return false
-	case ExprParameter, ExprLiteral:
+	case ExprParameter, ExprLiteral, ExprCase:
 		return isTrueCell(env.cell(expr, d))
 	case ExprFunctionCall:
 		return isTrueCell(env.functionCell(e, d))
@@ -480,6 +490,15 @@ func (env *evalEnv) functionCell(call ExprFunctionCall, d *evalDoc) Cell {
 			return CellNull{}
 		}
 		return CellJSON{JSON: kdbjson.ToJSONString(kdbjson.ArrayValue{Elements: append([]kdbjson.Value(nil), vals...)})}
+	case "coalesce":
+		// The first argument that is neither NULL nor missing (a missing path evaluates to NULL),
+		// so `SET n = COALESCE(n, 0) + 1` counts from zero on a document without n.
+		for _, arg := range call.Args {
+			if c := env.cell(arg, d); !isNullCell(c) {
+				return c
+			}
+		}
+		return CellNull{}
 	case "array_length":
 		if len(call.Args) != 1 {
 			return CellNull{}
