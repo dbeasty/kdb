@@ -3,6 +3,36 @@
 Written 2026-10-20 against `main` d8a915d (= v0.9.2 plus docs). Each item cites the Cassandra
 mechanism it follows where it changes architecture, as `kdb-memory-cassandra-plan.md` does.
 
+## Status (2026-10-21)
+
+Implemented, each its own PR, each measured alone and in combination. qtask bench, mixed @ 8
+users, two back-to-back cells; v0.9.2 does 69.5-71.2 actions/s (six cells):
+
+| item | PR | alone | cumulative |
+|---|---|---:|---:|
+| P1 hardware CRC32 | #328 | 80.5 / 79.6 (+14%) | 80 |
+| P0 cache pool sized from the machine (new, see below) | #329 | 109.3 / 104.2 (+50%) | 118.7 / 110.8 (with P1) |
+| P4 SELECTs off the session queue | #330 | flat (CPU-bound) | 122.5 / 116.9 (+3-5%) |
+| P3 client declines zstd on loopback | #331 | client-only | 141.5 / 136.3 (+16%) |
+| P2 file by value per version (draft: disk trade) | #332 | flat (69.7 / 72.0) | **178.5 / 172.2 (+26%)**, disk 954 → 1467 MiB |
+
+What implementing changed in the plan:
+
+- **P0 was not in the first draft and is the largest single item.** kdb-service gave its host
+  the embedded default cache pool, a fixed 64 MiB: in a 4 GiB container that is a 4 MiB frame
+  cache and a 9 MiB block cache, against WiredTiger's ~1.5 GB. Raising the frame cache's
+  *fraction* did nothing (4 → 15 MiB); the pool itself had to grow. Sized now as Cassandra sizes
+  its heap (a quarter of the cgroup limit or RAM, 64 MiB-8 GiB); embedded runtimes keep 64 MiB.
+- **P2 only pays with P0.** On the 64 MiB pool the re-filed bodies were served from SSTable
+  blocks that missed a 9 MiB cache; throughput did not move. The first version's extra rule
+  (frame must also hold 4x the version) kept qtask's 12 KiB tasks on their frames - an
+  instrumented run counted 315k such versions in 35 s - and was dropped. It costs a second copy
+  of the re-filed bodies (+54% on disk here), which is why #332 is a draft.
+- **P4's gain is small while the server is CPU-bound**, as expected; it is there for when
+  requests are cheaper than the CPU, and for a single app instance.
+- **P5 and P6 are not started.** After P0-P4 the profile is led by `topKDocs`/`materializeUpTo`
+  reading candidate bodies (P5) and GC (~9%).
+
 ## Where we stand
 
 qtask's Docker benchmark (`qtask/bench`, prod scale: 517,464 documents; each database alone in a
