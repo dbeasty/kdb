@@ -117,21 +117,24 @@ type StorageEngineConfig struct {
 	// own write is not wanted; the cost is that every open replays the log
 	// in full.
 	DisableCheckpoints bool
-	// LargeCommitBodyBytes is the size of the document bodies one commit writes at or past which
-	// each body is filed in the blob store itself, instead of as a location record pointing into
-	// the commit's delta frame (objects history strategy only). A location costs a cold read the
-	// whole frame - one 4 MiB import commit decompressed to return one 16 KiB document - so a bulk
-	// write's documents are filed by value, at the cost of a second copy of their bytes. Cold
-	// reads that still meet a large frame through a location file what they decoded the same way.
-	// Zero uses DefaultLargeCommitBodyBytes (64 KiB); negative never files bodies.
+	// LargeCommitBodyBytes is how many bytes of other versions a document version's commit frame
+	// must hold, besides the version itself, before the version's body is filed in the blob store
+	// itself instead of as a location record pointing into the frame (objects history strategy
+	// only). A location costs
+	// a cold read the whole frame - one 4 MiB import commit decompressed to return one 16 KiB
+	// document - so a bulk write's documents are filed by value, at the cost of a second copy of
+	// their bytes. Cold reads that still meet such a frame through a location file what they
+	// decoded the same way. Zero uses DefaultLargeCommitBodyBytes (16 KiB); negative never files
+	// bodies.
 	LargeCommitBodyBytes int64
 }
 
-// DefaultLargeCommitBodyBytes is StorageEngineConfig.LargeCommitBodyBytes's default: a commit
-// writing 64 KiB of bodies or more is a batch whose documents are read one at a time later, and
-// reading one of them through the frame costs at least 64 KiB of decompression - several times
-// the document. A single ordinary document stays below it and keeps its 17-byte location.
-const DefaultLargeCommitBodyBytes = 64 << 10
+// DefaultLargeCommitBodyBytes is StorageEngineConfig.LargeCommitBodyBytes's default: Cassandra's
+// default compression chunk, the most it decompresses to read one row. A version whose frame
+// holds that much besides it is part of a batch read one document at a time later. A single ordinary document, or a commit of a few small ones, stays below it and
+// keeps its 17-byte location. It was 64 KiB of bodies per commit, which qtask's import commits
+// (split at 64 KiB) all fell just short of.
+const DefaultLargeCommitBodyBytes = 16 << 10
 
 // ResolvedLargeCommitBodyBytes is the large-commit threshold in force, or 0 when bodies are never
 // filed by value.

@@ -116,7 +116,7 @@ type StorageOptions struct {
 	// turns it on unless KDB_BOUNDED_LIVE_BODIES=off; the zero value here is off.
 	BoundedLiveBodies bool
 	// LargeCommitBodyBytes: see storage.StorageEngineConfig.LargeCommitBodyBytes. Zero is the
-	// default threshold (64 KiB); negative turns filing bodies by value off.
+	// default threshold (16 KiB); negative turns filing bodies by value off.
 	// FileRuntimeOptionsFromEnv reads KDB_LARGE_COMMIT_BODY_BYTES.
 	LargeCommitBodyBytes int64
 	// CommitOpsBytes caps how many bytes of commit operations the DAG
