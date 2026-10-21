@@ -166,6 +166,36 @@ export interface ConnectOptions {
    * server acks them (an older server, or the JVM one, acks none and the connection stays JSON).
    */
   jsonOnly?: boolean;
+  /**
+   * Whether the server may zstd-compress the frames it sends. "auto" (the default) declines it on
+   * a loopback address - 127.0.0.0/8, ::1, localhost - where compressing costs the server CPU and
+   * saves no network, and accepts it anywhere else, as Cassandra leaves compression to each
+   * connection's client. qtask's server spent 20% of its CPU compressing replies to a client on
+   * the same host. "zstd" and "none" decide it regardless of the address. Ignored with jsonOnly.
+   */
+  compression?: "auto" | "zstd" | "none";
+}
+
+/**
+ * Whether uri names a loopback host. Only literal loopback addresses and "localhost" count: a
+ * name that merely resolves to one is not looked up, so it keeps compression on.
+ */
+export function isLoopbackAddress(uri: string): boolean {
+  let host: string;
+  try {
+    host = new URL(uri).hostname;
+  } catch {
+    return false;
+  }
+  host = host.replace(/^\[|\]$/g, "").toLowerCase();
+  return host === "localhost" || host === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+}
+
+/** The wire features a handshake offers under options, for a connection to uri when known. */
+function offeredWireFeatures(options: ConnectOptions, uri: string | undefined): string[] {
+  const compression = options.compression ?? "auto";
+  const decline = compression === "none" || (compression === "auto" && uri !== undefined && isLoopbackAddress(uri));
+  return decline ? OFFERED_WIRE_FEATURES.filter((f) => f !== WIRE_FEATURE_ZSTD) : OFFERED_WIRE_FEATURES;
 }
 
 interface NamespaceState {
@@ -213,7 +243,7 @@ export async function connect(addr: string, options: ConnectOptions = {}): Promi
     transport = await connectTcp(uri, transportOptions);
   }
 
-  const client = new Client(transport, options);
+  const client = new Client(transport, options, uri);
   try {
     await client.handshake(options);
   } catch (error) {
@@ -236,11 +266,15 @@ export class Client implements KdbOperations {
   readonly #sessionLocks = new Map<string, SessionLock>();
 
   #correlation = 1;
+  /** The address connect() dialled, when it did; "auto" compression decides by it. */
+  #uri: string | undefined;
   #closed = false;
   #closeCause: Error | undefined;
 
-  constructor(transport: Transport, options: ConnectOptions = {}) {
+  /** uri is the address the transport is connected to, when known; see ConnectOptions.compression. */
+  constructor(transport: Transport, options: ConnectOptions = {}, uri?: string) {
     this.#transport = transport;
+    this.#uri = uri;
     this.#maxFrameBytes = options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
     this.#requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.#authorNodeId = randomUuid();
@@ -271,7 +305,7 @@ export class Client implements KdbOperations {
       protocolVersion: KDB_WIRE_PROTOCOL_VERSION,
     };
     if (options.token !== undefined && options.token !== "") request.token = options.token;
-    if (!options.jsonOnly) request.wireFeatures = OFFERED_WIRE_FEATURES;
+    if (!options.jsonOnly) request.wireFeatures = offeredWireFeatures(options, this.#uri);
 
     const callOptions: CallOptions = {};
     if (options.signal !== undefined) callOptions.signal = options.signal;
