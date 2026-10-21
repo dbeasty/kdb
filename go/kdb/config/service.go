@@ -62,9 +62,9 @@ type ServiceSettings struct {
 	MemoryReserveMB int
 	// CacheMB is the storage engine's in-memory cache pool - document versions, the SSTable block
 	// cache, the delta frame cache, memtables and commit operations - shared by every namespace the
-	// process opens. 0 (default) sizes it from the machine as Cassandra sizes its heap: a quarter
+	// process opens. 0 (default) sizes it from the machine as Cassandra sizes its caches: an eighth
 	// of the memory the process may use (the cgroup limit where there is one, else host RAM),
-	// at most 8 GiB and at least 64 MiB. A positive value is an explicit size in MiB.
+	// at most 4 GiB and at least 64 MiB. A positive value is an explicit size in MiB.
 	CacheMB int
 	// MaxConnections caps concurrently-accepted connections per listener (§6.5); 0 is unlimited.
 	MaxConnections int

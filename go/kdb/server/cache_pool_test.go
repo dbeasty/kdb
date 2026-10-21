@@ -8,11 +8,11 @@ func TestCachePoolBytesExplicit(t *testing.T) {
 	}
 }
 
-// Auto-sizing takes a quarter of the machine, clamped: a 4 GiB container gets 1 GiB, a tiny one
-// still gets the old 64 MiB, and a large host stops at 8 GiB.
+// Auto-sizing takes an eighth of the machine, clamped: a 4 GiB container gets 512 MiB, a tiny one
+// still gets the old 64 MiB, and a large host stops at 4 GiB.
 func TestClampCachePool(t *testing.T) {
 	for _, tc := range []struct{ machine, want int64 }{
-		{4 << 30, 1 << 30},
+		{4 << 30, 512 << 20},
 		{128 << 20, MinCachePoolBytes},
 		{256 << 30, MaxCachePoolBytes},
 	} {

@@ -338,7 +338,7 @@ memory budget, durability, abort watchdog) plus the exact build identity.
 |------|---------|---------|
 | `--memory-budget-mb N` | `0` = auto-detect | budget admission control governs against: cgroup limit if present, else 75 % of host RAM; `-1` disables |
 | `--memory-reserve-mb N` | 48 | rescue reserve released on entry to the Critical zone (clamped to ¼ of the budget) |
-| `--cache-mb N` | `0` = size from the machine | storage cache pool shared by every namespace (document versions, SSTable blocks, delta frames, memtables): ¼ of the cgroup limit, else of host RAM, between 64 MiB and 8 GiB, as Cassandra sizes its heap. Embedded runtimes keep 64 MiB |
+| `--cache-mb N` | `0` = size from the machine | storage cache pool shared by every namespace (document versions, SSTable blocks, delta frames, memtables): ⅛ of the cgroup limit, else of host RAM, between 64 MiB and 4 GiB - Cassandra gives its caches and memtables about half of a heap sized at ¼ of RAM. Embedded runtimes keep 64 MiB |
 | `--scan-row-budget N` | 1 000 000 | maximum rows a single scan may **examine**; shrinks automatically as pressure rises |
 | `--abort-after DUR` | 0 (off) | after sustained pressure, drain and exit 75 so a supervisor restarts clean |
 | `--drain-timeout DUR` | 30s | on SIGTERM, how long to wait for admitted writes before closing storage anyway |
