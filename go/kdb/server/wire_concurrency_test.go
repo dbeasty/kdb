@@ -456,3 +456,111 @@ func TestConcurrentFramesAreBounded(t *testing.T) {
 		}
 	}
 }
+
+func (c *pipelinedClient) sessionBeginWith(t *testing.T, namespace, consistency string) string {
+	t.Helper()
+	cid := c.send(t, wire.SessionBeginMessage{
+		H:               wire.Header{MessageType: wire.MsgSessionBegin, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: c.raw.nextCorrelation()},
+		Namespace:       namespace,
+		ReadConsistency: consistency,
+	})
+	ack, ok := c.await(t, cid, 2*time.Second).(wire.SessionBeginAckMessage)
+	if !ok || ack.SessionID == "" {
+		t.Fatalf("session begin failed: %+v", ack)
+	}
+	return ack.SessionID
+}
+
+// blockSlowSelects holds every SqlExec (of any kind) whose SQL mentions "slow" in the hook until release is
+// closed, and closes entered when the first one arrives.
+func blockSlowSelects(rt *KdbServerRuntime) (entered, release chan struct{}) {
+	entered, release = make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	rt.SetBeforeSqlExecHookForTest(func(msg wire.SqlExecMessage) {
+		if !strings.Contains(msg.SQL, "slow") {
+			return
+		}
+		once.Do(func() { close(entered) })
+		<-release
+	})
+	return entered, release
+}
+
+// A SELECT on a READ_COMMITTED session reads the live head and none of its session's state, so it
+// does not wait behind an earlier, still-running SELECT on the same session: one app process's
+// queries run concurrently, as Cassandra runs the requests of one connection by stream id.
+func TestSelectsOnOneReadCommittedSessionRunConcurrently(t *testing.T) {
+	rt := newTestRuntime(t)
+	addr := listenFor(t, rt)
+	entered, release := blockSlowSelects(rt)
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	c := dialPipelinedClient(t, addr)
+	c.handshake(t, "app/data")
+	session := c.sessionBegin(t, "app/data")
+
+	slow := c.sendSqlExec(t, "app/data", session, `SELECT 'slow' AS s`)
+	<-entered
+	fast := c.sendSqlExec(t, "app/data", session, `SELECT 'fast' AS s`)
+	if r, ok := c.await(t, fast, 2*time.Second).(wire.SqlResultMessage); !ok || r.Error != nil || r.Rows[0][0] != "fast" {
+		t.Fatalf("second SELECT: %+v", r)
+	}
+	if _, answered := c.poll(slow); answered {
+		t.Fatal("the blocked SELECT was answered before it was released - the test proves nothing")
+	}
+	close(release)
+	if r, ok := c.await(t, slow, 2*time.Second).(wire.SqlResultMessage); !ok || r.Error != nil {
+		t.Fatalf("first SELECT: %+v", r)
+	}
+}
+
+// A SNAPSHOT session's SELECTs read its transaction's pin, which moves at every boundary, so they
+// stay in session order; so does anything that is not a SELECT. (A READ_COMMITTED SELECT holds no
+// place in its session's order at all, so a statement after it does not wait for it either.)
+func TestSnapshotSessionAndNonSelectFramesStayOrdered(t *testing.T) {
+	for _, tc := range []struct{ name, consistency, first, second string }{
+		{"snapshot select", "SNAPSHOT", `SELECT 'slow' AS s`, `SELECT 'second' AS s`},
+		{"read-committed DDL then DML", "READ_COMMITTED", `CREATE TABLE slow (id VARCHAR NOT NULL)`, `INSERT INTO slow (id) VALUES ('a')`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := newTestRuntime(t)
+			addr := listenFor(t, rt)
+			entered, release := blockSlowSelects(rt)
+			c := dialPipelinedClient(t, addr)
+			c.handshake(t, "app/data")
+			session := c.sessionBeginWith(t, "app/data", tc.consistency)
+
+			first := c.sendSqlExec(t, "app/data", session, tc.first)
+			<-entered
+			second := c.sendSqlExec(t, "app/data", session, tc.second)
+			time.Sleep(100 * time.Millisecond)
+			if _, answered := c.poll(second); answered {
+				close(release)
+				t.Fatal("a frame that must stay in session order was answered while the frame before it was still running")
+			}
+			close(release)
+			for _, cid := range []int{first, second} {
+				if r, ok := c.await(t, cid, 2*time.Second).(wire.SqlResultMessage); !ok || r.Error != nil {
+					t.Fatalf("frame %d: %+v", cid, r)
+				}
+			}
+		})
+	}
+}
+
+func TestIsPlainSelect(t *testing.T) {
+	for sql, want := range map[string]bool{
+		"SELECT 1": true, "  select * FROM docs": true, "\nSelect(1)": true, "SELECT*FROM t": true,
+		"SELECT": false, "SELECTED": false, "WITH x AS (SELECT 1) SELECT * FROM x": false,
+		"EXPLAIN SELECT 1": false, "UPDATE t SET a = 1": false, "": false,
+	} {
+		if got := isPlainSelect(sql); got != want {
+			t.Errorf("isPlainSelect(%q) = %v, want %v", sql, got, want)
+		}
+	}
+}
