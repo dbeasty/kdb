@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { Client, backoffDelay } from "../src/client.ts";
+import { Client, backoffDelay, isLoopbackAddress } from "../src/client.ts";
 import { CLIENT_VERSION } from "../src/version.ts";
 import {
   KdbAbortedError,
@@ -105,6 +105,47 @@ describe("handshake", () => {
       new Client(server).handshake(),
       (error: unknown) => error instanceof KdbUnauthenticatedError && /bad token/.test(String(error)),
     );
+  });
+});
+
+describe("compression choice", () => {
+  const ack = () => ({
+    kind: "handshakeAck" as const,
+    payload: { accepted: true, negotiatedEncoding: "JSON", protocolVersion: 1, remoteHeads: {}, serverVersion: CLIENT_VERSION },
+  });
+  const offered = async (uri: string | undefined, compression?: "auto" | "zstd" | "none") => {
+    const server = new FakeServer(ack);
+    const options = compression === undefined ? {} : { compression };
+    await new Client(server, options, uri).handshake(options);
+    return server.requests[0]!.payload["wireFeatures"] as string[];
+  };
+
+  it("declines zstd frames on a loopback address and offers them elsewhere", async () => {
+    // Skipped where this runtime cannot read zstd at all: then it is never offered.
+    const remote = await offered("tcp://db.internal:9090");
+    if (!remote.includes("zstd-frames")) return;
+    assert.ok(!(await offered("tcp://127.0.0.1:9090")).includes("zstd-frames"));
+    assert.ok(!(await offered("tcp://localhost:9090")).includes("zstd-frames"));
+    assert.ok(!(await offered("tcp://[::1]:9090")).includes("zstd-frames"));
+    assert.ok((await offered("tcp://127.0.0.1:9090")).includes("binary-frames"), "binary frames stay on");
+    // A custom transport with no address keeps the old behaviour.
+    assert.ok((await offered(undefined)).includes("zstd-frames"));
+  });
+
+  it("lets compression override the address either way", async () => {
+    const remote = await offered("tcp://db.internal:9090");
+    if (!remote.includes("zstd-frames")) return;
+    assert.ok((await offered("tcp://127.0.0.1:9090", "zstd")).includes("zstd-frames"));
+    assert.ok(!(await offered("tcp://db.internal:9090", "none")).includes("zstd-frames"));
+  });
+
+  it("recognises only literal loopback hosts", () => {
+    for (const uri of ["tcp://127.0.0.1:1", "tcp://127.9.8.7:1", "tcp://localhost:1", "tcp://[::1]:1", "ws://LOCALHOST:1/x"]) {
+      assert.ok(isLoopbackAddress(uri), uri);
+    }
+    for (const uri of ["tcp://10.0.0.1:1", "tcp://db:1", "tcp://128.0.0.1:1", "tcp://localhost.example.com:1", "not a uri"]) {
+      assert.ok(!isLoopbackAddress(uri), uri);
+    }
   });
 });
 
