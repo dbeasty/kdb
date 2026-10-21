@@ -96,6 +96,10 @@ type ServiceSettings struct {
 	// when that is worth it. Off, every version is kept as the original file, whole
 	// (embed.StorageOptions.DisableAttachmentDeltas). On by default.
 	AttachmentDeltas bool
+	// DocumentCopies trades disk for read CPU (embed.StorageOptions.DocumentCopies): on, document
+	// versions in bulk commits get a second, by-value copy so a read need not decompress the commit.
+	// Off by default; switchable on restart, the next open re-filing existing versions to match.
+	DocumentCopies bool
 	// MaintenanceMaxDefer is how many consecutive ticks write load may postpone a due
 	// maintenance pass before it runs anyway. Negative never forces, which risks a busy server
 	// never reclaiming; 0 uses the embed default.
@@ -232,6 +236,7 @@ type ServiceFile struct {
 	AttachmentUploadGrace  *string         `json:"attachmentUploadGrace"`
 	AttachmentDeltaStepMB  *int            `json:"attachmentDeltaStepMb"`
 	AttachmentDeltas       *bool           `json:"attachmentDeltas"`
+	DocumentCopies         *bool           `json:"documentCopies"`
 	TLS                    *ServiceTLSFile `json:"tls"`
 	LogLevel               *string         `json:"logLevel"`
 	LogFormat              *string         `json:"logFormat"`
@@ -338,6 +343,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		}
 		setIf(&s.AttachmentDeltaStepMB, file.AttachmentDeltaStepMB)
 		setIf(&s.AttachmentDeltas, file.AttachmentDeltas)
+		setIf(&s.DocumentCopies, file.DocumentCopies)
 		if file.MaintenanceMaxDefer != nil {
 			s.MaintenanceMaxDefer = *file.MaintenanceMaxDefer
 		}
@@ -466,6 +472,9 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 	if err := envInt("KDB_ATTACHMENT_DELTA_STEP_MB", &s.AttachmentDeltaStepMB); err != nil {
 		return s, err
 	}
+	if err := envBool("KDB_DOCUMENT_COPIES", &s.DocumentCopies); err != nil {
+		return s, err
+	}
 	if err := envBool("KDB_ATTACHMENT_DELTAS", &s.AttachmentDeltas); err != nil {
 		return s, err
 	}
@@ -531,6 +540,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		{"attachment-upload-grace", func() { s.AttachmentUploadGrace = flags.AttachmentUploadGrace }},
 		{"attachment-delta-step-mb", func() { s.AttachmentDeltaStepMB = flags.AttachmentDeltaStepMB }},
 		{"attachment-deltas", func() { s.AttachmentDeltas = flags.AttachmentDeltas }},
+		{"document-copies", func() { s.DocumentCopies = flags.DocumentCopies }},
 		{"maintenance-max-defer", func() { s.MaintenanceMaxDefer = flags.MaintenanceMaxDefer }},
 		{"tls-cert", func() { s.TLSCert = flags.TLSCert }},
 		{"tls-key", func() { s.TLSKey = flags.TLSKey }},

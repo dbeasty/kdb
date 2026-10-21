@@ -121,6 +121,7 @@ func (h *Host) openNamespace(
 		DocumentCacheBytes:    opts.Storage.DocumentCacheBytes,
 		BoundedLiveBodies:     opts.Storage.BoundedLiveBodies,
 		LargeCommitBodyBytes:  opts.Storage.LargeCommitBodyBytes,
+		DocumentCopies:        opts.Storage.DocumentCopies,
 		CommitOpsBytes:        opts.Storage.CommitOpsBytes,
 		DeltaMaxSegmentBytes:  opts.Storage.DeltaMaxSegmentBytes,
 		TreeChainLimit:        opts.Storage.TreeChainLimit,
@@ -354,11 +355,13 @@ func (h *Host) openNamespace(
 	// the delta writer, sealed its segment, or reached ServerEngine.Close()'s final WAL sync.
 	// Set at the end of the open, once nothing can fail it; see startBackgroundCompaction.
 	var bgCompaction *backgroundCompaction
+	var refile *versionRefile
 	storageClose := func() error {
 		var firstErr error
 		// First: a merge still running would otherwise hold the store's tables through the
 		// shutdown below. Cancelling it costs nothing - it has written nothing until it finishes.
 		bgCompaction.stop()
+		refile.stop()
 		// Drain the commit log first: under DurabilityAsync there can be
 		// records queued but not yet written, and sealing the segment out from
 		// under them would drop acknowledged commits on a clean shutdown.
@@ -443,6 +446,9 @@ func (h *Host) openNamespace(
 	}
 	if eng != nil && !opts.ReadOnly && !opts.Storage.DisableBackgroundCompaction {
 		bgCompaction = startBackgroundCompaction(eng, namespaceID)
+	}
+	if eng != nil && !opts.ReadOnly {
+		refile = startVersionRefile(eng, dataRoot, namespaceID)
 	}
 	return &namespaceEntry{rt: rt, close: storageClose}, budget, nil
 }

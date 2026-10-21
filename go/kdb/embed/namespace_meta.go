@@ -37,6 +37,13 @@ type namespaceMeta struct {
 	// documents' bodies exist only in the blob store - even after its history has been fetched
 	// back (peersync.Deepen) and ShallowRoots has emptied. Set once, never cleared.
 	BodiesExternal bool `json:"bodiesExternal,omitempty"`
+	// FilingThresholdBytes is the version-filing threshold (storage.StorageEngineConfig.
+	// ResolvedLargeCommitBodyBytes) the namespace's records were last brought fully in line with,
+	// -1 for "never by value". Absent means storage.DefaultLargeCommitBodyBytes, the only
+	// threshold there was before it could be changed. A writable open that resolves another
+	// threshold re-files in the background (startVersionRefile) and records the new one when
+	// done; until then the records are a correct mix of both.
+	FilingThresholdBytes int64 `json:"filingThresholdBytes,omitempty"`
 }
 
 func namespaceMetaPath(dataRoot, namespaceID string) string {

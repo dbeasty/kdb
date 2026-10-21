@@ -36,8 +36,10 @@ import (
 // qtask's mixed workload. (A version-relative ratio was tried as well and kept qtask's tasks -
 // four to six 12 KiB documents per import commit - on their frames, for the same cost.)
 
-// filedByValue reports whether a version in a frame holding rest bytes besides it is filed by
-// value.
+// filedByValue reports whether a version in a frame holding rest bytes of other bodies besides it
+// is filed by value. rest counts bodies only - what fileBodiesOfLargeCommit sums when the commit is
+// logged - never the payload's encoding around them, so a commit, a cold read of its frame and
+// RefileVersions all reach the same verdict for the same version.
 func filedByValue(rest, threshold int64) bool {
 	return rest >= threshold
 }
@@ -101,9 +103,10 @@ func (e *ServerEngine) documentFromLargeFrame(docID codec.UUID, contentHash code
 	hasher := contentHashers.Get().(*document.ContentHasher)
 	defer contentHashers.Put(hasher)
 	err := pr.ReadPayloadAt(storage.DeltaSegmentRef{NamespaceID: dr.namespaceID, SequenceNumber: segmentSeq}, frameOffset, func(payload []byte) error {
-		large := int64(len(payload)) >= threshold
+		total := frameBodyBytes(payload)
+		large := total >= threshold
 		return document.ScanAllCommitWrites(payload, func(id codec.UUID, patch []byte) bool {
-			if large && !filedByValue(int64(len(payload)-len(patch)), threshold) {
+			if large && !filedByValue(total-int64(len(patch)), threshold) {
 				// The frame is not much more than this version: reading it through the frame
 				// costs about what it costs by value, so it keeps its location (and its single
 				// copy).
@@ -139,3 +142,18 @@ func (e *ServerEngine) documentFromLargeFrame(docID codec.UUID, contentHash code
 // frame. For tests and reporting.
 func (e *ServerEngine) LargeCommitBodiesFiled() int64  { return e.largeCommitBodies.Load() }
 func (e *ServerEngine) LargeFrameBodiesRefiled() int64 { return e.largeFrameRefiled.Load() }
+
+// FilingThresholdBytes is the version-filing threshold in force (see
+// storage.StorageEngineConfig.ResolvedLargeCommitBodyBytes), 0 when nothing is filed by value.
+func (e *ServerEngine) FilingThresholdBytes() int64 { return e.config.ResolvedLargeCommitBodyBytes() }
+
+// frameBodyBytes is the size of every write's body in a commit payload: the total
+// fileBodiesOfLargeCommit takes for the commit, measured from its frame.
+func frameBodyBytes(payload []byte) int64 {
+	var total int64
+	_ = document.ScanAllCommitWrites(payload, func(_ codec.UUID, patch []byte) bool {
+		total += int64(len(patch))
+		return true
+	})
+	return total
+}
