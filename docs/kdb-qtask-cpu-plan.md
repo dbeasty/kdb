@@ -16,6 +16,24 @@ users, two back-to-back cells; v0.9.2 does 69.5-71.2 actions/s (six cells):
 | P3 client declines zstd on loopback | #331 | client-only | 141.5 / 136.3 (+16%) |
 | P2 file by value per version (draft: disk trade) | #332 | flat (69.7 / 72.0) | **178.5 / 172.2 (+26%)**, disk 954 → 1467 MiB |
 
+Final matrix, MongoDB `j:true` and KDB in one run, 2026-10-21 (`qtask/bench/results/2026-10-21-final2-all`,
+KDB = #328-#332 with #331's client; `-final2-nop2` is the same without #332). actions/s, gap to MongoDB in brackets:
+
+| profile | users | v0.9.2 (2026-10-20) | all PRs | without #332 | MongoDB |
+|---|---:|---:|---:|---:|---:|
+| mixed | 1 / 8 / 32 | 30 / 68 / 48 (4.8x / 6.9x / 10.6x) | 56 / 156 / 174 (2.9x / 2.9x / 2.9x) | 49 / 119 / 124 | 160 / 457 / 510 |
+| read-heavy | 1 / 8 / 32 | 28 / 62 / 39 (5.8x / 6.1x / 10.4x) | 58 / 154 / 159 (2.9x / 2.5x / 2.6x) | 50 / 112 / 116 | 167 / 378 / 412 |
+| write-heavy | 1 / 8 / 32 | 34 / 95 / 98 (4.7x / 6.5x / 8.3x) | 54 / 176 / 202 (3.0x / 3.6x / 4.2x) | 49 / 150 / 153 | 159 / 631 / 849 |
+| claim | 1 / 8 / 32 | 107 / 298 / 319 (3.7x / 7.5x / 8.4x) | 110 / 277 / 276 (3.5x / 8.7x / 9.6x) | 111 / 282 / 277 | 385 / 2413 / 2661 |
+
+No errors in any cell. On disk after each profile: MongoDB 1.23-1.63 GB, KDB with #332 0.99-1.74 GB,
+without it 0.91-1.21 GB. Claim did not move: none of P0-P4 touches the conditional-update path
+(`ExecImmediateUpdate`), which is now the largest relative gap.
+
+The cache pool's first cut (a quarter of the machine) put write-heavy @ 32 at the container's 4 GiB
+limit and the memory guard shed 61k writes: secondary-index history and trees held about as much
+again as the pool. #329 now uses an eighth, Cassandra's caches-to-RAM ratio.
+
 What implementing changed in the plan:
 
 - **P0 was not in the first draft and is the largest single item.** kdb-service gave its host
@@ -30,7 +48,7 @@ What implementing changed in the plan:
   of the re-filed bodies (+54% on disk here), which is why #332 is a draft.
 - **P4's gain is small while the server is CPU-bound**, as expected; it is there for when
   requests are cheaper than the CPU, and for a single app instance.
-- **P5 and P6 are not started.** After P0-P4 the profile is led by `topKDocs`/`materializeUpTo`
+- **Claim (8.7-9.6x) is the largest remaining gap**, then P5; **P5 and P6 are not started.** After P0-P4 the profile is led by `topKDocs`/`materializeUpTo`
   reading candidate bodies (P5) and GC (~9%).
 
 ## Where we stand
