@@ -104,6 +104,7 @@ func Main() {
 	fs.IntVar(&flagVals.MemoryBudgetMB, "memory-budget-mb", flagVals.MemoryBudgetMB, "memory budget that admission control governs against: operations reserve their estimated memory cost before running, and are refused with a typed, retryable error once the budget is committed, rather than the process being OOM-killed with no signal to the client. 0 (default) auto-detects - the cgroup/container memory limit where there is one, else 75% of host RAM - so governance is on by default; -1 disables it entirely; a positive value is an explicit budget in MiB. With Component 48's accounting this can be set at the container's real --memory limit, unlike the deprecated --memory-limit-mb it replaces")
 	fs.IntVar(&flagVals.MemoryLimitMB, "memory-limit-mb", flagVals.MemoryLimitMB, "DEPRECATED alias for --memory-budget-mb, retained for existing configs. Its old meaning is preserved: an explicit 0 disables governance (whereas --memory-budget-mb 0 auto-detects). The old guidance to set this to only 60-80% of the container limit no longer applies - it was a workaround for the reactive sampler this replaces")
 	fs.IntVar(&flagVals.MemoryReserveMB, "memory-reserve-mb", flagVals.MemoryReserveMB, "rescue reserve held back from the grant system and released on entry to the Critical pressure zone, so in-flight commits can finish, storage can be flushed, and typed rejections can be written instead of the process dying partway through (kdb-spec-layer13 Component 48 §5.6)")
+	fs.IntVar(&flagVals.CacheMB, "cache-mb", flagVals.CacheMB, "the storage engine's in-memory cache pool in MiB - document versions, SSTable blocks, delta frames, memtables and commit operations - shared by every namespace this process opens. 0 (default) sizes it from the machine the way Cassandra sizes its heap: a quarter of the cgroup/container memory limit where there is one, else of host RAM, capped at 8 GiB and never below 64 MiB. Embedded runtimes keep their own 64 MiB default")
 	fs.IntVar(&flagVals.MaxConnections, "max-connections", flagVals.MaxConnections, "cap on concurrently-accepted connections per listener; connections past the cap are closed at accept time. Each accepted connection costs a goroutine stack and a frame buffer whether or not it sends anything, none of which admission control can see - 0 means unlimited (kdb-spec-layer13 Component 49 §6.5)")
 	fs.IntVar(&flagVals.MaxResultRows, "max-result-rows", flagVals.MaxResultRows, "most rows one SQL reply may carry (default 10000). A larger result fails with RESOURCE_EXHAUSTED instead of being silently cut short; raise it for applications that read whole collections. It also sizes the memory admission control reserves per query, so it interacts with --memory-budget-mb")
 	fs.IntVar(&flagVals.ScanRowBudget, "scan-row-budget", flagVals.ScanRowBudget, "maximum rows a single scan may examine (not merely return) before it is aborted with RESOURCE_EXHAUSTED; shrinks automatically as memory pressure rises. 0 means unlimited (kdb-spec-layer13 Component 48 §5.2)")
@@ -256,6 +257,10 @@ func Main() {
 	// over the same root would simply be refused (docs/kdb-spec-layer17 §1).
 	secondary := map[string]*server.KdbServerRuntime{}
 	var host *embed.Host
+	// What the storage cache pool was sized to, and how (memory mode has none), for the startup
+	// line.
+	var cachePoolBytes int64
+	cachePoolSource := "none (in-memory namespace)"
 
 	if memory {
 		catalog := embed.CatalogFromNamespace(namespace)
@@ -288,7 +293,13 @@ func Main() {
 			os.Exit(1)
 		}
 		server.SetProcessNodeID(nodeID)
-		host, err = embed.OpenFileHost(dataDir, opts)
+		// The cache pool is the host's: every namespace this process opens draws from it. The
+		// namespace's own MemoryBudgetBytes stays zero, which means "a share of the pool" rather
+		// than a fixed size (see Host.Namespace).
+		hostOpts := opts
+		hostOpts.Storage.MemoryBudgetBytes, cachePoolSource = server.CachePoolBytes(cfg.CacheMB)
+		cachePoolBytes = hostOpts.Storage.MemoryBudgetBytes
+		host, err = embed.OpenFileHost(dataDir, hostOpts)
 		if err == nil {
 			rt, err = host.NamespaceWithOptions(
 				embed.CatalogFromNamespace(namespace), namespace, schema.None(), opts.Storage)
@@ -850,6 +861,7 @@ func Main() {
 		"tls", tlsStatus,
 		"rbac", rbacStatus,
 		"memory_limit", memoryLimitStatus,
+		"cache_pool", cachePoolStatus(cachePoolBytes, cachePoolSource),
 		"abort_after", abortStatus,
 		"document_expiry", srv.ExpirySummary(),
 		"maintenance", maintenanceStatus(cfg.MaintenanceInterval, len(maintenance.all())),
@@ -1187,4 +1199,12 @@ func (l lazyReplication) OpenRepairSessionTo(name, ns string) (*peersync.RepairS
 		return r.OpenRepairSessionTo(name, ns)
 	}
 	return nil, fmt.Errorf("no replication peers are configured")
+}
+
+// cachePoolStatus is the startup line's account of the storage cache pool.
+func cachePoolStatus(bytes int64, source string) string {
+	if bytes <= 0 {
+		return source
+	}
+	return fmt.Sprintf("%dMB %s", bytes>>20, source)
 }
