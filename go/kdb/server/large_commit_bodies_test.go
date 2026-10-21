@@ -137,3 +137,56 @@ func TestSmallCommitsKeepLocationRecords(t *testing.T) {
 		t.Fatalf("a 6 KB commit filed %d bodies by value", got)
 	}
 }
+
+// qtask's migration splits its import into commits of at most 64 KiB of bodies, which all sat
+// just under the old 64 KiB-per-commit threshold: filed by location, every later read of one of
+// their small documents decompressed the whole frame. Each version's frame holds far more than
+// 16 KiB and four times the version besides it, so they are filed by value now.
+func TestImportCommitJustUnder64KiBIsFiledByValue(t *testing.T) {
+	dir := t.TempDir()
+	srv, eng := openLargeCommitRuntime(t, dir, 0)
+	defer srv.Runtime.Close()
+	ids, bodies := importCommit(t, srv, 150, 400) // ~62 KB of bodies, the shape of qtask's activities
+	if got := eng.LargeCommitBodiesFiled(); got != int64(len(ids)) {
+		t.Fatalf("%d of %d bodies filed by value", got, len(ids))
+	}
+	if misses := readAll(t, srv, eng, ids, bodies); misses > 2 {
+		t.Fatalf("reading %d documents of one import decompressed %d frames, want ~0", len(ids), misses)
+	}
+}
+
+// The rule is per version: in one commit, the large document whose frame is mostly itself keeps
+// its location, and the small one beside it - whose frame is mostly the other - is filed by
+// value. A commit of two mid-sized documents, neither of whose frames holds 16 KiB besides it,
+// keeps locations for both.
+func TestFilingByValueIsDecidedPerVersion(t *testing.T) {
+	dir := t.TempDir()
+	srv, eng := openLargeCommitRuntime(t, dir, 0)
+	defer srv.Runtime.Close()
+	base, err := srv.Runtime.DAG.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	big, small := mustRandomUUID(t), mustRandomUUID(t)
+	ops := []document.Op{
+		document.WriteOp{DocID: big, Patch: fmt.Sprintf(`{"pad":%q}`, strings.Repeat("b", 40<<10)), Replace: true},
+		document.WriteOp{DocID: small, Patch: `{"pad":"small"}`, Replace: true},
+	}
+	tx := document.Transaction{ID: mustRandomUUID(t), BaseVersion: base, Operations: ops, Timestamp: codec.TimestampNow()}
+	if _, err := srv.Commit(largeCommitNS, tx, "mixed", auth.Principal{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := eng.LargeCommitBodiesFiled(); got != 1 {
+		t.Fatalf("%d bodies filed by value, want 1 (the small one)", got)
+	}
+	importCommit(t, srv, 2, 12<<10)
+	if got := eng.LargeCommitBodiesFiled(); got != 1 {
+		t.Fatalf("two 12 KiB documents filed %d bodies by value, want none", got-1)
+	}
+	// qtask's tasks: five 12 KiB documents to an import commit. Each one's frame holds 48 KiB
+	// besides it, which every read through the frame would decompress, so all five are filed.
+	importCommit(t, srv, 5, 12<<10)
+	if got := eng.LargeCommitBodiesFiled(); got != 6 {
+		t.Fatalf("five 12 KiB documents filed %d bodies by value, want 5", got-1)
+	}
+}
