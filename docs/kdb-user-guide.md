@@ -311,6 +311,7 @@ memory budget, durability, abort watchdog) plus the exact build identity.
 | `--async-sync-interval-ms N` | 5 | background flush period under `async` |
 | `--compression zstd\|none` | `zstd` | codec for new delta frames and SSTable blocks (recorded per frame) |
 | `--sync-mode full\|fast` | `full` | physical sync primitive (`fast` survives OS crash but not power loss) |
+| `--document-copies` | off | trade disk for read CPU: a document in a bulk commit (16 KiB of other bodies beside it, instead of 64 KiB) gets a by-value copy, so reading it does not decompress the commit. qtask's benchmark: +26% throughput, +54% data directory. Switchable on restart - the next open re-files existing documents in the background (`KDB_DOCUMENT_COPIES`, `documentCopies`) |
 | `--version` | — | print version and exit |
 
 **Listeners** — each is enabled by default on loopback; pass an empty value to disable one.

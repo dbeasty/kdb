@@ -308,6 +308,13 @@ func serviceSpecs() []settingSpec {
 			inFile: func(f *ServiceFile) bool { return f.AttachmentDeltas != nil },
 		},
 		{
+			key: "storage.documentCopies", flag: "document-copies", env: "KDB_DOCUMENT_COPIES",
+			scope: ScopeProcess, mutability: MutabilityRestart,
+			help:   "trade disk for read CPU: document versions in bulk commits get a by-value copy, so a read need not decompress the commit. Takes effect on restart; the next open re-files existing versions in the background, and turning it off gives the copies' disk back as the blob store merges",
+			value:  yn(func(s ServiceSettings) bool { return s.DocumentCopies }),
+			inFile: func(f *ServiceFile) bool { return f.DocumentCopies != nil },
+		},
+		{
 			key: "governance.maintenanceMaxDefer", flag: "maintenance-max-defer", env: "KDB_MAINTENANCE_MAX_DEFER",
 			scope: ScopeProcess, mutability: MutabilityLive, unit: "ticks",
 			help:      "how many consecutive ticks write load may postpone a due maintenance pass before it runs anyway. The busiest server is the one whose log grows fastest, so this bound is what stops load starving reclamation; -1 never forces and risks exactly that",
