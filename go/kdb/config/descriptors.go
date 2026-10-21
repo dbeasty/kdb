@@ -238,7 +238,7 @@ func serviceSpecs() []settingSpec {
 		{
 			key: "memory.cacheMB", flag: "cache-mb", env: "KDB_CACHE_MB",
 			scope: ScopeProcess, mutability: MutabilityRestart, unit: "MiB",
-			help:   "the storage engine's in-memory cache pool, shared by every namespace; 0 sizes it from the machine (a quarter of the cgroup limit or host RAM, 64 MiB to 8 GiB)",
+			help:   "the storage engine's in-memory cache pool, shared by every namespace; 0 sizes it from the machine (an eighth of the cgroup limit or host RAM, 64 MiB to 4 GiB)",
 			value:  num(func(s ServiceSettings) int { return s.CacheMB }),
 			inFile: func(f *ServiceFile) bool { return f.CacheMB != nil },
 		},
