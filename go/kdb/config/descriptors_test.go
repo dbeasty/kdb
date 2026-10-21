@@ -24,6 +24,7 @@ var fieldToKey = map[string]string{
 	"MemoryBudgetMB":         "memory.budgetMB",
 	"MemoryLimitMB":          "memory.limitMB",
 	"MemoryReserveMB":        "memory.reserveMB",
+	"CacheMB":                "memory.cacheMB",
 	"MaxConnections":         "governance.maxConnections",
 	"ScanRowBudget":          "governance.scanRowBudget",
 	"MaxResultRows":          "governance.maxResultRows",
@@ -112,7 +113,7 @@ func envProbeValue(key string) string {
 	case "control.ui", "governance.attachmentDeltas":
 		// Defaults to on, so "true" would be indistinguishable from nothing happening.
 		return "false"
-	case "memory.budgetMB", "memory.limitMB", "memory.reserveMB",
+	case "memory.budgetMB", "memory.limitMB", "memory.reserveMB", "memory.cacheMB",
 		"governance.maxConnections", "governance.scanRowBudget", "governance.maxResultRows", "storage.asyncSyncIntervalMS",
 		"governance.maintenanceMaxDefer", "governance.attachmentDeltaStepMB":
 		return "4242"

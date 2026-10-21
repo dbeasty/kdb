@@ -105,3 +105,46 @@ func peerSyncMaxConnections(setting int) int {
 		return setting
 	}
 }
+
+// The storage cache pool kdb-service gives its embed.Host when --cache-mb is 0: a quarter of the
+// memory the process may use, between 64 MiB and 8 GiB. Cassandra sizes its heap from the machine
+// the same way (cassandra-env.sh: a quarter of RAM, capped at 8 GB) and cuts its caches and
+// memtables out of it; MongoDB's WiredTiger cache is half of RAM less 1 GB. An embedded runtime
+// keeps embed.DefaultHostMemoryBudgetBytes (64 MiB) - it shares its process with an application
+// that owns the memory - but a server process owns its container. At the old fixed 64 MiB, qtask's
+// 517k-document benchmark ran with a 4 MiB frame cache and a 9 MiB block cache in a 4 GiB
+// container, and decompressed the same frames on every read.
+const (
+	CachePoolFractionOfMemory       = 0.25
+	MinCachePoolBytes         int64 = 64 << 20
+	MaxCachePoolBytes         int64 = 8 << 30
+)
+
+// CachePoolBytes resolves --cache-mb to bytes and says where the number came from: a positive
+// cacheMB is taken as given; 0 sizes the pool from the cgroup memory limit, else from host RAM,
+// and falls back to MinCachePoolBytes when neither can be read.
+func CachePoolBytes(cacheMB int) (int64, string) {
+	if cacheMB > 0 {
+		return int64(cacheMB) << 20, "explicit"
+	}
+	machine, source := int64(0), ""
+	if v, ok := cgroupMemoryLimitBytes(); ok {
+		machine, source = int64(v), "a quarter of the cgroup memory limit"
+	} else if total, err := storage.TotalSystemMemoryBytes(); err == nil && total > 0 {
+		machine, source = int64(total), "a quarter of host RAM"
+	}
+	if machine <= 0 {
+		return MinCachePoolBytes, "default (no memory limit or host RAM to size from)"
+	}
+	return clampCachePool(int64(float64(machine) * CachePoolFractionOfMemory)), source
+}
+
+func clampCachePool(b int64) int64 {
+	switch {
+	case b < MinCachePoolBytes:
+		return MinCachePoolBytes
+	case b > MaxCachePoolBytes:
+		return MaxCachePoolBytes
+	}
+	return b
+}
