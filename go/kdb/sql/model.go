@@ -123,6 +123,11 @@ type UpdateStatement struct {
 	Where       Expr
 	// Attachments are the SET list's attachment items (attachments.go).
 	Attachments []AttachmentChange
+	// Removes are the REMOVE clause's dotted paths: fields taken out of the document, as
+	// MongoDB's $unset or DynamoDB's REMOVE take them out - not set to null, which SET x = NULL
+	// does. A path that is not there, or that runs through something other than an object, is
+	// left as it is.
+	Removes []string
 	// OrderBy, Limit and Returning are the claim clauses: UPDATE ... [ORDER BY ...] [LIMIT n]
 	// [RETURNING ...]. ORDER BY with LIMIT picks which matching documents are updated; RETURNING
 	// projects each updated document as it is after the update. A statement carrying any of them

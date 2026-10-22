@@ -173,3 +173,18 @@ func TestUpdateCandidatesAndAmong(t *testing.T) {
 		t.Fatalf("%+v %v", res, err)
 	}
 }
+
+// The claim statement's RETURNING shows the document after its REMOVE, as findOneAndUpdate's
+// returnDocument 'after' shows it after $unset.
+func TestUpdateReturningSeesRemovedFields(t *testing.T) {
+	f := newCorpusFixture(t, "app/dml-claim-remove")
+	res, err := f.commitDML(`UPDATE tasks SET status = 'claimed' REMOVE priority
+		WHERE status = 'open' ORDER BY priority LIMIT 1 RETURNING title, priority`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := returnedRows(res); len(got) != 1 || got[0] != "charlie|NULL" {
+		t.Fatalf("returned %q", got)
+	}
+	f.expect(`SELECT COUNT(*) FROM tasks WHERE title = 'charlie' AND priority IS NULL`, "1")
+}
