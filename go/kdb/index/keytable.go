@@ -115,6 +115,11 @@ func (t *keyTable) order() []uint32 {
 	}
 	if len(t.unsorted) > 0 {
 		slices.SortFunc(t.unsorted, t.less)
+		if len(t.unsorted)*16 < len(t.sorted) {
+			t.sorted = t.spliceSorted(t.sorted, t.unsorted)
+			t.unsorted = t.unsorted[:0]
+			return t.sorted
+		}
 		merged := make([]uint32, 0, len(t.sorted)+len(t.unsorted))
 		i, j := 0, 0
 		for i < len(t.sorted) && j < len(t.unsorted) {
@@ -131,6 +136,33 @@ func (t *keyTable) order() []uint32 {
 		t.sorted, t.unsorted = merged, t.unsorted[:0]
 	}
 	return t.sorted
+}
+
+// spliceSorted inserts the few sorted ordinals add into the much longer sorted order, finding each
+// one's place by binary search and moving the rest up in place: O(len(add) log n) key comparisons
+// and a memmove per key. A merge compared every key in the order instead, and a key table
+// that gains a key between every two ordered reads - a BTREE over a timestamp each write
+// rewrites, walked by a queue claim after each - paid that on every read: 85% of the CPU of a
+// claim workload whose walk read one document.
+func (t *keyTable) spliceSorted(order, add []uint32) []uint32 {
+	from := 0
+	for _, a := range add {
+		enc := t.bytes(a)
+		lo, hi := from, len(order)
+		for lo < hi {
+			mid := int(uint(lo+hi) >> 1)
+			if bytes.Compare(t.bytes(order[mid]), enc) <= 0 {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		// In place: slices.Insert grows the order's backing array amortized, and add is sorted,
+		// so the next one's place is after this one.
+		order = slices.Insert(order, lo, a)
+		from = lo + 1
+	}
+	return order
 }
 
 // lowerBound is the first position in order whose key is >= enc.
