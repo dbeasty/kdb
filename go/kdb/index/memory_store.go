@@ -92,6 +92,12 @@ func (s *MemoryStore) Snapshot() ([]byte, error) {
 // answers every read with ErrHistoryUnavailable until it is rebuilt.
 func (s *MemoryStore) NeedsRebuild() bool { return s.log.needsRebuild() }
 
+// HistoryBytes estimates what the store retains for reads at commits behind its head.
+func (s *MemoryStore) HistoryBytes() int64 { return s.log.historyBytes() }
+
+// TrimHistoryOutside drops the as-of history of the commits inWindow does not hold.
+func (s *MemoryStore) TrimHistoryOutside(inWindow func(codec.Hash) bool) { s.log.trimOutside(inWindow) }
+
 // ForgetHistory records that the store's content was just rebuilt from the documents at head,
 // so it holds no history: a read at an older commit reports ErrHistoryUnavailable instead of
 // replaying the rebuild's events as if they had happened then.
