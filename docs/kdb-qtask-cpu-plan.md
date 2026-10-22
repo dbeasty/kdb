@@ -14,7 +14,7 @@ users, two back-to-back cells; v0.9.2 does 69.5-71.2 actions/s (six cells):
 | P0 cache pool sized from the machine (new, see below) | #329 | 109.3 / 104.2 (+50%) | 118.7 / 110.8 (with P1) |
 | P4 SELECTs off the session queue | #330 | flat (CPU-bound) | 122.5 / 116.9 (+3-5%) |
 | P3 client declines zstd on loopback | #331 | client-only | 141.5 / 136.3 (+16%) |
-| P2 file by value per version (draft: disk trade) | #332 | flat (69.7 / 72.0) | **178.5 / 172.2 (+26%)**, disk 954 → 1467 MiB |
+| P2 `--document-copies` (off by default, switchable on restart) | #332 | flat (69.7 / 72.0) | **178.5 / 172.2 (+26%)**, disk 954 → 1467 MiB; switch build: off 110.6 / 106.0 at 920 MiB, on 169.2 / 160.9 at 1464 MiB |
 
 Final matrix, MongoDB `j:true` and KDB in one run, 2026-10-21 (`qtask/bench/results/2026-10-21-final2-all`,
 KDB = #328-#332 with #331's client; `-final2-nop2` is the same without #332). actions/s, gap to MongoDB in brackets:
@@ -45,7 +45,9 @@ What implementing changed in the plan:
   blocks that missed a 9 MiB cache; throughput did not move. The first version's extra rule
   (frame must also hold 4x the version) kept qtask's 12 KiB tasks on their frames - an
   instrumented run counted 315k such versions in 35 s - and was dropped. It costs a second copy
-  of the re-filed bodies (+54% on disk here), which is why #332 is a draft.
+  of the re-filed bodies (+54% on disk here), so it is a switch, `--document-copies`, off by
+  default. Changing it on restart re-files existing versions in the background (22 s on, 19 s off
+  for 517k documents) and, towards fewer copies, merges the store to give the disk back.
 - **P4's gain is small while the server is CPU-bound**, as expected; it is there for when
   requests are cheaper than the CPU, and for a single app instance.
 - **Claim (8.7-9.6x) is the largest remaining gap**, then P5; **P5 and P6 are not started.** After P0-P4 the profile is led by `topKDocs`/`materializeUpTo`
