@@ -518,12 +518,24 @@ type ExecStats struct {
 	// documents plus projected row cells. This is the number an admission grant should have
 	// reserved (before response encoding, which the server accounts for separately).
 	RetainedBytes int64
+	// IndexBehind reports that an index walk that would have served the query could not, because
+	// the index no longer serves the requested commit exactly (commits landed since it was
+	// chosen). A caller free to pick a newer commit can retry there (KdbServerRuntime's queue
+	// claim does).
+	IndexBehind bool
 }
 
 // addExamined counts one examined row. Nil-safe so call sites need no guard.
 func (s *ExecStats) addExamined(n int) {
 	if s != nil {
 		s.RowsExamined += n
+	}
+}
+
+// markIndexBehind records ExecStats.IndexBehind. Nil-safe.
+func (s *ExecStats) markIndexBehind() {
+	if s != nil {
+		s.IndexBehind = true
 	}
 }
 

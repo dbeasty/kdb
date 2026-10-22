@@ -41,6 +41,23 @@ const maxImmediateDiff = 4096
 // maxImmediateCandidates bounds the candidates found before the gate.
 const maxImmediateCandidates = 1024
 
+// maxCandidateRetries is how many times the candidate search is run again at a newer head when an
+// index walk could not serve the one it read (sql.ExecStats.IndexBehind).
+const maxCandidateRetries = 2
+
+// addExecStats adds one statement part's counters into the statement's. Nil-safe.
+func addExecStats(into, from *sql.ExecStats) {
+	if into == nil || from == nil {
+		return
+	}
+	into.RowsExamined += from.RowsExamined
+	into.DocsRead += from.DocsRead
+	into.DocBytesRead += from.DocBytesRead
+	if from.RetainedBytes > into.RetainedBytes {
+		into.RetainedBytes = from.RetainedBytes
+	}
+}
+
 // ImmediateUpdateResult is what an immediate UPDATE did.
 type ImmediateUpdateResult struct {
 	// DML holds the RETURNING columns and rows and the number of documents updated.
@@ -78,15 +95,35 @@ func (s *KdbServerRuntime) ExecImmediateUpdate(upd sql.UpdateStatement, qctx sql
 		narrow     = upd.Limit != nil && *upd.Limit > 0
 	)
 	if narrow {
-		h, err := s.Runtime.DAG.Head()
-		if err != nil {
-			return ImmediateUpdateResult{}, err
-		}
-		readHead = h
-		defer s.pinBaseTree(readHead)()
-		candidates, complete, err = iu.UpdateCandidates(upd, at(readHead), s.immediateCandidateCount(*upd.Limit))
-		if err != nil {
-			return ImmediateUpdateResult{}, err
+		// Any recent head is a correct place to find candidates - the gate re-checks whatever
+		// changed after it - so when an index walk could not serve the head read, because claims
+		// committed in between and the index no longer serves that commit exactly, the search is
+		// run again at the newer head rather than falling back to reading every candidate: 8-14%
+		// of qtask's claims did, under contention, and each such fallback read every pending job.
+		for attempt := 0; ; attempt++ {
+			h, err := s.Runtime.DAG.Head()
+			if err != nil {
+				return ImmediateUpdateResult{}, err
+			}
+			unpin := s.pinBaseTree(h)
+			c := at(h)
+			stats := &sql.ExecStats{}
+			c.Stats = stats
+			cands, comp, err := iu.UpdateCandidates(upd, c, s.immediateCandidateCount(*upd.Limit))
+			addExecStats(qctx.Stats, stats)
+			if err != nil {
+				unpin()
+				return ImmediateUpdateResult{}, err
+			}
+			if stats.IndexBehind && attempt < maxCandidateRetries {
+				if latest, herr := s.Runtime.DAG.Head(); herr == nil && latest != h {
+					unpin()
+					continue
+				}
+			}
+			readHead, candidates, complete = h, cands, comp
+			defer unpin()
+			break
 		}
 	}
 	var out ImmediateUpdateResult

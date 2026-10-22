@@ -118,22 +118,19 @@ func (s *MemoryStore) CompositeSortTags(prefix []Key, atCommit *codec.Hash) (map
 	l := s.log
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	v, err := l.exactViewLocked(atCommit)
-	if err != nil {
+	// Only to refuse a read the index cannot serve exactly, as the walk would.
+	if _, err := l.exactViewLocked(atCommit); err != nil {
 		return nil, err
 	}
 	order := l.keys.order()
+	// One probe per tag: any interned key of that type under the prefix counts, documents or not.
+	// That may report a type only empty keys still carry - the walk then declines, which is safe -
+	// and never misses one, without walking the empty keys a queue leaves behind.
 	tags := map[byte]bool{}
 	for tag := byte(0); tag <= encTagComposite; tag++ {
 		probe := append(slices.Clone(pre), tag)
-		for i := l.keys.lowerBound(order, probe); i < len(order); i++ {
-			if !bytes.HasPrefix(l.keys.bytes(order[i]), probe) {
-				break
-			}
-			if len(v.st.ids(order[i])) > 0 {
-				tags[tag] = true
-				break
-			}
+		if i := l.keys.lowerBound(order, probe); i < len(order) && bytes.HasPrefix(l.keys.bytes(order[i]), probe) {
+			tags[tag] = true
 		}
 	}
 	return tags, nil
