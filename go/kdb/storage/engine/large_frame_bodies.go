@@ -25,12 +25,30 @@ import (
 //
 // Correctness never rests on this. Every record is checked against the content hash it is
 // filed under, and a missing record falls back to the location or the scan as before.
+//
+// The decision is per version, as Cassandra bounds a read by its compressed chunk (16 KiB by
+// default) rather than by the file: a version is filed by value when what a read through its
+// frame decompresses besides the version itself reaches the threshold, however large the version
+// is. A read pays that excess every time; filing by value pays one second copy once. It used to
+// be one absolute test on the commit - bodies adding up to 64 KiB - and qtask's import, which
+// splits its commits at 64 KiB of bodies, landed every commit just under it: every later read of
+// one of its documents decompressed (and CRC-ed) a ~64 KiB frame, 52% of kdb-service's CPU under
+// qtask's mixed workload. (A version-relative ratio was tried as well and kept qtask's tasks -
+// four to six 12 KiB documents per import commit - on their frames, for the same cost.)
+
+// filedByValue reports whether a version in a frame holding rest bytes of other bodies besides it
+// is filed by value. rest counts bodies only - what fileBodiesOfLargeCommit sums when the commit is
+// logged - never the payload's encoding around them, so a commit, a cold read of its frame and
+// RefileVersions all reach the same verdict for the same version.
+func filedByValue(rest, threshold int64) bool {
+	return rest >= threshold
+}
 
 // fileBodiesOfLargeCommit files the records of a commit's changed versions when their bodies add
-// up to the large-commit threshold - by value for every version whose frame holds at least the
-// threshold of other versions' bytes, by location for the rest - and reports whether it did (the
-// caller files locations otherwise). Bodies come from docsByHash, which pins every version until its commit is logged,
-// so all of them are found; one that is not makes the whole commit fall back to locations.
+// up to the large-commit threshold - by value for every version filedByValue picks, by location
+// for the rest - and reports whether it did (the caller files locations otherwise). Bodies come
+// from docsByHash, which pins every version until its commit is logged, so all of them are found;
+// one that is not makes the whole commit fall back to locations.
 func (e *ServerEngine) fileBodiesOfLargeCommit(changed []TreeChange, segmentSeq, frameOffset int64) bool {
 	threshold := e.config.ResolvedLargeCommitBodyBytes()
 	if threshold <= 0 || e.memTable == nil || e.HistoryStrategy() != storage.HistoryStrategyObjects {
@@ -54,7 +72,8 @@ func (e *ServerEngine) fileBodiesOfLargeCommit(changed []TreeChange, segmentSeq,
 		// What a read of this version through the frame would decompress besides the version
 		// itself. A commit of one large document costs its reader nothing extra: it keeps its
 		// location, and the log stays its only copy.
-		if total-int64(len(docs[i].JSON)) < threshold {
+		own := int64(len(docs[i].JSON))
+		if !filedByValue(total-own, threshold) {
 			e.putDocumentLocation(c.ContentHash, segmentSeq, frameOffset)
 			continue
 		}
@@ -84,11 +103,13 @@ func (e *ServerEngine) documentFromLargeFrame(docID codec.UUID, contentHash code
 	hasher := contentHashers.Get().(*document.ContentHasher)
 	defer contentHashers.Put(hasher)
 	err := pr.ReadPayloadAt(storage.DeltaSegmentRef{NamespaceID: dr.namespaceID, SequenceNumber: segmentSeq}, frameOffset, func(payload []byte) error {
-		large := int64(len(payload)) >= threshold
+		total := frameBodyBytes(payload)
+		large := total >= threshold
 		return document.ScanAllCommitWrites(payload, func(id codec.UUID, patch []byte) bool {
-			if large && int64(len(payload)-len(patch)) < threshold {
-				// One version is most of the frame: reading it through the frame costs about
-				// what it costs by value, so it keeps its location (and its single copy).
+			if large && !filedByValue(total-int64(len(patch)), threshold) {
+				// The frame is not much more than this version: reading it through the frame
+				// costs about what it costs by value, so it keeps its location (and its single
+				// copy).
 				if id == docID && !found && hasher.HashBytes(id, patch) == contentHash {
 					doc, found = documentFromPatch(docID, string(patch)), true
 				}
@@ -121,3 +142,18 @@ func (e *ServerEngine) documentFromLargeFrame(docID codec.UUID, contentHash code
 // frame. For tests and reporting.
 func (e *ServerEngine) LargeCommitBodiesFiled() int64  { return e.largeCommitBodies.Load() }
 func (e *ServerEngine) LargeFrameBodiesRefiled() int64 { return e.largeFrameRefiled.Load() }
+
+// FilingThresholdBytes is the version-filing threshold in force (see
+// storage.StorageEngineConfig.ResolvedLargeCommitBodyBytes), 0 when nothing is filed by value.
+func (e *ServerEngine) FilingThresholdBytes() int64 { return e.config.ResolvedLargeCommitBodyBytes() }
+
+// frameBodyBytes is the size of every write's body in a commit payload: the total
+// fileBodiesOfLargeCommit takes for the commit, measured from its frame.
+func frameBodyBytes(payload []byte) int64 {
+	var total int64
+	_ = document.ScanAllCommitWrites(payload, func(_ codec.UUID, patch []byte) bool {
+		total += int64(len(patch))
+		return true
+	})
+	return total
+}

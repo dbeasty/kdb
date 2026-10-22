@@ -292,10 +292,11 @@ func (h *sqlWireConnHandler) dispatchAndSendReserved(conn FrameConn, message wir
 
 // sessionTicket enqueues message behind every earlier frame naming the same session: wait is
 // closed once the previous frame on that session has finished, done must be called when this one
-// has. A frame naming no session gets an already-closed wait and a no-op done.
+// has. A frame naming no session, or a read that uses none of its session's state
+// (readsNoSessionState), gets an already-closed wait and a no-op done.
 func (h *sqlWireConnHandler) sessionTicket(message wire.Message) (wait <-chan struct{}, done func()) {
 	sessionID, ok := sessionIDOf(message)
-	if !ok || sessionID == "" {
+	if !ok || sessionID == "" || h.readsNoSessionState(message) {
 		return closedChan, func() {}
 	}
 	mine := make(chan struct{})
@@ -314,6 +315,48 @@ func (h *sqlWireConnHandler) sessionTicket(message wire.Message) (wait <-chan st
 		}
 		h.sessionMu.Unlock()
 	}
+}
+
+// readsNoSessionState reports whether message is a SELECT whose result does not depend on where
+// it falls among its session's other frames, so it need not wait behind them. As with Cassandra's
+// native-protocol stream ids, requests on one connection then run concurrently, and ordering is
+// kept only where session state makes it matter.
+//
+// A SELECT reads one piece of session state: a SNAPSHOT session's read pin, which moves at every
+// transaction boundary (KdbSession.ReadHead, crossReadHead). A READ_COMMITTED or
+// READ_YOUR_WRITES session reads the live head and never its pending transaction, so the same
+// SELECT gives the same answer whether or not the session's earlier frames have finished. Its
+// consistency is fixed when the session opens. Without this, every query an app process sends on
+// its one session ran one at a time: qtask, at 8 users, had 2 requests in flight across 4
+// connections while the rest queued here.
+//
+// Everything else stays ordered: SNAPSHOT sessions, DML (buffered on the session), transaction
+// control, and any statement that does not start with SELECT. An unknown session stays ordered
+// too; handleSqlExec rejects it either way.
+func (h *sqlWireConnHandler) readsNoSessionState(message wire.Message) bool {
+	msg, ok := message.(wire.SqlExecMessage)
+	if !ok || !isPlainSelect(msg.SQL) {
+		return false
+	}
+	sess, ok := h.sessions.Get(msg.SessionID)
+	return ok && sess.ReadConsistency != Snapshot
+}
+
+// isPlainSelect reports whether sql starts with the SELECT keyword. Deliberately literal: a
+// statement it does not recognise is only ordered, never wrong.
+func isPlainSelect(sql string) bool {
+	s := strings.TrimLeft(sql, " \t\r\n")
+	if len(s) < len("SELECT") || !strings.EqualFold(s[:len("SELECT")], "SELECT") {
+		return false
+	}
+	if len(s) == len("SELECT") {
+		return false
+	}
+	switch s[len("SELECT")] {
+	case ' ', '\t', '\r', '\n', '(', '*':
+		return true
+	}
+	return false
 }
 
 var closedChan = func() chan struct{} {

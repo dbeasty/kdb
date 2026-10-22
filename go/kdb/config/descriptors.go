@@ -236,6 +236,13 @@ func serviceSpecs() []settingSpec {
 			setInFile: setIntInFile(func(f *ServiceFile, n int) { f.MemoryReserveMB = &n }, 0),
 		},
 		{
+			key: "memory.cacheMB", flag: "cache-mb", env: "KDB_CACHE_MB",
+			scope: ScopeProcess, mutability: MutabilityRestart, unit: "MiB",
+			help:   "the storage engine's in-memory cache pool, shared by every namespace; 0 sizes it from the machine (an eighth of the cgroup limit or host RAM, 64 MiB to 4 GiB)",
+			value:  num(func(s ServiceSettings) int { return s.CacheMB }),
+			inFile: func(f *ServiceFile) bool { return f.CacheMB != nil },
+		},
+		{
 			key: "governance.maxConnections", flag: "max-connections", env: "KDB_MAX_CONNECTIONS",
 			scope: ScopeListener, mutability: MutabilityNewConnections,
 			help:   "cap on concurrently-accepted connections per listener; 0 is unlimited. Copied into transport options at listener construction, so a change reaches only listeners created afterwards",
@@ -306,6 +313,13 @@ func serviceSpecs() []settingSpec {
 			help:   "re-store a replaced attachment version as a delta against its successor when that saves space. Off, every version is kept as the original file, whole, and maintenance turns deltas already stored back into whole files. Applies to namespaces opened after it is set",
 			value:  yn(func(s ServiceSettings) bool { return s.AttachmentDeltas }),
 			inFile: func(f *ServiceFile) bool { return f.AttachmentDeltas != nil },
+		},
+		{
+			key: "storage.documentCopies", flag: "document-copies", env: "KDB_DOCUMENT_COPIES",
+			scope: ScopeProcess, mutability: MutabilityRestart,
+			help:   "trade disk for read CPU: document versions in bulk commits get a by-value copy, so a read need not decompress the commit. Takes effect on restart; the next open re-files existing versions in the background, and turning it off gives the copies' disk back as the blob store merges",
+			value:  yn(func(s ServiceSettings) bool { return s.DocumentCopies }),
+			inFile: func(f *ServiceFile) bool { return f.DocumentCopies != nil },
 		},
 		{
 			key: "governance.maintenanceMaxDefer", flag: "maintenance-max-defer", env: "KDB_MAINTENANCE_MAX_DEFER",

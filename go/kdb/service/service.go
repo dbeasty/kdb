@@ -104,6 +104,7 @@ func Main() {
 	fs.IntVar(&flagVals.MemoryBudgetMB, "memory-budget-mb", flagVals.MemoryBudgetMB, "memory budget that admission control governs against: operations reserve their estimated memory cost before running, and are refused with a typed, retryable error once the budget is committed, rather than the process being OOM-killed with no signal to the client. 0 (default) auto-detects - the cgroup/container memory limit where there is one, else 75% of host RAM - so governance is on by default; -1 disables it entirely; a positive value is an explicit budget in MiB. With Component 48's accounting this can be set at the container's real --memory limit, unlike the deprecated --memory-limit-mb it replaces")
 	fs.IntVar(&flagVals.MemoryLimitMB, "memory-limit-mb", flagVals.MemoryLimitMB, "DEPRECATED alias for --memory-budget-mb, retained for existing configs. Its old meaning is preserved: an explicit 0 disables governance (whereas --memory-budget-mb 0 auto-detects). The old guidance to set this to only 60-80% of the container limit no longer applies - it was a workaround for the reactive sampler this replaces")
 	fs.IntVar(&flagVals.MemoryReserveMB, "memory-reserve-mb", flagVals.MemoryReserveMB, "rescue reserve held back from the grant system and released on entry to the Critical pressure zone, so in-flight commits can finish, storage can be flushed, and typed rejections can be written instead of the process dying partway through (kdb-spec-layer13 Component 48 §5.6)")
+	fs.IntVar(&flagVals.CacheMB, "cache-mb", flagVals.CacheMB, "the storage engine's in-memory cache pool in MiB - document versions, SSTable blocks, delta frames, memtables and commit operations - shared by every namespace this process opens. 0 (default) sizes it from the machine the way Cassandra sizes its caches: an eighth of the cgroup/container memory limit where there is one, else of host RAM (half of a Cassandra-sized heap), capped at 4 GiB and never below 64 MiB. Embedded runtimes keep their own 64 MiB default")
 	fs.IntVar(&flagVals.MaxConnections, "max-connections", flagVals.MaxConnections, "cap on concurrently-accepted connections per listener; connections past the cap are closed at accept time. Each accepted connection costs a goroutine stack and a frame buffer whether or not it sends anything, none of which admission control can see - 0 means unlimited (kdb-spec-layer13 Component 49 §6.5)")
 	fs.IntVar(&flagVals.MaxResultRows, "max-result-rows", flagVals.MaxResultRows, "most rows one SQL reply may carry (default 10000). A larger result fails with RESOURCE_EXHAUSTED instead of being silently cut short; raise it for applications that read whole collections. It also sizes the memory admission control reserves per query, so it interacts with --memory-budget-mb")
 	fs.IntVar(&flagVals.ScanRowBudget, "scan-row-budget", flagVals.ScanRowBudget, "maximum rows a single scan may examine (not merely return) before it is aborted with RESOURCE_EXHAUSTED; shrinks automatically as memory pressure rises. 0 means unlimited (kdb-spec-layer13 Component 48 §5.2)")
@@ -119,6 +120,7 @@ func Main() {
 	fs.DurationVar(&flagVals.MaintenanceSweep, "maintenance-sweep", flagVals.MaintenanceSweep, "how long the maintenance loop may go without a pass while a namespace is idle - retention expires by wall clock with no commit involved, so this is what catches a window that aged out of a namespace nobody is writing to")
 	fs.IntVar(&flagVals.AttachmentDeltaStepMB, "attachment-delta-step-mb", flagVals.AttachmentDeltaStepMB, "how many MiB one maintenance pass reads diffing replaced attachment versions into deltas; a larger version is diffed over several passes (0: 4096)")
 	fs.BoolVar(&flagVals.AttachmentDeltas, "attachment-deltas", flagVals.AttachmentDeltas, "re-store a replaced attachment version as a delta against its successor when that saves space; false keeps every version as the original file, whole, and maintenance turns deltas already stored back into whole files")
+	fs.BoolVar(&flagVals.DocumentCopies, "document-copies", flagVals.DocumentCopies, "trade disk for read CPU: give document versions in bulk commits (16 KiB or more of other bodies in the same commit, rather than 64 KiB) a by-value copy, so a read finds the document alone instead of decompressing its commit. Off by default. Switchable on restart: the next open re-files existing versions in the background, and turning it off gives the copies' disk back as the blob store merges")
 	fs.IntVar(&flagVals.MaintenanceMaxDefer, "maintenance-max-defer", flagVals.MaintenanceMaxDefer, "how many consecutive ticks write load may postpone a due maintenance pass before it runs anyway; -1 never forces one through, which risks a busy server never reclaiming")
 	fs.StringVar(&flagVals.ControlAddr, "control-addr", flagVals.ControlAddr, "control-plane HTTP listen address (host:port) serving the JSON control API and, unless --control-ui=false, the embedded control UI: namespaces, commit history, per-commit diffs, schema, and the resolved configuration with provenance. Unlike --admin-addr it authenticates every request against the same auth engine the wire listeners use; without --rbac that engine accepts any credentials, so a non-loopback address is refused unless --control-open (empty to disable). With --rbac, issue clients revocable access tokens: kdb-service token create")
 	fs.BoolVar(&flagVals.ControlWrite, "control-write", flagVals.ControlWrite, "allow the control plane's mutating endpoints. Off by default: turning the control plane on is not, by itself, a decision to let a browser write to the database. Nothing mutating is implemented yet, so today this only decides whether such a request is refused as forbidden or reported as not-yet-built")
@@ -256,6 +258,10 @@ func Main() {
 	// over the same root would simply be refused (docs/kdb-spec-layer17 §1).
 	secondary := map[string]*server.KdbServerRuntime{}
 	var host *embed.Host
+	// What the storage cache pool was sized to, and how (memory mode has none), for the startup
+	// line.
+	var cachePoolBytes int64
+	cachePoolSource := "none (in-memory namespace)"
 
 	if memory {
 		catalog := embed.CatalogFromNamespace(namespace)
@@ -282,13 +288,20 @@ func Main() {
 		opts.Storage.AttachmentUploadGrace = cfg.AttachmentUploadGrace
 		opts.Storage.AttachmentDeltaStepBytes = int64(cfg.AttachmentDeltaStepMB) << 20
 		opts.Storage.DisableAttachmentDeltas = !cfg.AttachmentDeltas
+		opts.Storage.DocumentCopies = cfg.DocumentCopies
 		var nodeID codec.UUID
 		if nodeID, err = embed.LoadOrCreateNodeID(dataDir); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: node identity: %v\n", err)
 			os.Exit(1)
 		}
 		server.SetProcessNodeID(nodeID)
-		host, err = embed.OpenFileHost(dataDir, opts)
+		// The cache pool is the host's: every namespace this process opens draws from it. The
+		// namespace's own MemoryBudgetBytes stays zero, which means "a share of the pool" rather
+		// than a fixed size (see Host.Namespace).
+		hostOpts := opts
+		hostOpts.Storage.MemoryBudgetBytes, cachePoolSource = server.CachePoolBytes(cfg.CacheMB)
+		cachePoolBytes = hostOpts.Storage.MemoryBudgetBytes
+		host, err = embed.OpenFileHost(dataDir, hostOpts)
 		if err == nil {
 			rt, err = host.NamespaceWithOptions(
 				embed.CatalogFromNamespace(namespace), namespace, schema.None(), opts.Storage)
@@ -850,6 +863,7 @@ func Main() {
 		"tls", tlsStatus,
 		"rbac", rbacStatus,
 		"memory_limit", memoryLimitStatus,
+		"cache_pool", cachePoolStatus(cachePoolBytes, cachePoolSource),
 		"abort_after", abortStatus,
 		"document_expiry", srv.ExpirySummary(),
 		"maintenance", maintenanceStatus(cfg.MaintenanceInterval, len(maintenance.all())),
@@ -1187,4 +1201,12 @@ func (l lazyReplication) OpenRepairSessionTo(name, ns string) (*peersync.RepairS
 		return r.OpenRepairSessionTo(name, ns)
 	}
 	return nil, fmt.Errorf("no replication peers are configured")
+}
+
+// cachePoolStatus is the startup line's account of the storage cache pool.
+func cachePoolStatus(bytes int64, source string) string {
+	if bytes <= 0 {
+		return source
+	}
+	return fmt.Sprintf("%dMB %s", bytes>>20, source)
 }

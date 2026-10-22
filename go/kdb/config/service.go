@@ -60,6 +60,12 @@ type ServiceSettings struct {
 	MemoryLimitMB int
 	// MemoryReserveMB is the rescue reserve held back for the abort sequence (§5.6).
 	MemoryReserveMB int
+	// CacheMB is the storage engine's in-memory cache pool - document versions, the SSTable block
+	// cache, the delta frame cache, memtables and commit operations - shared by every namespace the
+	// process opens. 0 (default) sizes it from the machine as Cassandra sizes its caches: an eighth
+	// of the memory the process may use (the cgroup limit where there is one, else host RAM),
+	// at most 4 GiB and at least 64 MiB. A positive value is an explicit size in MiB.
+	CacheMB int
 	// MaxConnections caps concurrently-accepted connections per listener (§6.5); 0 is unlimited.
 	MaxConnections int
 	// ScanRowBudget caps rows examined per scan (§5.2), not merely rows returned.
@@ -90,6 +96,10 @@ type ServiceSettings struct {
 	// when that is worth it. Off, every version is kept as the original file, whole
 	// (embed.StorageOptions.DisableAttachmentDeltas). On by default.
 	AttachmentDeltas bool
+	// DocumentCopies trades disk for read CPU (embed.StorageOptions.DocumentCopies): on, document
+	// versions in bulk commits get a second, by-value copy so a read need not decompress the commit.
+	// Off by default; switchable on restart, the next open re-filing existing versions to match.
+	DocumentCopies bool
 	// MaintenanceMaxDefer is how many consecutive ticks write load may postpone a due
 	// maintenance pass before it runs anyway. Negative never forces, which risks a busy server
 	// never reclaiming; 0 uses the embed default.
@@ -177,9 +187,11 @@ func DefaultServiceSettings() ServiceSettings {
 		// 0 = auto-detect the budget rather than run ungoverned - see MemoryBudgetMB.
 		MemoryBudgetMB:  0,
 		MemoryReserveMB: int(server.DefaultRescueReserveBytes >> 20),
-		MaxConnections:  server.DefaultMaxConnections,
-		ScanRowBudget:   int(server.DefaultScanRowBudget),
-		MaxResultRows:   server.DefaultMaxResultRows,
+		// 0 = size the cache pool from the machine - see CacheMB.
+		CacheMB:        0,
+		MaxConnections: server.DefaultMaxConnections,
+		ScanRowBudget:  int(server.DefaultScanRowBudget),
+		MaxResultRows:  server.DefaultMaxResultRows,
 		// sync: an acknowledged write is on disk. Group commit (see
 		// embed.commitLogWriter) amortizes the fsync across concurrent writers,
 		// so this is the safe default without being the slow one it used to be.
@@ -212,6 +224,7 @@ type ServiceFile struct {
 	MemoryBudgetMB         *int            `json:"memoryBudgetMb"`
 	MemoryLimitMB          *int            `json:"memoryLimitMb"`
 	MemoryReserveMB        *int            `json:"memoryReserveMb"`
+	CacheMB                *int            `json:"cacheMb"`
 	MaxConnections         *int            `json:"maxConnections"`
 	ScanRowBudget          *int            `json:"scanRowBudget"`
 	MaxResultRows          *int            `json:"maxResultRows"`
@@ -223,6 +236,7 @@ type ServiceFile struct {
 	AttachmentUploadGrace  *string         `json:"attachmentUploadGrace"`
 	AttachmentDeltaStepMB  *int            `json:"attachmentDeltaStepMb"`
 	AttachmentDeltas       *bool           `json:"attachmentDeltas"`
+	DocumentCopies         *bool           `json:"documentCopies"`
 	TLS                    *ServiceTLSFile `json:"tls"`
 	LogLevel               *string         `json:"logLevel"`
 	LogFormat              *string         `json:"logFormat"`
@@ -306,6 +320,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		setIf(&s.MemoryBudgetMB, file.MemoryBudgetMB)
 		setIf(&s.MemoryLimitMB, file.MemoryLimitMB)
 		setIf(&s.MemoryReserveMB, file.MemoryReserveMB)
+		setIf(&s.CacheMB, file.CacheMB)
 		setIf(&s.MaxConnections, file.MaxConnections)
 		setIf(&s.ScanRowBudget, file.ScanRowBudget)
 		setIf(&s.MaxResultRows, file.MaxResultRows)
@@ -328,6 +343,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		}
 		setIf(&s.AttachmentDeltaStepMB, file.AttachmentDeltaStepMB)
 		setIf(&s.AttachmentDeltas, file.AttachmentDeltas)
+		setIf(&s.DocumentCopies, file.DocumentCopies)
 		if file.MaintenanceMaxDefer != nil {
 			s.MaintenanceMaxDefer = *file.MaintenanceMaxDefer
 		}
@@ -426,6 +442,9 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 	if err := envInt("KDB_MEMORY_RESERVE_MB", &s.MemoryReserveMB); err != nil {
 		return s, err
 	}
+	if err := envInt("KDB_CACHE_MB", &s.CacheMB); err != nil {
+		return s, err
+	}
 	if err := envInt("KDB_MAX_CONNECTIONS", &s.MaxConnections); err != nil {
 		return s, err
 	}
@@ -451,6 +470,9 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		return s, err
 	}
 	if err := envInt("KDB_ATTACHMENT_DELTA_STEP_MB", &s.AttachmentDeltaStepMB); err != nil {
+		return s, err
+	}
+	if err := envBool("KDB_DOCUMENT_COPIES", &s.DocumentCopies); err != nil {
 		return s, err
 	}
 	if err := envBool("KDB_ATTACHMENT_DELTAS", &s.AttachmentDeltas); err != nil {
@@ -507,6 +529,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		{"memory-budget-mb", func() { s.MemoryBudgetMB = flags.MemoryBudgetMB; budgetSet = true }},
 		{"memory-limit-mb", func() { s.MemoryLimitMB = flags.MemoryLimitMB; limitSet = true }},
 		{"memory-reserve-mb", func() { s.MemoryReserveMB = flags.MemoryReserveMB }},
+		{"cache-mb", func() { s.CacheMB = flags.CacheMB }},
 		{"max-connections", func() { s.MaxConnections = flags.MaxConnections }},
 		{"scan-row-budget", func() { s.ScanRowBudget = flags.ScanRowBudget }},
 		{"max-result-rows", func() { s.MaxResultRows = flags.MaxResultRows }},
@@ -517,6 +540,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		{"attachment-upload-grace", func() { s.AttachmentUploadGrace = flags.AttachmentUploadGrace }},
 		{"attachment-delta-step-mb", func() { s.AttachmentDeltaStepMB = flags.AttachmentDeltaStepMB }},
 		{"attachment-deltas", func() { s.AttachmentDeltas = flags.AttachmentDeltas }},
+		{"document-copies", func() { s.DocumentCopies = flags.DocumentCopies }},
 		{"maintenance-max-defer", func() { s.MaintenanceMaxDefer = flags.MaintenanceMaxDefer }},
 		{"tls-cert", func() { s.TLSCert = flags.TLSCert }},
 		{"tls-key", func() { s.TLSKey = flags.TLSKey }},
@@ -559,6 +583,9 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 	}
 	if s.MemoryReserveMB < 0 {
 		return s, fmt.Errorf("memory-reserve-mb must be >= 0, got %d", s.MemoryReserveMB)
+	}
+	if s.CacheMB < 0 {
+		return s, fmt.Errorf("cache-mb must be 0 (size from the machine) or a positive size in MiB, got %d", s.CacheMB)
 	}
 	if s.MaxConnections < 0 {
 		return s, fmt.Errorf("max-connections must be >= 0 (0 means unlimited), got %d", s.MaxConnections)

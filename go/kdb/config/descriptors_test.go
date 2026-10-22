@@ -24,6 +24,7 @@ var fieldToKey = map[string]string{
 	"MemoryBudgetMB":         "memory.budgetMB",
 	"MemoryLimitMB":          "memory.limitMB",
 	"MemoryReserveMB":        "memory.reserveMB",
+	"CacheMB":                "memory.cacheMB",
 	"MaxConnections":         "governance.maxConnections",
 	"ScanRowBudget":          "governance.scanRowBudget",
 	"MaxResultRows":          "governance.maxResultRows",
@@ -34,6 +35,7 @@ var fieldToKey = map[string]string{
 	"AttachmentUploadGrace":  "governance.attachmentUploadGrace",
 	"AttachmentDeltaStepMB":  "governance.attachmentDeltaStepMB",
 	"AttachmentDeltas":       "governance.attachmentDeltas",
+	"DocumentCopies":         "storage.documentCopies",
 	"MaintenanceMaxDefer":    "governance.maintenanceMaxDefer",
 	"TLSCert":                "tls.certFile",
 	"TLSKey":                 "tls.keyFile",
@@ -107,12 +109,12 @@ func envProbeValue(key string) string {
 	switch key {
 	case "storage.memory", "auth.rbac", "tls.clientAuth", "control.write":
 		return "true"
-	case "control.settingsPersist", "control.promote":
+	case "control.settingsPersist", "control.promote", "storage.documentCopies":
 		return "true"
 	case "control.ui", "governance.attachmentDeltas":
 		// Defaults to on, so "true" would be indistinguishable from nothing happening.
 		return "false"
-	case "memory.budgetMB", "memory.limitMB", "memory.reserveMB",
+	case "memory.budgetMB", "memory.limitMB", "memory.reserveMB", "memory.cacheMB",
 		"governance.maxConnections", "governance.scanRowBudget", "governance.maxResultRows", "storage.asyncSyncIntervalMS",
 		"governance.maintenanceMaxDefer", "governance.attachmentDeltaStepMB":
 		return "4242"

@@ -1,9 +1,13 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -18,7 +22,14 @@ const largeCommitNS = "app/data"
 
 func openLargeCommitRuntime(t *testing.T, dir string, threshold int64) (*KdbServerRuntime, *engine.ServerEngine) {
 	t.Helper()
+	return openLargeCommitRuntimeWith(t, dir, threshold, false)
+}
+
+// openLargeCommitRuntimeWith is openLargeCommitRuntime with StorageOptions.DocumentCopies set.
+func openLargeCommitRuntimeWith(t *testing.T, dir string, threshold int64, copies bool) (*KdbServerRuntime, *engine.ServerEngine) {
+	t.Helper()
 	opts := embed.FileRuntimeOptions{}
+	opts.Storage.DocumentCopies = copies
 	opts.Storage.MemoryBudgetBytes = 4 << 20
 	opts.Storage.DocumentCacheBytes = 1 << 20
 	opts.Storage.BoundedLiveBodies = true
@@ -135,5 +146,159 @@ func TestSmallCommitsKeepLocationRecords(t *testing.T) {
 	importCommit(t, srv, 3, 2000)
 	if got := eng.LargeCommitBodiesFiled(); got != 0 {
 		t.Fatalf("a 6 KB commit filed %d bodies by value", got)
+	}
+}
+
+// qtask's migration splits its import into commits of at most 64 KiB of bodies, which all sit
+// just under the 64 KiB threshold: filed by location, every later read of one of their small
+// documents decompresses the whole frame. With document copies on, the threshold is 16 KiB and
+// they are filed by value.
+func TestImportCommitJustUnder64KiBIsFiledByValue(t *testing.T) {
+	dir := t.TempDir()
+	srv, eng := openLargeCommitRuntimeWith(t, dir, 0, true)
+	defer srv.Runtime.Close()
+	ids, bodies := importCommit(t, srv, 150, 400) // ~62 KB of bodies, the shape of qtask's activities
+	if got := eng.LargeCommitBodiesFiled(); got != int64(len(ids)) {
+		t.Fatalf("%d of %d bodies filed by value", got, len(ids))
+	}
+	if misses := readAll(t, srv, eng, ids, bodies); misses > 2 {
+		t.Fatalf("reading %d documents of one import decompressed %d frames, want ~0", len(ids), misses)
+	}
+}
+
+// The rule is per version: in one commit, the large document whose frame is mostly itself keeps
+// its location, and the small one beside it - whose frame is mostly the other - is filed by
+// value. A commit of two mid-sized documents, neither of whose frames holds 16 KiB besides it,
+// keeps locations for both.
+func TestFilingByValueIsDecidedPerVersion(t *testing.T) {
+	dir := t.TempDir()
+	srv, eng := openLargeCommitRuntimeWith(t, dir, 0, true)
+	defer srv.Runtime.Close()
+	base, err := srv.Runtime.DAG.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	big, small := mustRandomUUID(t), mustRandomUUID(t)
+	ops := []document.Op{
+		document.WriteOp{DocID: big, Patch: fmt.Sprintf(`{"pad":%q}`, strings.Repeat("b", 40<<10)), Replace: true},
+		document.WriteOp{DocID: small, Patch: `{"pad":"small"}`, Replace: true},
+	}
+	tx := document.Transaction{ID: mustRandomUUID(t), BaseVersion: base, Operations: ops, Timestamp: codec.TimestampNow()}
+	if _, err := srv.Commit(largeCommitNS, tx, "mixed", auth.Principal{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := eng.LargeCommitBodiesFiled(); got != 1 {
+		t.Fatalf("%d bodies filed by value, want 1 (the small one)", got)
+	}
+	importCommit(t, srv, 2, 12<<10)
+	if got := eng.LargeCommitBodiesFiled(); got != 1 {
+		t.Fatalf("two 12 KiB documents filed %d bodies by value, want none", got-1)
+	}
+	// qtask's tasks: five 12 KiB documents to an import commit. Each one's frame holds 48 KiB
+	// besides it, which every read through the frame would decompress, so all five are filed.
+	importCommit(t, srv, 5, 12<<10)
+	if got := eng.LargeCommitBodiesFiled(); got != 6 {
+		t.Fatalf("five 12 KiB documents filed %d bodies by value, want 5", got-1)
+	}
+}
+
+// Without document copies the threshold stays 64 KiB, and the same import keeps its locations:
+// the log is the only copy, as before the switch existed.
+func TestImportCommitJustUnder64KiBKeepsLocationsWithoutCopies(t *testing.T) {
+	dir := t.TempDir()
+	srv, eng := openLargeCommitRuntime(t, dir, 0)
+	defer srv.Runtime.Close()
+	importCommit(t, srv, 150, 400)
+	if got := eng.LargeCommitBodiesFiled(); got != 0 {
+		t.Fatalf("copies off filed %d bodies by value, want none", got)
+	}
+}
+
+// filedByValue counts how many of bodies' versions are filed by value, failing on any with no
+// record at all.
+func filedByValueCount(t *testing.T, eng *engine.ServerEngine, bodies map[codec.UUID]string) int {
+	t.Helper()
+	var hasher document.ContentHasher
+	n := 0
+	for id, body := range bodies {
+		byValue, found := eng.VersionFiledByValue(hasher.HashBytes(id, []byte(body)))
+		if !found {
+			t.Fatalf("document %s has no record", id)
+		}
+		if byValue {
+			n++
+		}
+	}
+	return n
+}
+
+// waitForFilingMarker waits until the namespace's marker records want as its filing threshold:
+// the background re-filing pass an open starts has finished.
+func waitForFilingMarker(t *testing.T, dir string, want int64) {
+	t.Helper()
+	path := filepath.Join(dir, "ns", filepath.FromSlash(largeCommitNS), "meta.json")
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var m struct {
+			FilingThresholdBytes int64 `json:"filingThresholdBytes"`
+		}
+		if raw, err := os.ReadFile(path); err == nil && json.Unmarshal(raw, &m) == nil && m.FilingThresholdBytes == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the re-filing pass never recorded threshold %d", want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// sstableBytes is the size of the namespace's blob-store tables on disk.
+func sstableBytes(t *testing.T, dir string) int64 {
+	t.Helper()
+	var n int64
+	_ = filepath.Walk(filepath.Join(dir, "ns", filepath.FromSlash(largeCommitNS), "sstable"), func(_ string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			n += info.Size()
+		}
+		return nil
+	})
+	return n
+}
+
+// DocumentCopies is switchable across restarts in both directions: turning it on re-files the
+// versions written without it by value, and turning it off puts their locations back and merges
+// the blob store, giving the copies' disk back.
+func TestDocumentCopiesSwitchBothWaysAcrossRestarts(t *testing.T) {
+	dir := t.TempDir()
+	srv, eng := openLargeCommitRuntime(t, dir, 0)
+	ids, bodies := importCommit(t, srv, 150, 400)
+	if n := filedByValueCount(t, eng, bodies); n != 0 {
+		t.Fatalf("copies off: %d versions by value, want 0", n)
+	}
+	srv.Runtime.Close()
+
+	srv, eng = openLargeCommitRuntimeWith(t, dir, 0, true)
+	waitForFilingMarker(t, dir, 16<<10)
+	if n := filedByValueCount(t, eng, bodies); n != len(ids) {
+		t.Fatalf("copies on: %d of %d versions by value after the re-filing pass", n, len(ids))
+	}
+	readAll(t, srv, eng, ids, bodies)
+	if err := eng.Flush(largeCommitNS); err != nil {
+		t.Fatal(err)
+	}
+	withCopies := sstableBytes(t, dir)
+	srv.Runtime.Close()
+
+	srv, eng = openLargeCommitRuntime(t, dir, 0)
+	defer srv.Runtime.Close()
+	waitForFilingMarker(t, dir, 64<<10)
+	if n := filedByValueCount(t, eng, bodies); n != 0 {
+		t.Fatalf("copies off again: %d versions still by value", n)
+	}
+	readAll(t, srv, eng, ids, bodies)
+	// The pass merged the store before recording the marker: the copies' bytes are gone, with no
+	// merge from anyone else.
+	if without := sstableBytes(t, dir); without >= withCopies {
+		t.Fatalf("turning copies off gave no disk back: %d table bytes with copies, %d after the pass", withCopies, without)
 	}
 }

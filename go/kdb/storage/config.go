@@ -117,21 +117,35 @@ type StorageEngineConfig struct {
 	// own write is not wanted; the cost is that every open replays the log
 	// in full.
 	DisableCheckpoints bool
-	// LargeCommitBodyBytes is the size of the document bodies one commit writes at or past which
-	// each body is filed in the blob store itself, instead of as a location record pointing into
-	// the commit's delta frame (objects history strategy only). A location costs a cold read the
-	// whole frame - one 4 MiB import commit decompressed to return one 16 KiB document - so a bulk
-	// write's documents are filed by value, at the cost of a second copy of their bytes. Cold
-	// reads that still meet a large frame through a location file what they decoded the same way.
-	// Zero uses DefaultLargeCommitBodyBytes (64 KiB); negative never files bodies.
+	// LargeCommitBodyBytes is how many bytes of other versions a document version's commit frame
+	// must hold, besides the version itself, before the version's body is filed in the blob store
+	// itself instead of as a location record pointing into the frame (objects history strategy
+	// only). A location costs a cold read the whole frame - one 4 MiB import commit decompressed
+	// to return one 16 KiB document - so a bulk write's documents are filed by value, at the cost
+	// of a second copy of their bytes. Cold reads that still meet such a frame through a location
+	// file what they decoded the same way. Zero takes the threshold DocumentCopies picks; negative
+	// never files bodies; a positive value overrides DocumentCopies.
 	LargeCommitBodyBytes int64
+	// DocumentCopies trades disk for read CPU: on, a version is filed by value once its frame
+	// holds DocumentCopiesBodyBytes (16 KiB) besides it, instead of DefaultLargeCommitBodyBytes
+	// (64 KiB). It can be changed between opens: a writable open that finds the namespace filed
+	// for the other threshold re-files its existing versions in the background (engine
+	// RefileVersions), so turning it off gives the copies' disk back once the blob store merges.
+	DocumentCopies bool
 }
 
-// DefaultLargeCommitBodyBytes is StorageEngineConfig.LargeCommitBodyBytes's default: a commit
-// writing 64 KiB of bodies or more is a batch whose documents are read one at a time later, and
-// reading one of them through the frame costs at least 64 KiB of decompression - several times
-// the document. A single ordinary document stays below it and keeps its 17-byte location.
+// DefaultLargeCommitBodyBytes is the filing threshold with DocumentCopies off: a version whose
+// frame holds 64 KiB besides it is part of a bulk write read one document at a time later. A
+// single ordinary document, or a commit of a few small ones, stays below it and keeps its 17-byte
+// location - the log is its only copy.
 const DefaultLargeCommitBodyBytes = 64 << 10
+
+// DocumentCopiesBodyBytes is the filing threshold with DocumentCopies on: Cassandra's default
+// compression chunk, the most it decompresses to read one row. qtask's import commits, split at
+// 64 KiB of bodies, all fall short of DefaultLargeCommitBodyBytes and past this; filing them by
+// value took qtask's mixed workload from 141 to 178 actions/s (#332) and its data directory from
+// 954 to 1467 MiB.
+const DocumentCopiesBodyBytes = 16 << 10
 
 // ResolvedLargeCommitBodyBytes is the large-commit threshold in force, or 0 when bodies are never
 // filed by value.
@@ -139,6 +153,8 @@ func (c StorageEngineConfig) ResolvedLargeCommitBodyBytes() int64 {
 	switch {
 	case c.LargeCommitBodyBytes < 0:
 		return 0
+	case c.LargeCommitBodyBytes == 0 && c.DocumentCopies:
+		return DocumentCopiesBodyBytes
 	case c.LargeCommitBodyBytes == 0:
 		return DefaultLargeCommitBodyBytes
 	}

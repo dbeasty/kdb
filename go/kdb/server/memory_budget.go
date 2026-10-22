@@ -105,3 +105,50 @@ func peerSyncMaxConnections(setting int) int {
 		return setting
 	}
 }
+
+// The storage cache pool kdb-service gives its embed.Host when --cache-mb is 0: an eighth of the
+// memory the process may use, between 64 MiB and 4 GiB. That is Cassandra's split: its heap is a
+// quarter of RAM (cassandra-env.sh, at most 8 GB), and its caches and memtables take about half of
+// the heap (chunk cache and memtables a quarter each, the key cache 5%) - the other half is left to
+// everything else the process holds. KDB's other residents are the same kind of thing: secondary
+// index history, the live tree and commit graph, and per-request garbage, which together held about
+// as much as the pool in qtask's write-heavy benchmark. A first cut at a quarter of the machine
+// for the pool alone put that benchmark's container at its limit and the memory guard shed writes.
+// An embedded runtime keeps embed.DefaultHostMemoryBudgetBytes (64 MiB) - it shares its process
+// with an application that owns the memory - but a server process owns its container. At the old
+// fixed 64 MiB, qtask's 517k-document benchmark ran with a 4 MiB frame cache and a 9 MiB block
+// cache in a 4 GiB container and decompressed the same frames on every read.
+const (
+	CachePoolFractionOfMemory       = 0.125
+	MinCachePoolBytes         int64 = 64 << 20
+	MaxCachePoolBytes         int64 = 4 << 30
+)
+
+// CachePoolBytes resolves --cache-mb to bytes and says where the number came from: a positive
+// cacheMB is taken as given; 0 sizes the pool from the cgroup memory limit, else from host RAM,
+// and falls back to MinCachePoolBytes when neither can be read.
+func CachePoolBytes(cacheMB int) (int64, string) {
+	if cacheMB > 0 {
+		return int64(cacheMB) << 20, "explicit"
+	}
+	machine, source := int64(0), ""
+	if v, ok := cgroupMemoryLimitBytes(); ok {
+		machine, source = int64(v), "an eighth of the cgroup memory limit"
+	} else if total, err := storage.TotalSystemMemoryBytes(); err == nil && total > 0 {
+		machine, source = int64(total), "an eighth of host RAM"
+	}
+	if machine <= 0 {
+		return MinCachePoolBytes, "default (no memory limit or host RAM to size from)"
+	}
+	return clampCachePool(int64(float64(machine) * CachePoolFractionOfMemory)), source
+}
+
+func clampCachePool(b int64) int64 {
+	switch {
+	case b < MinCachePoolBytes:
+		return MinCachePoolBytes
+	case b > MaxCachePoolBytes:
+		return MaxCachePoolBytes
+	}
+	return b
+}
