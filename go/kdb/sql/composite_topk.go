@@ -187,6 +187,7 @@ func (e *Executor) compositeTopK(query SelectQuery, env *evalEnv, ctx QueryConte
 	}
 	tags, err := plan.store.CompositeSortTags(plan.prefix, at)
 	if unsupported(err) {
+		ctx.Stats.markIndexBehind()
 		return nil, "", false, nil
 	}
 	if err != nil {
@@ -207,6 +208,7 @@ func (e *Executor) compositeTopK(query SelectQuery, env *evalEnv, ctx QueryConte
 	}
 	irregular, err := plan.store.CompositeIrregular(at)
 	if unsupported(err) {
+		ctx.Stats.markIndexBehind()
 		return nil, "", false, nil
 	}
 	if err != nil {
@@ -289,6 +291,7 @@ func (e *Executor) compositeTopK(query SelectQuery, env *evalEnv, ctx QueryConte
 	for {
 		groups, err := plan.store.CompositeGroups(plan.prefix, after, plan.ascending, at, page)
 		if unsupported(err) {
+			ctx.Stats.markIndexBehind()
 			return nil, "", false, nil
 		}
 		if err != nil {

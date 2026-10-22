@@ -129,6 +129,9 @@ type eventLog struct {
 	// plan memoizes the last historical plan: a reader pinned one commit behind head (a session's
 	// read head, a paged query) asks for the same cutoff again and again.
 	plan planMemo
+	// compactTriedAt is the key table's size at the last compaction attempt that freed too little,
+	// so the next is not tried until the table has grown again (maybeCompactKeysLocked).
+	compactTriedAt int
 }
 
 type planMemo struct {
@@ -423,7 +426,15 @@ func (l *eventLog) trimOutside(inWindow func(codec.Hash) bool) {
 func (l *eventLog) maybeCompactKeysLocked() {
 	h := l.head
 	n := l.keys.len()
-	if n < 1024 || n < 2*h.st.live+1024 {
+	// Empty keys - none of the head's documents filed under them - cost every ordered walk that
+	// passes them, not just memory: a queue whose claims rewrite each job's sort key leaves one
+	// behind per claim, right where the next claim's walk starts. So the table is compacted once
+	// they reach a quarter of the live keys (at least 4096), not only once they are the majority -
+	// a composite index over a busy collection's status and timestamp never reached that, and its
+	// claim walks slowed down claim by claim. A compaction that frees too little, because retained
+	// history still names the empty keys, is not tried again until the table has grown.
+	empty := n - h.st.live
+	if n < 1024 || empty < max(4096, h.st.live/4) || n < l.compactTriedAt+max(4096, n/8) {
 		return
 	}
 	used := make([]bool, n)
@@ -442,9 +453,11 @@ func (l *eventLog) maybeCompactKeysLocked() {
 			kept++
 		}
 	}
-	if n-kept < n/2 {
+	if n-kept < max(1024, empty/2) {
+		l.compactTriedAt = n
 		return
 	}
+	l.compactTriedAt = 0
 	remap := l.keys.compact(keep)
 	for i := range l.events {
 		if e := &l.events[i]; !e.del {

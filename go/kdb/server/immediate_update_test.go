@@ -10,6 +10,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/embed"
+	"github.com/limidus/kdb/go/kdb/index/stores"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/sql"
 )
@@ -37,7 +38,23 @@ func immediateRuntimes(t *testing.T) map[string]*KdbServerRuntime {
 		t.Fatal(err)
 	}
 	t.Cleanup(file.Close)
-	return map[string]*KdbServerRuntime{"memory": NewKdbServerRuntime(mem), "file": NewKdbServerRuntime(file)}
+	// A file runtime whose claims are served by a composite BTREE walk (sql/composite_topk.go),
+	// and so by the candidate retry at a newer head when concurrent claims outrun the index.
+	compFile, err := embed.OpenFileRuntime(t.TempDir(), "app", "app/data", schema.None())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(compFile.Close)
+	comp := NewKdbServerRuntime(compFile)
+	p, err := comp.OpenIndexes(stores.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.CreateIndex(sql.StmtCreateIndex{Name: "jobs_queue", Table: "docs", Using: "BTREE",
+		Fields: []sql.IndexField{{Path: "_c"}, {Path: "status"}, {Path: "createdAt"}}}, sql.QueryContext{NamespaceID: "app/data"}); err != nil {
+		t.Fatal(err)
+	}
+	return map[string]*KdbServerRuntime{"memory": NewKdbServerRuntime(mem), "file": NewKdbServerRuntime(file), "composite": comp}
 }
 
 func putJob(t *testing.T, rt *KdbServerRuntime, n int, status string, attempts, created int) {
