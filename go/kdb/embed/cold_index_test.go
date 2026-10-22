@@ -148,8 +148,11 @@ func TestColdIndexSidecarsServeTheReplayStrategy(t *testing.T) {
 				if res.Removed == 0 {
 					t.Fatal("maintenance truncated nothing")
 				}
-				requireAllLive(t, rt, ids, texts, "after truncation")
+				// Counted before reading anything back: the reads below may index a remaining segment
+				// that had no sidecar yet and write one, which is not a deleted segment's sidecar
+				// staying behind (and made this count flaky on CI).
 				after := len(sidecarFiles(t, root))
+				requireAllLive(t, rt, ids, texts, "after truncation")
 				t.Logf("truncated %d segments; sidecars %d -> %d", res.Removed, before, after)
 				// The newest segments have no sidecar yet, so truncation can remove more
 				// segments than there were sidecars.
