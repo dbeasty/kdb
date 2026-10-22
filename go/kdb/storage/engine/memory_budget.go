@@ -38,6 +38,7 @@ func (e *ServerEngine) SetMemoryBudgetBytes(budgetBytes int64) {
 	if e == nil || budgetBytes <= 0 {
 		return
 	}
+	e.memoryBudget.Store(budgetBytes)
 	// A sub-budget the caller set explicitly is a pin, not a default, and re-deriving it from a
 	// share would be the same defect the Resolved* helpers already avoid: an explicit setting
 	// quietly replaced by one computed from MemoryBudgetBytes. Honouring it at open and then
@@ -180,4 +181,13 @@ func (e *ServerEngine) MemoryBreakdown() MemoryBreakdown {
 	}
 	b.DeltaFrameCache = e.DeltaFrameCache().Bytes()
 	return b
+}
+
+// MemoryBudgetBytes is the namespace's current share of the memory budget: the last one
+// SetMemoryBudgetBytes was given, else what the config resolves to at open.
+func (e *ServerEngine) MemoryBudgetBytes() int64 {
+	if b := e.memoryBudget.Load(); b > 0 {
+		return b
+	}
+	return e.config.ResolvedGlobalMemoryBudgetBytes()
 }

@@ -69,11 +69,12 @@ func NewRegistryIndexProvider(reg *index.Registry, rt *KdbServerRuntime) *Regist
 func (p *RegistryIndexProvider) Registry() *index.Registry { return p.registry }
 
 var (
-	_ sql.IndexProvider    = (*RegistryIndexProvider)(nil)
-	_ sql.ExactCounter     = (*RegistryIndexProvider)(nil)
-	_ sql.OrderedKeyIndex  = (*RegistryIndexProvider)(nil)
-	_ sql.IndexDDLExecutor = (*RegistryIndexProvider)(nil)
-	_ SearchProvider       = (*RegistryIndexProvider)(nil)
+	_ sql.IndexProvider         = (*RegistryIndexProvider)(nil)
+	_ sql.ExactCounter          = (*RegistryIndexProvider)(nil)
+	_ sql.OrderedKeyIndex       = (*RegistryIndexProvider)(nil)
+	_ sql.CompositeOrderedIndex = (*RegistryIndexProvider)(nil)
+	_ sql.IndexDDLExecutor      = (*RegistryIndexProvider)(nil)
+	_ SearchProvider            = (*RegistryIndexProvider)(nil)
 )
 
 // ---------------------------------------------------------------------------
@@ -189,6 +190,11 @@ func (p *RegistryIndexProvider) IndexKeyGroups(ctx sql.QueryContext, field strin
 		return nil, false, nil
 	}
 	return sql.IndexKeyGroupsFromStore(store, ctx, field, kind, after, maxIDs)
+}
+
+// CompositeBTrees lists the namespace's composite BTREEs (sql.CompositeOrderedIndex).
+func (p *RegistryIndexProvider) CompositeBTrees() []index.Store {
+	return p.registry.CompositeBTrees()
 }
 
 // UnindexedDocs returns the ids the BTREE on field files under no key (sql.OrderedKeyIndex).
@@ -545,12 +551,28 @@ func descriptorFor(stmt sql.StmtCreateIndex, namespaceID string) (index.Descript
 	for _, f := range stmt.Fields {
 		paths = append(paths, f.Path)
 	}
-	if typ != index.IndexTypeFullText && len(paths) > 1 {
-		return index.Descriptor{}, fmt.Errorf("index %s: only FULLTEXT indexes may cover several fields", stmt.Name)
+	if typ != index.IndexTypeFullText && typ != index.IndexTypeBTree && len(paths) > 1 {
+		return index.Descriptor{}, fmt.Errorf("index %s: only FULLTEXT and BTREE indexes may cover several fields", stmt.Name)
 	}
 	opts := map[string]string{index.OptionIndexName: stmt.Name}
 	for k, v := range stmt.With {
 		opts[strings.ToLower(k)] = v
+	}
+	if typ == index.IndexTypeBTree && len(paths) > 1 {
+		// A composite BTREE - equality fields, then the ordered one, like a Cassandra clustering
+		// key - over top-level fields with the natural key mapping, which is what its walk
+		// (sql.compositeTopK) compares exactly as SQL does.
+		for _, p := range paths {
+			if segs := index.SplitFieldPath(p); len(segs) != 1 || segs[0] != p {
+				return index.Descriptor{}, fmt.Errorf("index %s: a composite BTREE covers top-level fields only, not %q", stmt.Name, p)
+			}
+		}
+		if _, typed := opts[index.OptionFieldType]; typed {
+			return index.Descriptor{}, fmt.Errorf("index %s: a composite BTREE takes no field_type", stmt.Name)
+		}
+		if stmt.Unique {
+			return index.Descriptor{}, fmt.Errorf("index %s: a composite BTREE cannot be UNIQUE; declare UNIQUE (a, b) on the table", stmt.Name)
+		}
 	}
 	if typ == index.IndexTypeFullText {
 		if w := weightsOption(stmt.Fields); w != "" {

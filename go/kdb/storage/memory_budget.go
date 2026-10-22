@@ -178,8 +178,15 @@ func ResolvedBlockCacheBytes(cfg StorageEngineConfig) int64 {
 }
 
 // DefaultHistoryTreeFraction is the share of the hot-tier budget that
-// historical document trees may hold.
-const DefaultHistoryTreeFraction = 0.10
+// historical document trees may hold. It gave half of its tenth to the
+// secondary indexes' as-of history (DefaultIndexHistoryFraction).
+const DefaultHistoryTreeFraction = 0.05
+
+// DefaultIndexHistoryFraction is the share of the hot-tier budget the namespace's secondary
+// indexes may hold together for reads at commits behind the head (index.Registry.SetHistoryBudget).
+// Each index used to bound only its own window, about 6.5 MB, so qtask's 51 indexes held about
+// 330 MB outside the budget.
+const DefaultIndexHistoryFraction = 0.05
 
 // ResolvedHistoryTreeBytes is how many bytes of historical document trees
 // stay resident before the least recently used are evicted and obtained

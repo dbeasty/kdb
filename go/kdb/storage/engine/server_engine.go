@@ -116,6 +116,9 @@ type ServerEngine struct {
 	// this namespace's share. Atomic rather than a write to config, which
 	// is a value field read without synchronisation from several paths.
 	memtableFlushOverride atomic.Int64
+	// memoryBudget is the namespace's last share of the memory budget (SetMemoryBudgetBytes), for
+	// the consumers outside the engine that size themselves from it (MemoryBudgetBytes).
+	memoryBudget atomic.Int64
 	// treeRebuilds counts historical document trees resolved the expensive
 	// way - from tree objects or by folding the delta log - because the
 	// bounded store did not hold them. Unlike coldLoads this is not fed to

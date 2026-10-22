@@ -104,6 +104,15 @@ func (e *Executor) topKDocs(query SelectQuery, residual Expr, env *evalEnv, ctx 
 		return nil, "", err
 	}
 	treeHash := commit.DocumentTreeHash
+	// A composite BTREE whose prefix is the WHERE's string equalities and whose last field is the
+	// first ORDER BY column settles the page after about k documents, forwards or backwards
+	// (composite_topk.go). What it read before giving up is reused below.
+	fetched := map[codec.UUID]*document.Document{}
+	if docs, label, ok, err := e.compositeTopK(query, env, ctx, k, atCommit, treeHash, fetched); err != nil {
+		return nil, "", err
+	} else if ok {
+		return docs, label, nil
+	}
 	ids, label, found, err := e.chooseIndexPath(query.Where, query.OrderBy, env, ctx)
 	if err != nil {
 		return nil, "", err
@@ -112,7 +121,6 @@ func (e *Executor) topKDocs(query SelectQuery, residual Expr, env *evalEnv, ctx 
 		// A BTREE on the first ORDER BY column may settle the page after reading about k
 		// documents (ordered_topk.go). When it does not apply, or gives up part way, the
 		// documents it read are reused here rather than read again.
-		fetched := map[codec.UUID]*document.Document{}
 		if docs, ok, abandoned, err := e.btreeTopK(query, residual, env, ctx, k, ids, atCommit, treeHash, fetched); err != nil {
 			return nil, "", err
 		} else if ok {

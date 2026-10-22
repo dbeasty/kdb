@@ -92,6 +92,12 @@ func (s *MemoryStore) Snapshot() ([]byte, error) {
 // answers every read with ErrHistoryUnavailable until it is rebuilt.
 func (s *MemoryStore) NeedsRebuild() bool { return s.log.needsRebuild() }
 
+// HistoryBytes estimates what the store retains for reads at commits behind its head.
+func (s *MemoryStore) HistoryBytes() int64 { return s.log.historyBytes() }
+
+// TrimHistoryOutside drops the as-of history of the commits inWindow does not hold.
+func (s *MemoryStore) TrimHistoryOutside(inWindow func(codec.Hash) bool) { s.log.trimOutside(inWindow) }
+
 // ForgetHistory records that the store's content was just rebuilt from the documents at head,
 // so it holds no history: a read at an older commit reports ErrHistoryUnavailable instead of
 // replaying the rebuild's events as if they had happened then.
@@ -142,6 +148,10 @@ func (s *MemoryStore) PrepareParsedDocument(docID codec.UUID, _ string, root jso
 		}
 		return prepared, nil
 	}
+	if s.descriptor.Type == IndexTypeBTree {
+		prepared.keys = compositeBTreeKeys(root, paths)
+		return prepared, nil
+	}
 	parts := make([]Key, 0, len(paths))
 	for _, p := range paths {
 		vals := PathValues(root, p)
@@ -156,6 +166,48 @@ func (s *MemoryStore) PrepareParsedDocument(docID codec.UUID, _ string, root jso
 	}
 	prepared.keys = []Key{CompositeKey{Parts: parts}}
 	return prepared, nil
+}
+
+// IrregularCompositeKey is the key a composite BTREE files a document under when it cannot place
+// it by value: an array or object in any of its fields. It is the empty composite, which sorts
+// before every real one; a walk of the index reads every document under it first (see
+// CompositeIrregular), so no matching document is ever missed because the index could not order it.
+var IrregularCompositeKey = CompositeKey{}
+
+// compositeBTreeKeys is what a composite BTREE on paths - equality fields, then the ordered one,
+// all top-level - files a document under, like a Cassandra clustering key: one CompositeKey of
+// every field's value in order.
+//
+//   - A prefix field that is absent or null files nothing: no string equality can match it.
+//   - The ordered (last) field absent or null is a NULL part, so the document still sorts, first.
+//   - An array or object anywhere files IrregularCompositeKey: an array can match an equality by
+//     membership and sorts as JSON, which no single key can stand for.
+func compositeBTreeKeys(root json.Value, paths []string) []Key {
+	obj, ok := root.(json.ObjectValue)
+	if !ok {
+		return nil
+	}
+	parts := make([]Key, 0, len(paths))
+	for i, p := range paths {
+		last := i == len(paths)-1
+		v := obj.Fields[p]
+		switch v.(type) {
+		case nil, json.NullValue:
+			if !last {
+				return nil
+			}
+			parts = append(parts, NullKey{})
+			continue
+		case json.ArrayValue, json.ObjectValue:
+			return []Key{IrregularCompositeKey}
+		}
+		k, ok := KeyFromJSONValue(v, "")
+		if !ok {
+			return []Key{IrregularCompositeKey}
+		}
+		parts = append(parts, k)
+	}
+	return []Key{CompositeKey{Parts: parts}}
 }
 
 // PutDocument is PrepareDocument followed by Apply.

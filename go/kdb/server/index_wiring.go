@@ -11,6 +11,8 @@ import (
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/index"
 	"github.com/limidus/kdb/go/kdb/index/stores"
+	"github.com/limidus/kdb/go/kdb/storage"
+	"github.com/limidus/kdb/go/kdb/storage/engine"
 )
 
 // Index wiring (kdb-spec-layer16 Components 67, 68 and 69): opening a namespace's index
@@ -75,6 +77,13 @@ func (s *KdbServerRuntime) OpenIndexes(opts stores.Options) (*RegistryIndexProvi
 	}
 
 	provider := NewRegistryIndexProvider(reg, s)
+	// The indexes' as-of history is held to a share of the namespace's memory budget, like every
+	// other store it keeps in memory.
+	if eng, ok := s.Runtime.Storage.(*engine.ServerEngine); ok {
+		reg.SetHistoryBudget(func() int64 {
+			return int64(float64(eng.MemoryBudgetBytes()) * storage.DefaultIndexHistoryFraction)
+		})
+	}
 	provider.dir = dir
 	provider.opts = opts
 

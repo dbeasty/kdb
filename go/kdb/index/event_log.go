@@ -338,40 +338,83 @@ func (l *eventLog) truncateLocked() {
 	if l.maxEvents <= 0 || l.head == nil {
 		return
 	}
-	h := l.head
 	keepFrom := uint32(0)
 	if len(l.events) > l.maxEvents {
-		drop := len(l.events) - l.maxEvents*3/4
-		if drop > h.pos {
-			drop = h.pos
-		}
-		if drop > 0 {
-			for i := 0; i < drop; i++ {
-				// Every retained step must be at least as new as every dropped applied event: a
-				// historical read that stops at a retained step counts on every older effect
-				// being one it sees.
-				if e := &l.events[i]; e.state == evApplied && e.step > keepFrom {
-					keepFrom = e.step
-				}
-			}
-			l.dropped = true
-			firstEff := l.effBase + uint64(len(l.eff))
-			for i := drop; i < len(l.events); i++ {
-				if e := &l.events[i]; e.del && e.state == evApplied {
-					firstEff = e.effOff
-					break
-				}
-			}
-			cut := int(firstEff - l.effBase)
-			l.eff = l.eff[:copy(l.eff, l.eff[cut:])]
-			l.effBase = firstEff
-			l.events = l.events[:copy(l.events, l.events[drop:])]
-			h.pos -= drop
-			l.replays, l.replayOrder = nil, nil
-			l.maybeCompactKeysLocked()
-		}
+		keepFrom = l.dropPrefixLocked(len(l.events) - l.maxEvents*3/4)
 	}
 	l.lin.TrimSteps(keepFrom, l.maxEvents)
+}
+
+// dropPrefixLocked drops the oldest drop processed events (never past the head's position), with
+// the effects only they referred to, and returns the newest step any dropped applied event was
+// applied under: every step the lineage keeps must be at least that new.
+func (l *eventLog) dropPrefixLocked(drop int) uint32 {
+	h := l.head
+	if drop > h.pos {
+		drop = h.pos
+	}
+	keepFrom := uint32(0)
+	if drop <= 0 {
+		return keepFrom
+	}
+	for i := 0; i < drop; i++ {
+		// Every retained step must be at least as new as every dropped applied event: a
+		// historical read that stops at a retained step counts on every older effect being one
+		// it sees.
+		if e := &l.events[i]; e.state == evApplied && e.step > keepFrom {
+			keepFrom = e.step
+		}
+	}
+	l.dropped = true
+	firstEff := l.effBase + uint64(len(l.eff))
+	for i := drop; i < len(l.events); i++ {
+		if e := &l.events[i]; e.del && e.state == evApplied {
+			firstEff = e.effOff
+			break
+		}
+	}
+	cut := int(firstEff - l.effBase)
+	l.eff = l.eff[:copy(l.eff, l.eff[cut:])]
+	l.effBase = firstEff
+	l.events = l.events[:copy(l.events, l.events[drop:])]
+	h.pos -= drop
+	l.replays, l.replayOrder = nil, nil
+	l.maybeCompactKeysLocked()
+	return keepFrom
+}
+
+// Approximate resident bytes of one retained event and one lineage step, for HistoryBytes.
+const (
+	historyEventBytes = 88
+	historyStepBytes  = 100
+)
+
+// historyBytes estimates what the log retains for as-of reads: its events, their effects and the
+// lineage steps.
+func (l *eventLog) historyBytes() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return int64(len(l.events))*historyEventBytes + int64(len(l.eff))*4 + int64(l.lin.Steps())*historyStepBytes
+}
+
+// trimOutside drops the oldest events whose commit is not in the window, up to the first that
+// is: a read at a commit the window still holds keeps every event it needs, and one at an older
+// commit is answered from the documents (ErrHistoryUnavailable), as one past the event window
+// always was.
+func (l *eventLog) trimOutside(inWindow func(codec.Hash) bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.head == nil {
+		return
+	}
+	drop := 0
+	for drop < len(l.events) && drop < l.head.pos && !inWindow(l.events[drop].commit) {
+		drop++
+	}
+	if drop == 0 {
+		return
+	}
+	l.lin.TrimSteps(l.dropPrefixLocked(drop), l.maxEvents)
 }
 
 // maybeCompactKeysLocked rebuilds the key table without the keys that are empty at head and

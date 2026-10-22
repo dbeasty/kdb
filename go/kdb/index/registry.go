@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -32,6 +34,16 @@ type Registry struct {
 	// epoch changes (under mu) whenever a store is added or removed. A write prepared at another
 	// epoch is prepared again when it commits (PreparedWrite.Commit).
 	epoch atomic.Uint64
+
+	// historyBudget, when set, is how many bytes every store's as-of history may hold together
+	// (SetHistoryBudget); historyWindow is the commit window all of them keep to stay inside it,
+	// and commitsSeen paces the check.
+	historyBudget func() int64
+	historyMu     sync.Mutex
+	historyWindow int
+	commitsSeen   atomic.Uint64
+	// recent is the last commits marked, oldest first, at most historyWindow of them.
+	recent []codec.Hash
 }
 
 type registryEntry struct {
@@ -75,8 +87,10 @@ func (r *Registry) Add(desc Descriptor) (Store, error) {
 		if n := desc.IndexName(); n != "" && e.desc.IndexName() == n {
 			return nil, fmt.Errorf("index name %q already registered", n)
 		}
-		if e.desc.Type == desc.Type && e.desc.FirstField() == desc.FirstField() && e.desc.IsSystem() == desc.IsSystem() {
-			return nil, fmt.Errorf("a %s index on %s already exists", desc.Type, desc.FirstField())
+		// The same fields, in order: a composite BTREE on (a, b) and one on (a, c), or on (a) alone,
+		// are different indexes, as a single field's lookups never pick a composite (ByField).
+		if e.desc.Type == desc.Type && slices.Equal(e.desc.FieldPaths(), desc.FieldPaths()) && e.desc.IsSystem() == desc.IsSystem() {
+			return nil, fmt.Errorf("a %s index on %s already exists", desc.Type, strings.Join(desc.FieldPaths(), ", "))
 		}
 	}
 	store, err := r.factory.Create(desc)
@@ -147,11 +161,16 @@ func (r *Registry) ByName(name string) (Store, bool) {
 }
 
 // ByField finds the index of type typ whose first field is field. System indexes are never
-// returned: their keys are typed for the server's own use, not for a user's predicate.
+// returned: their keys are typed for the server's own use, not for a user's predicate. Nor is a
+// composite BTREE: its keys are tuples, so a lookup of its first field alone would match nothing;
+// it is read only through its prefix walk (CompositeGroups).
 func (r *Registry) ByField(field string, typ IndexType) (Store, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for _, e := range r.entries {
+		if e.desc.Type == IndexTypeBTree && len(e.desc.FieldPaths()) > 1 {
+			continue
+		}
 		if e.desc.Type == typ && e.desc.FirstField() == field && !e.desc.IsSystem() {
 			return e.store, true
 		}
@@ -323,6 +342,102 @@ func (r *Registry) MarkCommit(commitHash codec.Hash) {
 	r.head = commitHash
 	r.hasHead = true
 	r.mu.Unlock()
+	if r.historyBudget == nil {
+		return
+	}
+	r.historyMu.Lock()
+	r.recent = append(r.recent, commitHash)
+	if n := len(r.recent); n > 2*r.historyWindow {
+		r.recent = append(r.recent[:0], r.recent[n-r.historyWindow:]...)
+	}
+	r.historyMu.Unlock()
+	if r.commitsSeen.Add(1)%historyCheckEvery == 0 {
+		r.boundHistory()
+	}
+}
+
+// historyCheckEvery is how many commits pass between two checks of the stores' history against
+// the budget; minHistoryWindow is the fewest commits of history the window shrinks to.
+const (
+	historyCheckEvery = 32
+	minHistoryWindow  = 256
+)
+
+// historyStore is a store whose as-of history the registry can size and trim (MemoryStore).
+type historyStore interface {
+	HistoryBytes() int64
+	TrimHistoryOutside(inWindow func(codec.Hash) bool)
+}
+
+// SetHistoryBudget bounds the as-of history of every store together by budget(), read at each
+// check. Each store otherwise bounds only its own (DefaultHistoryEvents), so a namespace with 51
+// indexes held 51 windows - about 330 MB in qtask's write-heavy benchmark, outside the storage
+// cache pool that bounds everything else. The stores share one window, counted in commits, as
+// Cassandra's tables share one memtable budget: a read at a commit inside it is answered by every
+// index alike, which a paged query reading behind the head needs of all the indexes it uses.
+func (r *Registry) SetHistoryBudget(budget func() int64) {
+	r.historyMu.Lock()
+	r.historyBudget = budget
+	r.historyWindow = DefaultHistoryEvents
+	r.historyMu.Unlock()
+}
+
+// HistoryWindow is the commit window the stores currently keep under the budget (0 when unset).
+func (r *Registry) HistoryWindow() int {
+	r.historyMu.Lock()
+	defer r.historyMu.Unlock()
+	return r.historyWindow
+}
+
+// boundHistory shrinks the shared window by a quarter and trims every store to it while their
+// history is over budget, and lets it grow back while well under.
+func (r *Registry) boundHistory() {
+	r.historyMu.Lock()
+	defer r.historyMu.Unlock()
+	budget := r.historyBudget()
+	if budget <= 0 {
+		return
+	}
+	var stores []historyStore
+	r.mu.RLock()
+	for _, e := range r.entries {
+		if hs, ok := e.store.(historyStore); ok {
+			stores = append(stores, hs)
+		}
+	}
+	r.mu.RUnlock()
+	total := func() (n int64) {
+		for _, s := range stores {
+			n += s.HistoryBytes()
+		}
+		return n
+	}
+	trim := func() {
+		from := max(0, len(r.recent)-r.historyWindow)
+		window := make(map[codec.Hash]struct{}, len(r.recent)-from)
+		for _, c := range r.recent[from:] {
+			window[c] = struct{}{}
+		}
+		inWindow := func(c codec.Hash) bool { _, ok := window[c]; return ok }
+		for _, s := range stores {
+			s.TrimHistoryOutside(inWindow)
+		}
+	}
+	// Back to the current window first: every store has gained commits since the last check,
+	// and judging that growth against the budget would shrink the window again each time.
+	if r.historyWindow < DefaultHistoryEvents {
+		trim()
+	}
+	used := total()
+	if used < budget/2 && r.historyWindow < DefaultHistoryEvents {
+		r.historyWindow = min(DefaultHistoryEvents, r.historyWindow*5/4+1)
+		return
+	}
+	for used > budget && r.historyWindow > minHistoryWindow {
+		r.historyWindow = max(minHistoryWindow, r.historyWindow*3/4)
+		trim()
+		used = total()
+	}
 }
 
 // Head returns the last commit the registry applied, if any.
@@ -711,4 +826,17 @@ func LoadRegistryWithOptions(dir, namespaceID string, d *dag.InMemoryCommitDag, 
 		r.MarkCommit(dagHead)
 	}
 	return r, report, nil
+}
+
+// CompositeBTrees returns the composite BTREE indexes (two fields or more), system ones excepted.
+func (r *Registry) CompositeBTrees() []Store {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []Store
+	for _, e := range r.entries {
+		if e.desc.Type == IndexTypeBTree && len(e.desc.FieldPaths()) > 1 && !e.desc.IsSystem() {
+			out = append(out, e.store)
+		}
+	}
+	return out
 }

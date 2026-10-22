@@ -15,6 +15,7 @@ func TestDefaultBudgetFractionsSumToOne(t *testing.T) {
 		"sstable index":     DefaultSSTableIndexFraction,
 		"block cache":       DefaultBlockCacheFraction,
 		"history trees":     DefaultHistoryTreeFraction,
+		"index history":     DefaultIndexHistoryFraction,
 		"delta frames":      DefaultDeltaFrameCacheFraction,
 	}
 	sum := 0.0
