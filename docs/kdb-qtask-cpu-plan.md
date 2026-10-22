@@ -34,6 +34,30 @@ The cache pool's first cut (a quarter of the machine) put write-heavy @ 32 at th
 limit and the memory guard shed 61k writes: secondary-index history and trees held about as much
 again as the pool. #329 now uses an eighth, Cassandra's caches-to-RAM ratio.
 
+Second round (2026-10-22): the claim path, `ORDER BY ... LIMIT` and the index history.
+
+- **Composite BTREEs** (`sql/composite_topk.go`), walked like a Cassandra clustering key, serve
+  queue claims and descending "latest k" reads. The claim was 61% of server CPU in `topKDocs`,
+  reading every pending job under the write gate.
+- **The BTREE key order** re-merged every key whenever one was new: 85% of the composite claim's CPU.
+  New keys are now spliced in by binary search (388 us to 307 ns at 100k keys).
+- **Index as-of history** is held within 5% of the cache pool for all indexes together, as one
+  window of commits (Cassandra's shared memtable budget). It was about 6.5 MB per index outside
+  the pool; 51 indexes held about 330 MB, now about 45 MB.
+
+Same-run matrix after it (`qtask-composite/bench/results/2026-10-22-final3-on`, copies on, qtask
+declaring five composites, dbeasty/qtask#13), actions/s and gap to MongoDB:
+
+| profile | users | KDB | MongoDB | gap |
+|---|---:|---:|---:|---:|
+| mixed | 1 / 8 / 32 | 68 / 191 / 202 | 149 / 458 / 522 | 2.2x / 2.4x / 2.6x |
+| read-heavy | 1 / 8 / 32 | 68 / 187 / 187 | 161 / 366 / 408 | 2.4x / 2.0x / 2.2x |
+| write-heavy | 1 / 8 / 32 | 67 / 230 / 262 | 159 / 638 / 804 | 2.4x / 2.8x / 3.1x |
+| claim | 1 / 8 / 32 | 196 / 504 / 458 | 396 / 2403 / 2488 | 2.0x / 4.8x / 5.4x |
+
+Left: the claim now waits on the write gate (server CPU 116-130%, not saturated); task lists
+over the OR access filter still read every candidate.
+
 What implementing changed in the plan:
 
 - **P0 was not in the first draft and is the largest single item.** kdb-service gave its host
