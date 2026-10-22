@@ -310,6 +310,21 @@ func (e *ServerEngine) CompactBlobStoreContext(ctx context.Context) (sstable.Com
 	return e.blobStore.CompactContext(ctx, sstable.DefaultCompactionTrigger, e.reachableBlobKeys())
 }
 
+// CompactBlobStoreAllContext is CompactBlobStoreContext as a major compaction: every table is
+// merged into one whether or not a merge is due (sstable.LsmBlobStore.CompactAllContext).
+func (e *ServerEngine) CompactBlobStoreAllContext(ctx context.Context) (sstable.CompactionResult, error) {
+	if e.blobStore == nil || e.config.IOShim == nil {
+		return sstable.CompactionResult{}, nil
+	}
+	// Flushed first, for the same reason CompactBlobStoreContext flushes first.
+	if e.memTable != nil {
+		if _, err := e.memTable.Flush(0); err != nil {
+			return sstable.CompactionResult{}, err
+		}
+	}
+	return e.blobStore.CompactAllContext(ctx, e.reachableBlobKeys())
+}
+
 // reachableBlobKeys reports which blob keys are still worth keeping, or
 // nil when everything is.
 //

@@ -2,10 +2,12 @@ package embed
 
 import (
 	"context"
+	"fmt"
 	"log"
 
 	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/storage/engine"
+	"github.com/limidus/kdb/go/kdb/storage/sstable"
 )
 
 // recordedFilingThreshold is the threshold meta says the namespace's records are filed for, in
@@ -48,14 +50,30 @@ func startVersionRefile(eng *engine.ServerEngine, dataRoot, namespaceID string) 
 	}
 	meta, _ := readNamespaceMeta(dataRoot, namespaceID)
 	want := eng.FilingThresholdBytes()
-	if recordedFilingThreshold(meta) == want {
+	recorded := recordedFilingThreshold(meta)
+	if recorded == want {
 		return nil
 	}
+	// Towards fewer copies: a higher threshold, or none at all. Decided by the switch rather than
+	// by what this pass moves, because a pass that resumes one cut short during its merge finds
+	// every location already back and moves nothing - the merge still has to run.
+	fewerCopies := want == 0 || (recorded > 0 && want > recorded)
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &versionRefile{cancel: cancel, done: make(chan struct{})}
 	go func() {
 		defer close(r.done)
 		st, err := eng.RefileVersions(ctx)
+		var merged string
+		if err == nil && ctx.Err() == nil && fewerCopies {
+			// The copies are shadowed but still on disk, and the size-tiered policy may never
+			// reach their tables on a quiet store; a major compaction gives the disk back now, as
+			// Cassandra's is the way to apply changed storage options to all of a table at once.
+			// Before the marker, so a merge cut short is retried with the pass by the next open.
+			var c sstable.CompactionResult
+			if c, err = eng.CompactBlobStoreAllContext(ctx); err == nil {
+				merged = fmt.Sprintf("; merged %d tables to drop the copies", c.Merged)
+			}
+		}
 		switch {
 		case ctx.Err() != nil:
 			// Closed first; the marker still names the old threshold, so the next open resumes.
@@ -72,8 +90,8 @@ func startVersionRefile(eng *engine.ServerEngine, dataRoot, namespaceID string) 
 				log.Printf("kdb: namespace %s: re-filed versions but could not record it (%v) - the next open re-files again", namespaceID, err)
 				return
 			}
-			log.Printf("kdb: namespace %s: re-filed versions for a %d-byte threshold across %d frames: %d to body copies, %d back to locations",
-				namespaceID, want, st.Frames, st.ToValue, st.ToLocation)
+			log.Printf("kdb: namespace %s: re-filed versions for a %d-byte threshold across %d frames: %d to body copies, %d back to locations%s",
+				namespaceID, want, st.Frames, st.ToValue, st.ToLocation, merged)
 		}
 	}()
 	return r
