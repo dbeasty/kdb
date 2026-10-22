@@ -417,6 +417,19 @@ func (s *LsmBlobStore) CompactContext(ctx context.Context, trigger int, keep fun
 // Which tables the merge takes is decided here - see tiering.go - so a bounded caller can still
 // merge a window of small new runs in a store too large to merge whole.
 func (s *LsmBlobStore) CompactContextUpTo(ctx context.Context, trigger int, keep func(codec.Hash) bool, maxBytes int64) (CompactionResult, error) {
+	return s.compactContext(ctx, trigger, keep, maxBytes, false)
+}
+
+// CompactAllContext merges every table in the store into one run, whether or not a merge is due:
+// a major compaction. It is for the one case the size-tiered policy never reaches on its own - a
+// change that shadowed data across the whole store at once (engine.RefileVersions putting
+// locations back over body copies), on a store that may never flush enough new runs to make a
+// full merge due. Nothing to do with fewer than two runs.
+func (s *LsmBlobStore) CompactAllContext(ctx context.Context, keep func(codec.Hash) bool) (CompactionResult, error) {
+	return s.compactContext(ctx, 2, keep, -1, true)
+}
+
+func (s *LsmBlobStore) compactContext(ctx context.Context, trigger int, keep func(codec.Hash) bool, maxBytes int64, all bool) (CompactionResult, error) {
 	if trigger < 2 {
 		trigger = 2
 	}
@@ -429,6 +442,12 @@ func (s *LsmBlobStore) CompactContextUpTo(ctx context.Context, trigger int, keep
 	runs := runsNewestFirst(pinned)
 	sized := sizeRuns(s.io, runs)
 	lo, hi, full := pickMerge(runs, sized, trigger)
+	if all {
+		lo, hi, full = 0, 0, false
+		if len(runs) >= 2 {
+			lo, hi, full = 0, len(runs), true
+		}
+	}
 	if hi == 0 {
 		return CompactionResult{}, nil
 	}

@@ -265,29 +265,9 @@ func sstableBytes(t *testing.T, dir string) int64 {
 	return n
 }
 
-// mergeBlobStore flushes and merges until a merge has actually run, adding a small run each time
-// one is not yet due - the size-tiered policy merges only once enough runs have accumulated.
-func mergeBlobStore(t *testing.T, srv *KdbServerRuntime, eng *engine.ServerEngine) {
-	t.Helper()
-	for i := 0; i < 8; i++ {
-		c, err := eng.CompactBlobStore()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if c.Merged > 0 {
-			return
-		}
-		importCommit(t, srv, 1, 50)
-		if err := eng.Flush(largeCommitNS); err != nil {
-			t.Fatal(err)
-		}
-	}
-	t.Fatal("the blob store never merged")
-}
-
 // DocumentCopies is switchable across restarts in both directions: turning it on re-files the
-// versions written without it by value, and turning it off puts their locations back, so the next
-// blob-store merge drops the copies and the disk they took.
+// versions written without it by value, and turning it off puts their locations back and merges
+// the blob store, giving the copies' disk back.
 func TestDocumentCopiesSwitchBothWaysAcrossRestarts(t *testing.T) {
 	dir := t.TempDir()
 	srv, eng := openLargeCommitRuntime(t, dir, 0)
@@ -316,9 +296,9 @@ func TestDocumentCopiesSwitchBothWaysAcrossRestarts(t *testing.T) {
 		t.Fatalf("copies off again: %d versions still by value", n)
 	}
 	readAll(t, srv, eng, ids, bodies)
-	// The copies are shadowed now; a merge that reaches their table drops them.
-	mergeBlobStore(t, srv, eng)
+	// The pass merged the store before recording the marker: the copies' bytes are gone, with no
+	// merge from anyone else.
 	if without := sstableBytes(t, dir); without >= withCopies {
-		t.Fatalf("turning copies off gave no disk back: %d table bytes with copies, %d after a merge", withCopies, without)
+		t.Fatalf("turning copies off gave no disk back: %d table bytes with copies, %d after the pass", withCopies, without)
 	}
 }
