@@ -171,6 +171,37 @@ type InsertStatement struct {
 	Rows    [][]Expr
 	// Attachments are the WITH ATTACHMENT clauses, applied to every inserted row (attachments.go).
 	Attachments []AttachmentSpec
+	// OnConflict is the ON CONFLICT clause: what to do when the row would claim a value of a
+	// unique constraint another document holds. Returning is the RETURNING clause. A statement
+	// carrying either is Immediate (see ImmediateInsert).
+	OnConflict *OnConflict
+	Returning  []Projection
+}
+
+// OnConflict is INSERT's ON CONFLICT (columns) DO NOTHING | DO UPDATE SET ... [REMOVE ...]
+// [WHERE ...] - an upsert, as PostgreSQL spells it and as Cassandra's INSERT and UPDATE behave by
+// key: the row's values of a declared unique constraint (Columns, in any order) name the document
+// it is about. When no document holds them, the row is inserted. When one does, the row is not
+// inserted and that document is updated by Update instead, or left as it is when Update is nil
+// (DO NOTHING). Update's WHERE, if any, further restricts whether the holder is updated.
+type OnConflict struct {
+	Columns []string
+	Update  *UpdateStatement
+}
+
+// Immediate reports an INSERT that carries ON CONFLICT or RETURNING - one the server decides and
+// commits as its own statement under its write gate, where the holder of a unique value is known
+// exactly, instead of buffering it on the session.
+func (i InsertStatement) Immediate() bool {
+	return i.OnConflict != nil || len(i.Returning) > 0
+}
+
+// ImmediateInsert returns stmt's INSERT when it is Immediate.
+func ImmediateInsert(stmt Statement) (InsertStatement, bool) {
+	if s, ok := stmt.(StmtInsert); ok && s.Insert.Immediate() {
+		return s.Insert, true
+	}
+	return InsertStatement{}, false
 }
 
 // CreateTableStatement is CREATE TABLE ...

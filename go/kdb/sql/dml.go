@@ -28,21 +28,8 @@ func (d *DMLExecutor) ExecuteInsert(insert InsertStatement, ctx QueryContext) ([
 	}
 	var ops []document.Op
 	for _, values := range insert.Rows {
-		if len(insert.Columns) != len(values) {
-			return nil, NewPlanningError("column count does not match value count", "")
-		}
-		id, err := codec.RandomUUID()
+		id, jsonText, err := insertRow(insert, values, env, ctx.Schema, false)
 		if err != nil {
-			return nil, err
-		}
-		jsonText := "{}"
-		for i, col := range insert.Columns {
-			jsonText, err = assignPath(jsonText, stripTableAlias(col, insert.Table), env.cell(values[i], newEvalDoc(emptyDoc)))
-			if err != nil {
-				return nil, err
-			}
-		}
-		if err := validateJSON(id, jsonText, ctx.Schema); err != nil {
 			return nil, err
 		}
 		ops = append(ops, document.WriteOp{DocID: id, Patch: jsonText})
@@ -55,6 +42,52 @@ func (d *DMLExecutor) ExecuteInsert(insert InsertStatement, ctx QueryContext) ([
 		}
 	}
 	return ops, nil
+}
+
+// insertRow builds one VALUES row's document: its id - the kdb_id column's value when the
+// statement names one, else a fresh random id - and its body. withID allows the kdb_id column:
+// only an immediate INSERT, which checks under the gate that no document has that id, may name
+// one; a buffered INSERT would silently merge into an existing document.
+func insertRow(insert InsertStatement, values []Expr, env *evalEnv, sch schema.KdbSchema, withID bool) (codec.UUID, string, error) {
+	if len(insert.Columns) != len(values) {
+		return codec.UUID{}, "", NewPlanningError("column count does not match value count", "")
+	}
+	var id codec.UUID
+	hasID := false
+	jsonText := "{}"
+	for i, col := range insert.Columns {
+		path := stripTableAlias(col, insert.Table)
+		cell := env.cell(values[i], newEvalDoc(emptyDoc))
+		if path == colKdbID {
+			if !withID {
+				return codec.UUID{}, "", NewPlanningError("kdb_id can be given only in an INSERT with ON CONFLICT or RETURNING", "")
+			}
+			s, ok := cell.(CellString)
+			if !ok {
+				return codec.UUID{}, "", NewPlanningError("kdb_id must be a UUID string", "")
+			}
+			parsed, err := codec.ParseUUID(s.Value)
+			if err != nil {
+				return codec.UUID{}, "", NewPlanningError("kdb_id must be a UUID string: "+err.Error(), "")
+			}
+			id, hasID = parsed, true
+			continue
+		}
+		var err error
+		if jsonText, err = assignPath(jsonText, path, cell); err != nil {
+			return codec.UUID{}, "", err
+		}
+	}
+	if !hasID {
+		var err error
+		if id, err = codec.RandomUUID(); err != nil {
+			return codec.UUID{}, "", err
+		}
+	}
+	if err := validateJSON(id, jsonText, sch); err != nil {
+		return codec.UUID{}, "", err
+	}
+	return id, jsonText, nil
 }
 
 // ExecuteUpdate returns one Write op per matching document with the SET assignments applied.
@@ -73,35 +106,11 @@ func (d *DMLExecutor) ExecuteUpdate(upd UpdateStatement, ctx QueryContext) ([]do
 // the candidates found before the gate (UpdateCandidates) plus whatever changed since, and this
 // re-checks every one of them at the live head.
 func (d *DMLExecutor) ExecuteUpdateAmong(upd UpdateStatement, ctx QueryContext, among []codec.UUID) (DMLResult, error) {
-	if len(upd.Assignments) == 0 && len(upd.Attachments) == 0 && len(upd.Removes) == 0 {
-		return DMLResult{}, NewPlanningError("UPDATE needs at least one assignment", "")
-	}
-	for _, r := range upd.Removes {
-		switch path := stripTableAlias(r, upd.Table); {
-		case path == colKdbID || path == colDoc || path == colAttachments:
-			return DMLResult{}, NewPlanningError(path+" cannot be removed", "")
-		case !ctx.Schema.IsSchemaless() && !ctx.Schema.HasField(rootSegment(path)):
-			return DMLResult{}, NewPlanningError("unknown column: "+path, "")
-		}
+	if err := checkUpdate(upd, ctx.Schema); err != nil {
+		return DMLResult{}, err
 	}
 	env := newEvalEnv(ctx.Schema, ctx.Parameters, upd.Table)
 	env.attach = ctx.attach
-	v := &validator{sch: ctx.Schema, from: upd.Table}
-	for _, a := range upd.Assignments {
-		path := stripTableAlias(a.Path, upd.Table)
-		if path == colKdbID {
-			return DMLResult{}, NewPlanningError("kdb_id cannot be assigned", "")
-		}
-		if path != colDoc && !ctx.Schema.IsSchemaless() && !ctx.Schema.HasField(rootSegment(path)) {
-			return DMLResult{}, NewPlanningError("unknown column: "+path, "")
-		}
-		if err := v.check(a.Value, false, false); err != nil {
-			return DMLResult{}, err
-		}
-	}
-	if err := validateClaimClauses(upd, ctx.Schema); err != nil {
-		return DMLResult{}, err
-	}
 	docs, err := d.updateTargets(upd, ctx, env, among)
 	if err != nil {
 		return DMLResult{}, err
@@ -155,6 +164,35 @@ func (d *DMLExecutor) ExecuteUpdateAmong(upd UpdateStatement, ctx QueryContext, 
 		res.RowsAffected = len(docs)
 	}
 	return res, nil
+}
+
+// checkUpdate checks an UPDATE's SET, REMOVE and claim clauses against sch.
+func checkUpdate(upd UpdateStatement, sch schema.KdbSchema) error {
+	if len(upd.Assignments) == 0 && len(upd.Attachments) == 0 && len(upd.Removes) == 0 {
+		return NewPlanningError("UPDATE needs at least one assignment", "")
+	}
+	for _, r := range upd.Removes {
+		switch path := stripTableAlias(r, upd.Table); {
+		case path == colKdbID || path == colDoc || path == colAttachments:
+			return NewPlanningError(path+" cannot be removed", "")
+		case !sch.IsSchemaless() && !sch.HasField(rootSegment(path)):
+			return NewPlanningError("unknown column: "+path, "")
+		}
+	}
+	v := &validator{sch: sch, from: upd.Table}
+	for _, a := range upd.Assignments {
+		path := stripTableAlias(a.Path, upd.Table)
+		if path == colKdbID {
+			return NewPlanningError("kdb_id cannot be assigned", "")
+		}
+		if path != colDoc && !sch.IsSchemaless() && !sch.HasField(rootSegment(path)) {
+			return NewPlanningError("unknown column: "+path, "")
+		}
+		if err := v.check(a.Value, false, false); err != nil {
+			return err
+		}
+	}
+	return validateClaimClauses(upd, sch)
 }
 
 // validateClaimClauses checks an UPDATE's ORDER BY and RETURNING the way a SELECT's are checked,

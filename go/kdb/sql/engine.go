@@ -149,6 +149,10 @@ func (e *defaultEngine) ExecuteDML(sqlText string, ctx QueryContext) (DMLResult,
 	var ops []document.Op
 	switch s := stmt.(type) {
 	case StmtInsert:
+		if s.Insert.Immediate() {
+			// Decided under the server's write gate (ImmediateInserter), never buffered.
+			return DMLResult{}, NewPlanningError("INSERT with ON CONFLICT or RETURNING runs only as its own statement on a server session", "")
+		}
 		ops, err = e.dml.ExecuteInsert(s.Insert, ctx)
 		if err != nil {
 			return DMLResult{}, err
