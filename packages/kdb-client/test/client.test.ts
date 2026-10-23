@@ -156,7 +156,8 @@ describe("sessions", () => {
         ? sessionAck(request.payload["namespace"] as string)
         : sqlOk(request.payload["namespace"] as string),
     );
-    const client = new Client(server);
+    // One session per namespace when write pooling is off (see "session pool" for when it is on).
+    const client = new Client(server, { sessionsPerNamespace: 1 });
 
     await client.putJSON(NS, DOC, { n: 1 });
     await client.putJSON(NS, DOC, { n: 2 });
@@ -173,7 +174,7 @@ describe("sessions", () => {
         ? sessionAck(request.payload["namespace"] as string)
         : sqlOk(request.payload["namespace"] as string),
     );
-    const client = new Client(server);
+    const client = new Client(server, { sessionsPerNamespace: 1 });
 
     await Promise.all([
       client.putJSON(NS, DOC, { n: 1 }),
@@ -712,7 +713,7 @@ describe("SQL", () => {
       }
       return sqlOk(NS, HEAD_ONE, false, 1);
     });
-    const client = new Client(server);
+    const client = new Client(server, { sessionsPerNamespace: 1 });
 
     const counts = await Promise.all(
       Array.from({ length: 50 }, (_, i) => client.exec(NS, `DELETE FROM t WHERE id = '${i}'`)),
@@ -1020,5 +1021,113 @@ describe("frame dispatch", () => {
     assert.doesNotThrow(() => server.deliver(garbage));
 
     assert.deepEqual(await client.query(NS, "SELECT 1"), []);
+  });
+});
+
+
+describe("session pool", () => {
+  // A server that hands out distinct sessions and, like the real one, holds one pending
+  // transaction per session: sqlExec adds to it, txCommit drains it.
+  function pooledServer(lockGranted = true) {
+    let next = 0;
+    const pending = new Map<string, number>();
+    const server = new FakeServer((request) => {
+      const sessionId = request.payload["sessionId"] as string;
+      if (request.kind === "sessionBegin") {
+        const ack = sessionAck(NS);
+        return { ...ack, payload: { ...ack.payload, sessionId: `sess-${++next}` } };
+      }
+      if (request.kind === "lockAcquire" || request.kind === "lockRelease") {
+        return { kind: "lockResult" as const, payload: { namespace: NS, sessionId, docId: DOC, granted: lockGranted, fence: 1, expiresAtMillis: 0 } };
+      }
+      if (request.kind === "sqlExec") {
+        const sql = request.payload["sql"] as string;
+        if (sql.startsWith("FAIL")) return { ...sqlOk(NS), payload: { ...sqlOk(NS).payload, error: "boom" } };
+        if (sql.startsWith("SELECT") || sql.startsWith("BEGIN")) return sqlOk(NS, "", true, 0);
+        pending.set(sessionId, (pending.get(sessionId) ?? 0) + 1);
+        return sqlOk(NS, HEAD_ONE, false, 1);
+      }
+      if (request.kind === "txCommit" && (request.payload["transactionBytes"] as unknown[]).length === 0) {
+        if (!pending.get(sessionId)) {
+          return { ...sqlOk(NS), payload: { ...sqlOk(NS).payload, error: "no pending transaction to commit" } };
+        }
+        pending.set(sessionId, 0);
+      }
+      return sqlOk(NS, HEAD_ONE, false, 1);
+    });
+    const opened = () => server.requests.filter((r) => r.kind === "sessionBegin").length;
+    return { server, opened };
+  }
+
+  it("runs concurrent execs on several sessions, each exec followed by its own commit", async () => {
+    const { server, opened } = pooledServer();
+    const client = new Client(server, { sessionsPerNamespace: 4 });
+    const counts = await Promise.all(
+      Array.from({ length: 50 }, (_, i) => client.exec(NS, `DELETE FROM t WHERE id = '${i}'`)),
+    );
+    assert.ok(counts.every((n) => n === 1), "every exec committed its own statement");
+    // The namespace's own session plus at most three pooled ones.
+    assert.ok(opened() > 1 && opened() <= 4, `${opened()} sessions opened`);
+    const bySession = new Map<string, string[]>();
+    for (const r of server.requests.filter((r) => r.kind === "sqlExec" || r.kind === "txCommit")) {
+      const id = r.payload["sessionId"] as string;
+      bySession.set(id, [...(bySession.get(id) ?? []), r.kind]);
+    }
+    for (const [id, kinds] of bySession) {
+      kinds.forEach((kind, i) => assert.equal(kind, i % 2 === 0 ? "sqlExec" : "txCommit", `${id} interleaved`));
+    }
+  });
+
+  it("reuses an idle pooled session rather than opening another", async () => {
+    const { server, opened } = pooledServer();
+    const client = new Client(server);
+    for (let i = 0; i < 5; i++) await client.putJSON(NS, DOC, { n: i });
+    assert.equal(opened(), 2, "the namespace's session and one pooled one");
+    const commits = server.requests.filter((r) => r.kind === "txCommit");
+    assert.ok(commits.every((r) => r.payload["sessionId"] === "sess-2"), "every commit on the pooled session");
+  });
+
+  it("writes on the lease holder's session while this client holds a lease", async () => {
+    const { server } = pooledServer();
+    const client = new Client(server);
+    await client.acquireLock(NS, DOC);
+    const holder = server.requests.find((r) => r.kind === "lockAcquire")!.payload["sessionId"];
+    await client.putJSON(NS, DOC, { n: 1 });
+    await client.exec(NS, "DELETE FROM t WHERE id = 'x'");
+    for (const r of server.requests.filter((r) => r.kind === "txCommit" || (r.kind === "sqlExec"))) {
+      assert.equal(r.payload["sessionId"], holder, `${r.kind} left the lease holder's session`);
+    }
+    await client.releaseLock(NS, DOC);
+    const before = server.requests.length;
+    await client.putJSON(NS, DOC, { n: 2 });
+    const commit = server.requests.slice(before).find((r) => r.kind === "txCommit")!;
+    assert.notEqual(commit.payload["sessionId"], holder, "pooled again once the lease is released");
+  });
+
+  it("keeps transaction control on the namespace's own session", async () => {
+    const { server } = pooledServer();
+    const client = new Client(server);
+    await client.exec(NS, "DELETE FROM t WHERE id = 'x'"); // opens the namespace's session and a pooled one
+    await client.exec(NS, "BEGIN");
+    const begin = server.requests.find((r) => r.kind === "sqlExec" && r.payload["sql"] === "BEGIN")!;
+    assert.equal(begin.payload["sessionId"], "sess-1");
+  });
+
+  it("does not reuse a session whose unit failed", async () => {
+    const { server, opened } = pooledServer();
+    const client = new Client(server, { sessionsPerNamespace: 2 });
+    await assert.rejects(client.exec(NS, "FAIL here"));
+    const failedOn = server.requests.find((r) => r.kind === "sqlExec")!.payload["sessionId"];
+    await client.exec(NS, "DELETE FROM t WHERE id = 'x'");
+    const next = server.requests.filter((r) => r.kind === "sqlExec").at(-1)!;
+    assert.notEqual(next.payload["sessionId"], failedOn);
+    assert.equal(opened(), 3, "the namespace's session, the failed one and its replacement");
+  });
+
+  it("never opens more sessions than sessionsPerNamespace", async () => {
+    const { server, opened } = pooledServer();
+    const client = new Client(server, { sessionsPerNamespace: 3 });
+    await Promise.all(Array.from({ length: 40 }, (_, i) => client.putJSON(NS, DOC, { n: i })));
+    assert.ok(opened() <= 3, `${opened()} sessions opened`);
   });
 });

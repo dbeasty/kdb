@@ -174,6 +174,32 @@ export interface ConnectOptions {
    * the same host. "zstd" and "none" decide it regardless of the address. Ignored with jsonOnly.
    */
   compression?: "auto" | "zstd" | "none";
+  /**
+   * How many server sessions one namespace may use for writes at once (default 8; 1 runs every
+   * write on the namespace's one session, as before). The server orders the frames of one session,
+   * and an exec holds its session until its auto-commit lands, so with a single session one app
+   * process ran one write at a time: each waited for the one before it, fsync included, and none
+   * shared a group commit. Self-contained writes - an exec and its auto-commit, a commit carrying
+   * its own transaction - take a session from a small pool instead, the way Cassandra's and
+   * MongoDB's drivers keep many requests in flight per process. Leases, queries and transaction
+   * control stay on the namespace's own session, and while this client holds a lease in a
+   * namespace every write there does too: the server checks a lease against its holder's session.
+   */
+  sessionsPerNamespace?: number;
+}
+
+const DEFAULT_SESSIONS_PER_NAMESPACE = 8;
+
+/** The write sessions of one namespace beyond its own (ConnectOptions.sessionsPerNamespace). */
+interface SessionPool {
+  idle: string[];
+  open: number;
+  waiters: Array<{ resolve: (sessionId: string) => void; reject: (error: unknown) => void }>;
+}
+
+/** Whether sql is transaction control, which only the namespace's own session may carry. */
+function isTransactionControl(sql: string): boolean {
+  return /^\s*(BEGIN|START\s+TRANSACTION|COMMIT|ROLLBACK|END)\b/i.test(sql);
 }
 
 /**
@@ -264,6 +290,10 @@ export class Client implements KdbOperations {
   readonly #namespaces = new Map<string, NamespaceState>();
   readonly #sessionsInFlight = new Map<string, Promise<NamespaceState>>();
   readonly #sessionLocks = new Map<string, SessionLock>();
+  readonly #maxSessions: number;
+  readonly #pools = new Map<string, SessionPool>();
+  /** The documents this client holds a lease on, per namespace. */
+  readonly #leases = new Map<string, Set<string>>();
 
   #correlation = 1;
   /** The address connect() dialled, when it did; "auto" compression decides by it. */
@@ -275,6 +305,7 @@ export class Client implements KdbOperations {
   constructor(transport: Transport, options: ConnectOptions = {}, uri?: string) {
     this.#transport = transport;
     this.#uri = uri;
+    this.#maxSessions = Math.max(1, Math.floor(options.sessionsPerNamespace ?? DEFAULT_SESSIONS_PER_NAMESPACE));
     this.#maxFrameBytes = options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
     this.#requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.#authorNodeId = randomUuid();
@@ -706,9 +737,10 @@ export class Client implements KdbOperations {
     options: CallOptions,
   ): Promise<{ columns: string[]; rows: string[][]; cellKinds: string | undefined; rowsAffected: number }> {
     // The sqlExec and its auto-commit are one unit of work on a session that holds a single
-    // pending transaction, so nothing else may use that session between them. See SessionLock.
-    return this.#sessionLock(ns).exclusive(async () => {
-      const result = await this.#execSql(ns, sql, args, options);
+    // pending transaction, so nothing else may use that session between them: a pooled session
+    // is this unit's alone, the namespace's own is held exclusively (see SessionLock).
+    return this.#withWriteSession(ns, options, "exclusive", !isTransactionControl(sql), async (sessionId) => {
+      const result = await this.#execSql(ns, sql, args, options, undefined, sessionId);
       if (result.readOnly) {
         if (result.rowsAffected > 0 && result.resolvedCommitHex) {
           // A write the server committed on its own (an UPDATE with ORDER BY, LIMIT or
@@ -728,7 +760,7 @@ export class Client implements KdbOperations {
       const state = await this.#ensureNamespace(ns, options);
       const reply = await this.#request(
         "txCommit",
-        { namespace: ns, sessionId: state.sessionId, transactionBytes: [] },
+        { namespace: ns, sessionId, transactionBytes: [] },
         options,
       );
       this.#handleCommitReply(ns, state, reply);
@@ -761,6 +793,7 @@ export class Client implements KdbOperations {
       options,
       "releaseLock",
     );
+    this.#leases.get(ns)?.delete(docId);
     const result = this.#expect<LockResultDto>(reply, "lockResult");
     if (!result.granted && result.error) {
       throw new KdbLockError(docId, result.holderSessionId ?? undefined, `kdb: ${result.error}`);
@@ -1181,6 +1214,11 @@ export class Client implements KdbOperations {
       kind,
     );
     const result = this.#expect<LockResultDto>(reply, "lockResult");
+    if (result.granted) {
+      let held = this.#leases.get(ns);
+      if (!held) this.#leases.set(ns, (held = new Set()));
+      held.add(docId);
+    }
     if (!result.granted) {
       throw new KdbLockError(
         docId,
@@ -1245,14 +1283,15 @@ export class Client implements KdbOperations {
     tx: TransactionDto,
     options: CallOptions,
   ): Promise<CommitHash> {
-    // Shared with other byte-carrying commits, exclusive against exec: the server clears the
-    // session's pending transaction as this lands, so it must not land inside an exec.
-    const reply = await this.#sessionLock(ns).shared(() =>
+    // On the namespace's own session: shared with other byte-carrying commits, exclusive against
+    // exec - the server clears the session's pending transaction as this lands, so it must not
+    // land inside an exec. On a pooled one it is alone.
+    const reply = await this.#withWriteSession(ns, options, "shared", true, (sessionId) =>
       this.#request(
         "txCommit",
         {
           namespace: ns,
-          sessionId: state.sessionId,
+          sessionId,
           transactionBytes: bytesToWire(utf8Encode(JSON.stringify(tx))),
         },
         options,
@@ -1290,6 +1329,7 @@ export class Client implements KdbOperations {
     args: unknown[],
     options: CallOptions,
     paging?: { pageSize: number; continuation?: string },
+    sessionId?: string,
   ): Promise<{
     columns: string[];
     rows: string[][];
@@ -1304,7 +1344,7 @@ export class Client implements KdbOperations {
       "sqlExec",
       {
         namespace: ns,
-        sessionId: state.sessionId,
+        sessionId: sessionId ?? state.sessionId,
         sql,
         parametersJson: args.length > 0 ? JSON.stringify(args.map(sqlParam)) : null,
         ...(paging
@@ -1328,6 +1368,79 @@ export class Client implements KdbOperations {
       resolvedCommitHex: result.resolvedCommitHex || undefined,
     };
   }
+
+  /**
+   * Runs one self-contained write on a session of its own from the namespace's pool, or, when
+   * pooling is off, the statement must stay on the namespace's session, or this client holds a
+   * lease in the namespace, on the namespace's own session under its lock (mode).
+   */
+  async #withWriteSession<T>(
+    ns: string,
+    options: CallOptions,
+    mode: "exclusive" | "shared",
+    poolable: boolean,
+    run: (sessionId: string) => Promise<T>,
+  ): Promise<T> {
+    const state = await this.#ensureNamespace(ns, options);
+    if (this.#maxSessions <= 1 || !poolable || (this.#leases.get(ns)?.size ?? 0) > 0) {
+      const lock = this.#sessionLock(ns);
+      return mode === "exclusive" ? lock.exclusive(() => run(state.sessionId)) : lock.shared(() => run(state.sessionId));
+    }
+    const sessionId = await this.#acquirePooled(ns, options);
+    let healthy = false;
+    try {
+      const out = await run(sessionId);
+      healthy = true;
+      return out;
+    } finally {
+      // A unit that failed in any way may have left half of itself on the session - an exec
+      // whose commit never landed - so the session is not reused. Opening another is one round
+      // trip, and failures are rare.
+      this.#releasePooled(ns, sessionId, healthy);
+    }
+  }
+
+  async #acquirePooled(ns: string, options: CallOptions): Promise<string> {
+    let pool = this.#pools.get(ns);
+    if (!pool) this.#pools.set(ns, (pool = { idle: [], open: 0, waiters: [] }));
+    const idle = pool.idle.pop();
+    if (idle !== undefined) return idle;
+    // The namespace's own session counts towards the limit; the pool holds the rest.
+    if (pool.open < this.#maxSessions - 1) {
+      pool.open++;
+      try {
+        return await this.#beginSession(ns, options).then((ack) => ack.sessionId);
+      } catch (error) {
+        pool.open--;
+        throw error;
+      }
+    }
+    return new Promise<string>((resolve, reject) => pool.waiters.push({ resolve, reject }));
+  }
+
+  #releasePooled(ns: string, sessionId: string, healthy: boolean): void {
+    const pool = this.#pools.get(ns);
+    if (!pool) return;
+    const waiter = pool.waiters.shift();
+    if (healthy) {
+      if (waiter) waiter.resolve(sessionId);
+      else pool.idle.push(sessionId);
+      return;
+    }
+    // Dropped: its place in the pool goes to a fresh session for whoever waits, if anyone does.
+    if (!waiter) {
+      pool.open--;
+      return;
+    }
+    this.#beginSession(ns, {}).then(
+      (ack) => waiter.resolve(ack.sessionId),
+      (error: unknown) => {
+        pool.open--;
+        waiter.reject(error);
+      },
+    );
+  }
+
 
   #sessionLock(ns: string): SessionLock {
     let lock = this.#sessionLocks.get(ns);
@@ -1353,23 +1466,7 @@ export class Client implements KdbOperations {
     if (inFlight) return inFlight;
 
     const promise = (async () => {
-      const reply = await this.#request(
-        "sessionBegin",
-        {
-          namespace: ns,
-          sessionId: null,
-          readConsistency: READ_COMMITTED,
-          baseVersionHex: null,
-        },
-        options,
-      );
-      const ack = this.#expect<SessionBeginAckDto>(reply, "sessionBeginAck");
-      if (!ack.sessionId) {
-        throw new KdbUnauthenticatedError(
-          `kdb: session begin rejected for namespace ${ns}` +
-            (ack.error ? `: ${ack.error}` : ""),
-        );
-      }
+      const ack = await this.#beginSession(ns, options);
       const state: NamespaceState = { sessionId: ack.sessionId, head: ack.headHex };
       this.#namespaces.set(ns, state);
       return state;
@@ -1381,6 +1478,27 @@ export class Client implements KdbOperations {
     } finally {
       this.#sessionsInFlight.delete(ns);
     }
+  }
+
+  /** Opens a READ_COMMITTED session on ns. */
+  async #beginSession(ns: string, options: CallOptions): Promise<{ sessionId: string; headHex: string }> {
+    const reply = await this.#request(
+      "sessionBegin",
+      {
+        namespace: ns,
+        sessionId: null,
+        readConsistency: READ_COMMITTED,
+        baseVersionHex: null,
+      },
+      options,
+    );
+    const ack = this.#expect<SessionBeginAckDto>(reply, "sessionBeginAck");
+    if (!ack.sessionId) {
+      throw new KdbUnauthenticatedError(
+        `kdb: session begin rejected for namespace ${ns}` + (ack.error ? `: ${ack.error}` : ""),
+      );
+    }
+    return { sessionId: ack.sessionId, headHex: ack.headHex };
   }
 
   /**
@@ -1503,6 +1621,12 @@ export class Client implements KdbOperations {
       const pending = this.#take(correlationId);
       pending?.reject(this.#closeCause);
     }
+    // Sessions die with the connection: so do the pools and the leases they were checked against.
+    for (const pool of this.#pools.values()) {
+      for (const waiter of pool.waiters.splice(0)) waiter.reject(this.#closeCause);
+    }
+    this.#pools.clear();
+    this.#leases.clear();
   }
 
   #nextCorrelation(): number {
