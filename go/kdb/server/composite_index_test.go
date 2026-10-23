@@ -15,10 +15,11 @@ import (
 // (_c, status, updatedAt) and one without, so every answer the walk gives can be checked against
 // the ordinary path's.
 type compositePair struct {
-	t          *testing.T
-	with, bare *rawWireClient
-	ws, bs     string
-	ids        []codec.UUID
+	t           *testing.T
+	with, bare  *rawWireClient
+	ws, bs      string
+	withRuntime *KdbServerRuntime
+	ids         []codec.UUID
 }
 
 func newCompositePair(t *testing.T, docs []string) *compositePair {
@@ -35,6 +36,7 @@ func newCompositePair(t *testing.T, docs []string) *compositePair {
 		}
 	}
 	p.with, p.bare = listenForTest(t, rtWith), listenForTest(t, rtBare)
+	p.withRuntime = rtWith
 	p.ws = p.with.sessionBegin(t, "app/data", "READ_COMMITTED").SessionID
 	p.bs = p.bare.sessionBegin(t, "app/data", "READ_COMMITTED").SessionID
 	for _, ddl := range []string{

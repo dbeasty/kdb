@@ -460,19 +460,35 @@ func (p *RegistryIndexProvider) preparedForStored(requested []document.Op, prepa
 // commitToIndexes applies prepared updates under the landed commit hash and returns the hints
 // that replicate them. It runs after the DAG append and still under the write gate, so index
 // state advances in the same order the log does. It writes nothing to disk: it nudges the
-// background flusher, which writes the snapshots once the namespace goes quiet.
+// background flusher, which writes the snapshots once the namespace goes quiet. The stores'
+// bookkeeping is not done here but by maintain, which the caller runs once the gate is released.
 func (p *RegistryIndexProvider) commitToIndexes(prepared []*index.PreparedWrite, commitHash codec.Hash) ([]index.Hint, error) {
-	hints, err := p.applyCommit(prepared, commitHash)
-	if err == nil {
-		p.repairHeads()
+	return p.applyCommit(prepared, commitHash)
+}
+
+// maintain is the stores' bookkeeping after commits: it brings every store's head state up to
+// the DAG head, rebuilds any that cannot follow (repairHeads), and runs the history check the
+// registry flagged due (index.Registry.BoundHistoryIfDue). None of it decides what a read sees -
+// a read brings the stores it uses to its own cutoff, and a store that cannot follow answers
+// with a scan until it is rebuilt - so it is kept off the write gate, as Cassandra keeps
+// compaction and memtable flushing off its write path. Advancing every store on every commit
+// under the gate was most of what a queue claim held the gate for: 51 stores, two or three of
+// which the claim had written. The server runs it after releasing the gate, while the commit
+// waits for its sync; when another commit's pass is already running this one is skipped, and
+// that pass, or the next, covers it.
+func (p *RegistryIndexProvider) maintain() {
+	if !p.maintainMu.TryLock() {
+		return
 	}
-	return hints, err
+	defer p.maintainMu.Unlock()
+	p.registry.BoundHistoryIfDue()
+	p.repairHeads()
 }
 
 // repairHeads rebuilds, from the documents at head, any store whose head state could not follow
 // the commit graph (index.MemoryStore.NeedsRebuild: history it would need to replay was dropped).
-// It runs on the commit path, after the commit is applied, so the stores are current before the
-// next read; until it runs, reads of such a store fall back to a scan rather than a wrong answer.
+// Run by maintain after commits; until it runs, reads of such a store fall back to a scan rather
+// than a wrong answer.
 func (p *RegistryIndexProvider) repairHeads() {
 	ids := p.registry.NeedingRebuild()
 	if len(ids) == 0 {

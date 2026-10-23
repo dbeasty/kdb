@@ -42,8 +42,16 @@ type Registry struct {
 	historyMu     sync.Mutex
 	historyWindow int
 	commitsSeen   atomic.Uint64
-	// recent is the last commits marked, oldest first, at most historyWindow of them.
-	recent []codec.Hash
+	// recent is the last commits marked, oldest first, and recentSeq numbers each of them in
+	// marking order (markSeq is the newest), so a commit's place in the window is one lookup.
+	recent    []codec.Hash
+	recentSeq map[codec.Hash]int64
+	markSeq   int64
+	// deferBound makes MarkCommit only flag a due check (historyDue) for the owner to run with
+	// BoundHistoryIfDue off its write path; boundMu keeps two checks from running at once.
+	deferBound bool
+	historyDue atomic.Bool
+	boundMu    sync.Mutex
 }
 
 type registryEntry struct {
@@ -336,7 +344,8 @@ func (r *Registry) ApplyHints(hints []Hint) error {
 }
 
 // MarkCommit records that every store reflects commitHash. Call it for commits that touched
-// no indexed document too, so a snapshot taken afterwards is not judged stale on open.
+// no indexed document too, so a snapshot taken afterwards is not judged stale on open. Marking
+// the same commit again (one call per document a commit wrote) counts it once.
 func (r *Registry) MarkCommit(commitHash codec.Hash) {
 	r.mu.Lock()
 	r.head = commitHash
@@ -346,12 +355,38 @@ func (r *Registry) MarkCommit(commitHash codec.Hash) {
 		return
 	}
 	r.historyMu.Lock()
+	if _, seen := r.recentSeq[commitHash]; seen {
+		r.historyMu.Unlock()
+		return
+	}
+	r.markSeq++
+	r.recentSeq[commitHash] = r.markSeq
 	r.recent = append(r.recent, commitHash)
-	if n := len(r.recent); n > 2*r.historyWindow {
-		r.recent = append(r.recent[:0], r.recent[n-r.historyWindow:]...)
+	// Kept to the largest window the stores can be given, with slack so this is rare.
+	if n := len(r.recent); n > DefaultHistoryEvents*5/4 {
+		for _, c := range r.recent[:n-DefaultHistoryEvents] {
+			delete(r.recentSeq, c)
+		}
+		r.recent = append(r.recent[:0], r.recent[n-DefaultHistoryEvents:]...)
 	}
 	r.historyMu.Unlock()
 	if r.commitsSeen.Add(1)%historyCheckEvery == 0 {
+		if r.deferBound {
+			r.historyDue.Store(true)
+		} else {
+			r.boundHistory()
+		}
+	}
+}
+
+// DeferHistoryBounding hands the periodic history check to the caller: MarkCommit then only
+// flags it due, and the caller runs it with BoundHistoryIfDue where it costs no writer anything -
+// the server, after its write gate is released. Set before the registry is used.
+func (r *Registry) DeferHistoryBounding() { r.deferBound = true }
+
+// BoundHistoryIfDue runs the history check MarkCommit flagged (see DeferHistoryBounding), if any.
+func (r *Registry) BoundHistoryIfDue() {
+	if r.historyDue.CompareAndSwap(true, false) {
 		r.boundHistory()
 	}
 }
@@ -379,6 +414,7 @@ func (r *Registry) SetHistoryBudget(budget func() int64) {
 	r.historyMu.Lock()
 	r.historyBudget = budget
 	r.historyWindow = DefaultHistoryEvents
+	r.recentSeq = make(map[codec.Hash]int64)
 	r.historyMu.Unlock()
 }
 
@@ -390,11 +426,16 @@ func (r *Registry) HistoryWindow() int {
 }
 
 // boundHistory shrinks the shared window by a quarter and trims every store to it while their
-// history is over budget, and lets it grow back while well under.
+// history is over budget, and lets it grow back while well under. The stores are trimmed without
+// historyMu held, so MarkCommit - on the commit path - never waits for a trim: whether a commit is
+// in the window is a lookup of its marking sequence against the window's first one.
 func (r *Registry) boundHistory() {
+	r.boundMu.Lock()
+	defer r.boundMu.Unlock()
 	r.historyMu.Lock()
-	defer r.historyMu.Unlock()
-	budget := r.historyBudget()
+	budgetFn, window := r.historyBudget, r.historyWindow
+	r.historyMu.Unlock()
+	budget := budgetFn()
 	if budget <= 0 {
 		return
 	}
@@ -413,28 +454,37 @@ func (r *Registry) boundHistory() {
 		return n
 	}
 	trim := func() {
-		from := max(0, len(r.recent)-r.historyWindow)
-		window := make(map[codec.Hash]struct{}, len(r.recent)-from)
-		for _, c := range r.recent[from:] {
-			window[c] = struct{}{}
+		r.historyMu.Lock()
+		first := r.markSeq - int64(window) // a commit marked after this one is in the window
+		r.historyMu.Unlock()
+		inWindow := func(c codec.Hash) bool {
+			r.historyMu.Lock()
+			seq, ok := r.recentSeq[c]
+			r.historyMu.Unlock()
+			return ok && seq > first
 		}
-		inWindow := func(c codec.Hash) bool { _, ok := window[c]; return ok }
 		for _, s := range stores {
 			s.TrimHistoryOutside(inWindow)
 		}
 	}
+	setWindow := func(w int) {
+		window = w
+		r.historyMu.Lock()
+		r.historyWindow = w
+		r.historyMu.Unlock()
+	}
 	// Back to the current window first: every store has gained commits since the last check,
 	// and judging that growth against the budget would shrink the window again each time.
-	if r.historyWindow < DefaultHistoryEvents {
+	if window < DefaultHistoryEvents {
 		trim()
 	}
 	used := total()
-	if used < budget/2 && r.historyWindow < DefaultHistoryEvents {
-		r.historyWindow = min(DefaultHistoryEvents, r.historyWindow*5/4+1)
+	if used < budget/2 && window < DefaultHistoryEvents {
+		setWindow(min(DefaultHistoryEvents, window*5/4+1))
 		return
 	}
-	for used > budget && r.historyWindow > minHistoryWindow {
-		r.historyWindow = max(minHistoryWindow, r.historyWindow*3/4)
+	for used > budget && window > minHistoryWindow {
+		setWindow(max(minHistoryWindow, window*3/4))
 		trim()
 		used = total()
 	}

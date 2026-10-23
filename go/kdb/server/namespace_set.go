@@ -467,6 +467,7 @@ func (sp *serverPrepared) Apply(message string) (document.Commit, error) {
 			if _, err := sp.provider.commitToIndexes(stored, r.Commit.Hash); err != nil {
 				return r.Commit, err
 			}
+			sp.provider.maintain()
 		}
 		return r.Commit, nil
 	case transaction.ResultAborted:

@@ -210,7 +210,9 @@ func (n serverLocalNode) Advanced(step peersync.AdvanceStep) error {
 		err := step.EachApplied(func(ops []document.Op) error {
 			prepared, err := p.prepareCommitForIndexes(ops)
 			if err == nil {
-				_, err = p.commitToIndexes(prepared, last.Hash)
+				if _, err = p.commitToIndexes(prepared, last.Hash); err == nil {
+					p.maintain()
+				}
 			}
 			return err
 		})

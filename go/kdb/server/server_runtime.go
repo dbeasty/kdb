@@ -204,6 +204,9 @@ type KdbServerRuntime struct {
 	// because silently degrading a correctness guarantee is worse than the violation itself.
 	UniqueKeyRebuildError error
 
+	// changes is which documents recent commits wrote, for immediate UPDATEs (change_log.go).
+	changes changeLog
+
 	// sweeperState holds document-expiry configuration and the sweeper goroutine (expiry.go).
 	sweeperState
 
@@ -898,6 +901,8 @@ func (s *KdbServerRuntime) commitAtGateFront(tx document.Transaction, call func(
 	}
 	switch r := result.(type) {
 	case transaction.ResultSuccess:
+		// Which documents it wrote, for the immediate UPDATEs queued behind it (changeLog).
+		s.changes.record(r.Commit)
 		// Applied under the gate so index state advances in commit order. The hints ride along
 		// on the commit for replication.
 		if indexProvider != nil {
@@ -926,6 +931,11 @@ func (s *KdbServerRuntime) commitAtGateFront(tx document.Transaction, call func(
 			}
 		}
 		releaseNow()
+		if indexProvider != nil {
+			// The stores' bookkeeping, now that the next writer can have the gate: overlapped
+			// with this commit's wait for its sync.
+			indexProvider.maintain()
+		}
 		if waitDurable != nil {
 			if err := waitDurable(); err != nil {
 				return document.Commit{}, err

@@ -93,7 +93,15 @@ func (s *KdbServerRuntime) ExecImmediateUpdate(upd sql.UpdateStatement, qctx sql
 		candidates []codec.UUID
 		complete   bool
 		narrow     = upd.Limit != nil && *upd.Limit > 0
+		keyed      []codec.UUID
 	)
+	if ku, ok := s.SQLEngine().(sql.KeyedUpdater); ok {
+		// The WHERE names its documents by key: no other can match, so nothing is searched for
+		// before the gate and nothing that changed since needs re-checking under it.
+		if ids, isKeyed := ku.UpdateKeyedTargets(upd, qctx); isKeyed {
+			keyed, narrow = ids, false
+		}
+	}
 	if narrow {
 		// Any recent head is a correct place to find candidates - the gate re-checks whatever
 		// changed after it - so when an index walk could not serve the head read, because claims
@@ -129,7 +137,7 @@ func (s *KdbServerRuntime) ExecImmediateUpdate(upd sql.UpdateStatement, qctx sql
 	var out ImmediateUpdateResult
 	commit, committed, err := s.CommitImmediate(principal, sessionID, func(live codec.Hash) ([]document.Op, error) {
 		out.Head = live
-		var among []codec.UUID
+		among := keyed
 		if narrow {
 			among = s.immediateAmong(readHead, live, candidates, complete, *upd.Limit)
 		}
@@ -204,6 +212,15 @@ func (s *KdbServerRuntime) immediateAmong(readHead, live codec.Hash, candidates 
 // changedSince lists the documents whose content differs between the trees of commits from and
 // to, and false when that cannot be told cheaply: a tree not at hand, or more than max changes.
 func (s *KdbServerRuntime) changedSince(from, to codec.Hash, max int) ([]codec.UUID, bool) {
+	// What the commit path recorded, when it covers every commit in between (changeLog).
+	if ids, ok := s.changes.changedSince(from, to, maxImmediateDiff, max); ok {
+		return ids, true
+	}
+	return s.treeChangedSince(from, to, max)
+}
+
+// treeChangedSince is changedSince by diffing the two commits' document trees.
+func (s *KdbServerRuntime) treeChangedSince(from, to codec.Hash, max int) ([]codec.UUID, bool) {
 	if s.dag == nil {
 		return nil, false
 	}
