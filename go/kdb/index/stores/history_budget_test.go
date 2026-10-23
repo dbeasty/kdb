@@ -125,3 +125,28 @@ func TestRegistryHistoryWithoutABudgetIsPerIndex(t *testing.T) {
 		t.Fatalf("window %d with no budget set", w)
 	}
 }
+
+// Deferred, the check only runs when its owner asks (the server: after the write gate is
+// released). Until then history is not trimmed; once it runs it is back within the budget.
+func TestRegistryHistoryCheckCanBeDeferred(t *testing.T) {
+	r, d, head := historyRegistry(t, 12)
+	r.DeferHistoryBounding()
+	budget := int64(1 << 20)
+	r.SetHistoryBudget(func() int64 { return budget })
+	docs := make([]codec.UUID, 50)
+	for i := range docs {
+		docs[i], _ = codec.RandomUUID()
+	}
+	commits := writeCommits(t, r, d, head, docs, 12, 8_000, 1)
+	if used := historyBytes(r); used <= budget {
+		t.Fatalf("history %d bytes within the %d budget before any check ran", used, budget)
+	}
+	for i := 0; i < 8; i++ { // each check shrinks the window by at most what one pass trims
+		r.BoundHistoryIfDue()
+		commits = writeCommits(t, r, d, commits[len(commits)-1], docs, 12, 32, 2)
+	}
+	r.BoundHistoryIfDue()
+	if used := historyBytes(r); used > budget*5/4 {
+		t.Fatalf("history %d bytes against a %d budget after the deferred checks", used, budget)
+	}
+}

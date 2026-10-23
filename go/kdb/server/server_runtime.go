@@ -926,6 +926,11 @@ func (s *KdbServerRuntime) commitAtGateFront(tx document.Transaction, call func(
 			}
 		}
 		releaseNow()
+		if indexProvider != nil {
+			// The stores' bookkeeping, now that the next writer can have the gate: overlapped
+			// with this commit's wait for its sync.
+			indexProvider.maintain()
+		}
 		if waitDurable != nil {
 			if err := waitDurable(); err != nil {
 				return document.Commit{}, err

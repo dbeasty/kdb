@@ -55,6 +55,8 @@ type RegistryIndexProvider struct {
 	hasSavedHead bool
 	closed       bool
 	flusher      *indexFlusher
+	// maintainMu lets one maintain pass run at a time; a commit finding one running skips its own.
+	maintainMu sync.Mutex
 
 	catchUpCounter
 }
@@ -62,6 +64,8 @@ type RegistryIndexProvider struct {
 // NewRegistryIndexProvider wires reg to rt. rt supplies the head commit, document bodies for
 // IncludeJSON, and the expiry predicate; it may be nil in tests that only exercise lookups.
 func NewRegistryIndexProvider(reg *index.Registry, rt *KdbServerRuntime) *RegistryIndexProvider {
+	// The history check runs in maintain, off the write gate.
+	reg.DeferHistoryBounding()
 	return &RegistryIndexProvider{registry: reg, runtime: rt}
 }
 
