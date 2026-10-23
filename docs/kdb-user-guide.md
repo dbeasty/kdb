@@ -252,6 +252,25 @@ UPDATE docs SET status = 'completed' REMOVE lastError WHERE kdb_id = ? LIMIT 1 R
 UPDATE docs REMOVE staging WHERE _c = 'projects' AND parentId = ?
 ```
 
+An upsert on a unique key is one statement too - MongoDB's `updateOne(filter, update, {upsert:
+true})`, spelled as PostgreSQL spells it. `ON CONFLICT (columns)` names a declared unique
+constraint (its columns in any order). When no document holds the row's values of it, the row is
+inserted; when one does, the row is dropped and that document is updated by `DO UPDATE SET ...
+[REMOVE ...] [WHERE ...]` (whose expressions read the existing document), or left alone by `DO
+NOTHING`. Like a claim it is decided and committed under the write gate, so concurrent upserts of
+one key never insert twice and never fail with a unique violation. `RETURNING` projects the
+document as written; no row comes back for `DO NOTHING`, or when `DO UPDATE`'s `WHERE` does not
+match. The reply's generated ids name the document only when the row was inserted. Such an
+`INSERT` takes one `VALUES` row and no attachments, and may name its document's `kdb_id`, which
+must be new. A row whose values of the constraint include a null claims nothing and is always
+inserted, and a row colliding on some other unique constraint is refused.
+
+```sql
+INSERT INTO docs (kdb_id, _c, jobId, status, attempts) VALUES (?, 'jobs', ?, 'pending', 0)
+  ON CONFLICT (jobId) DO UPDATE SET status = 'pending' REMOVE lastError
+  RETURNING kdb_id, _doc
+```
+
 The TypeScript client's `execReturning(ns, sql, args)` returns `{ columns, rows, rowsAffected }`
 the same way. Such a statement commits on its own, so it is refused inside a transaction that has
 already buffered writes, and it acts on the session's own namespace only.

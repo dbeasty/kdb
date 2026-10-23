@@ -418,6 +418,16 @@ func (p *rdParser) parseInsert() (InsertStatement, error) {
 		}
 		ins.Attachments = specs
 	}
+	if p.matchKeyword("ON") {
+		if ins.OnConflict, err = p.parseOnConflict(table); err != nil {
+			return InsertStatement{}, err
+		}
+	}
+	if p.matchKeyword("RETURNING") {
+		if ins.Returning, err = p.parseProjections(); err != nil {
+			return InsertStatement{}, err
+		}
+	}
 	return ins, nil
 }
 
@@ -426,6 +436,35 @@ func (p *rdParser) parseUpdate() (UpdateStatement, error) {
 	if err != nil {
 		return UpdateStatement{}, err
 	}
+	upd, err := p.parseUpdateChanges(table)
+	if err != nil {
+		return UpdateStatement{}, err
+	}
+	if p.matchKeyword("WHERE") {
+		upd.Where, err = p.parseExpr()
+		if err != nil {
+			return UpdateStatement{}, err
+		}
+	}
+	// The claim clauses (UpdateStatement.Immediate): which matching documents to update, and
+	// what to hand back about them.
+	if upd.OrderBy, err = p.parseOrderBy(); err != nil {
+		return UpdateStatement{}, err
+	}
+	if upd.Limit, err = p.parseLimit(); err != nil {
+		return UpdateStatement{}, err
+	}
+	if p.matchKeyword("RETURNING") {
+		if upd.Returning, err = p.parseProjections(); err != nil {
+			return UpdateStatement{}, err
+		}
+	}
+	return upd, nil
+}
+
+// parseUpdateChanges parses what an UPDATE (or INSERT's ON CONFLICT DO UPDATE) changes: the SET
+// list and the REMOVE clause.
+func (p *rdParser) parseUpdateChanges(table TableRef) (UpdateStatement, error) {
 	// SET may be left out when the list starts with DROP or RENAME ATTACHMENT, or when there is
 	// only a REMOVE clause.
 	removeOnly := p.peekKeyword("REMOVE")
@@ -475,26 +514,43 @@ func (p *rdParser) parseUpdate() (UpdateStatement, error) {
 			}
 		}
 	}
-	if p.matchKeyword("WHERE") {
-		upd.Where, err = p.parseExpr()
-		if err != nil {
-			return UpdateStatement{}, err
-		}
-	}
-	// The claim clauses (UpdateStatement.Immediate): which matching documents to update, and
-	// what to hand back about them.
-	if upd.OrderBy, err = p.parseOrderBy(); err != nil {
-		return UpdateStatement{}, err
-	}
-	if upd.Limit, err = p.parseLimit(); err != nil {
-		return UpdateStatement{}, err
-	}
-	if p.matchKeyword("RETURNING") {
-		if upd.Returning, err = p.parseProjections(); err != nil {
-			return UpdateStatement{}, err
-		}
-	}
 	return upd, nil
+}
+
+// parseOnConflict parses what follows INSERT's ON: CONFLICT (columns) DO NOTHING | DO UPDATE
+// SET ... [REMOVE ...] [WHERE ...].
+func (p *rdParser) parseOnConflict(table TableRef) (*OnConflict, error) {
+	if err := p.expectKeyword("CONFLICT"); err != nil {
+		return nil, err
+	}
+	columns, err := p.parseIdentifierList()
+	if err != nil {
+		return nil, err
+	}
+	if len(columns) == 0 {
+		return nil, p.parseError("ON CONFLICT needs the columns of a unique constraint")
+	}
+	if err := p.expectKeyword("DO"); err != nil {
+		return nil, err
+	}
+	oc := &OnConflict{Columns: columns}
+	if p.matchKeyword("NOTHING") {
+		return oc, nil
+	}
+	if !p.matchKeyword("UPDATE") {
+		return nil, p.parseError("expected NOTHING or UPDATE after DO")
+	}
+	upd, err := p.parseUpdateChanges(table)
+	if err != nil {
+		return nil, err
+	}
+	if p.matchKeyword("WHERE") {
+		if upd.Where, err = p.parseExpr(); err != nil {
+			return nil, err
+		}
+	}
+	oc.Update = &upd
+	return oc, nil
 }
 
 func (p *rdParser) parseDelete() (DeleteStatement, error) {

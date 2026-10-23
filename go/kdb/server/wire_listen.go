@@ -726,26 +726,47 @@ func (h *sqlWireConnHandler) handleSqlExec(msg wire.SqlExecMessage) wire.Message
 		return h.execRead(msg, sess, target, params, stmt)
 	}
 	if upd, ok := sql.ImmediateUpdate(stmt); ok {
-		return h.execImmediateUpdate(msg, sess, target, params, upd)
+		return h.execImmediate(msg, sess, target, params, "UPDATE with ORDER BY, LIMIT or RETURNING",
+			func(rt *KdbServerRuntime, qctx sql.QueryContext, check func(sql.DMLResult) error) (immediateOutcome, error) {
+				out, err := rt.ExecImmediateUpdate(upd, qctx, sess.Principal, sess.ID.Value, check)
+				return immediateOutcome{out.DML, out.Commit, out.Committed, out.Head}, err
+			})
+	}
+	if ins, ok := sql.ImmediateInsert(stmt); ok {
+		return h.execImmediate(msg, sess, target, params, "INSERT with ON CONFLICT or RETURNING",
+			func(rt *KdbServerRuntime, qctx sql.QueryContext, check func(sql.DMLResult) error) (immediateOutcome, error) {
+				out, err := rt.ExecImmediateInsert(ins, qctx, sess.Principal, sess.ID.Value, check)
+				return immediateOutcome{out.DML, out.Commit, out.Committed, out.Head}, err
+			})
 	}
 	return h.execDML(msg, sess, target, params)
 }
 
-// execImmediateUpdate runs an UPDATE with ORDER BY, LIMIT or RETURNING - a queue claim - as its
-// own statement: selected, written and committed in one step under the write gate
-// (KdbServerRuntime.ExecImmediateUpdate), not buffered on the session. The reply carries the
-// RETURNING rows and the commit, and is ReadOnly like a DDL statement's, because there is nothing
-// left for the client to commit: a client that auto-commits after a write (Exec) must not send a
-// TX_COMMIT for it.
-func (h *sqlWireConnHandler) execImmediateUpdate(msg wire.SqlExecMessage, sess *KdbSession, target sqlTarget, params []sql.Parameter, upd sql.UpdateStatement) wire.Message {
+// immediateOutcome is what an immediate statement did, for its reply.
+type immediateOutcome struct {
+	DML       sql.DMLResult
+	Commit    document.Commit
+	Committed bool
+	Head      codec.Hash
+}
+
+// execImmediate runs an immediate statement - an UPDATE with ORDER BY, LIMIT or RETURNING (a
+// queue claim), or an INSERT with ON CONFLICT or RETURNING (an upsert) - as its own statement:
+// decided, written and committed in one step under the write gate
+// (KdbServerRuntime.ExecImmediateUpdate, ExecImmediateInsert), not buffered on the session. The
+// reply carries the RETURNING rows and the commit, and is ReadOnly like a DDL statement's,
+// because there is nothing left for the client to commit: a client that auto-commits after a
+// write (Exec) must not send a TX_COMMIT for it. what names the statement kind in refusals.
+func (h *sqlWireConnHandler) execImmediate(msg wire.SqlExecMessage, sess *KdbSession, target sqlTarget, params []sql.Parameter, what string,
+	run func(rt *KdbServerRuntime, qctx sql.QueryContext, check func(sql.DMLResult) error) (immediateOutcome, error)) wire.Message {
 	if !target.own {
 		return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID,
-			"UPDATE with ORDER BY, LIMIT or RETURNING runs only on the session's own namespace")
+			what+" runs only on the session's own namespace")
 	}
 	if sess.hasPendingWrites() {
 		// It commits on its own, and it cannot take the open transaction's writes with it.
 		return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID,
-			"UPDATE with ORDER BY, LIMIT or RETURNING commits on its own; COMMIT or ROLLBACK the open transaction first")
+			what+" commits on its own; COMMIT or ROLLBACK the open transaction first")
 	}
 	rt := target.rt
 	qctx := sql.QueryContext{
@@ -772,7 +793,7 @@ func (h *sqlWireConnHandler) execImmediateUpdate(msg wire.SqlExecMessage, sess *
 		}
 		return nil
 	}
-	out, err := rt.ExecImmediateUpdate(upd, qctx, sess.Principal, sess.ID.Value, check)
+	out, err := run(rt, qctx, check)
 	if err != nil {
 		var conflictErr *ConflictError
 		if asError(err, &conflictErr) {
@@ -796,6 +817,7 @@ func (h *sqlWireConnHandler) execImmediateUpdate(msg wire.SqlExecMessage, sess *
 		RowsAffected:      out.DML.RowsAffected,
 		ResolvedCommitHex: out.Head.Hex(),
 		ReadOnly:          true,
+		GeneratedIDs:      out.DML.GeneratedIDs,
 	}
 }
 
