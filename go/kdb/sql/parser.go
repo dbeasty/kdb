@@ -426,13 +426,15 @@ func (p *rdParser) parseUpdate() (UpdateStatement, error) {
 	if err != nil {
 		return UpdateStatement{}, err
 	}
-	// SET may be left out when the list starts with DROP or RENAME ATTACHMENT.
-	if !p.matchKeyword("SET") && !p.peekKeyword("DROP") && !p.peekKeyword("RENAME") {
-		return UpdateStatement{}, p.parseError("expected SET")
+	// SET may be left out when the list starts with DROP or RENAME ATTACHMENT, or when there is
+	// only a REMOVE clause.
+	removeOnly := p.peekKeyword("REMOVE")
+	if !removeOnly && !p.matchKeyword("SET") && !p.peekKeyword("DROP") && !p.peekKeyword("RENAME") {
+		return UpdateStatement{}, p.parseError("expected SET or REMOVE")
 	}
 	var assignments []Assignment
 	var attachments []AttachmentChange
-	for {
+	for !removeOnly {
 		if kind := p.matchAttachmentItem(); kind >= 0 {
 			ch, err := p.parseAttachmentChange(kind)
 			if err != nil {
@@ -461,6 +463,18 @@ func (p *rdParser) parseUpdate() (UpdateStatement, error) {
 		}
 	}
 	upd := UpdateStatement{Table: table, Assignments: assignments, Attachments: attachments}
+	if p.matchKeyword("REMOVE") {
+		for {
+			path, err := p.readIdentifier()
+			if err != nil {
+				return UpdateStatement{}, err
+			}
+			upd.Removes = append(upd.Removes, path)
+			if !p.matchChar(',') {
+				break
+			}
+		}
+	}
 	if p.matchKeyword("WHERE") {
 		upd.Where, err = p.parseExpr()
 		if err != nil {
@@ -645,6 +659,7 @@ var clauseKeywords = map[string]bool{
 	"OR": true, "NOT": true, "AS": true, "VALUES": true, "INTO": true, "BY": true,
 	"ASC": true, "DESC": true, "JOIN": true, "INNER": true, "LEFT": true, "UNION": true,
 	"IS": true, "IN": true, "LIKE": true, "ILIKE": true, "BETWEEN": true, "RETURNING": true,
+	"REMOVE": true,
 }
 
 func (p *rdParser) peekIdentifierIsAlias() bool {

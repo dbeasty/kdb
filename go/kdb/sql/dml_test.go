@@ -191,3 +191,36 @@ func TestCreateTableWithUniqueConstraints(t *testing.T) {
 		t.Fatal("a constraint over an undeclared column must fail")
 	}
 }
+
+// REMOVE takes fields out of a document - MongoDB's $unset - rather than setting them to null, with
+// or without a SET beside it; a field that is not there, or a path through a non-object, is a no-op.
+func TestUpdateRemoveTakesFieldsOut(t *testing.T) {
+	f := newCorpusFixture(t, "app/dml-remove")
+	res, err := f.commitDML(`UPDATE tasks SET status = 'done' REMOVE priority, meta.reviewed WHERE title = 'alpha'`)
+	if err != nil || res.RowsAffected != 1 {
+		t.Fatalf("%+v %v", res, err)
+	}
+	f.expect(`SELECT _doc FROM tasks WHERE title = 'alpha'`,
+		`{"title":"alpha","status":"done","tags":["x","y"],"projectIds":["p1","p2"],"collaborators":[{"userId":"u1"},{"userId":"u2"}],"steps":[{"text":"plan"},{"text":"deploy staging"}],"flag":true,"score":1.5}`)
+	// Only REMOVE, no SET; a missing field and a path through a scalar leave the document alone.
+	if res, err = f.commitDML(`UPDATE tasks REMOVE flag, nothingHere, title.inside WHERE title = 'alpha'`); err != nil || res.RowsAffected != 1 {
+		t.Fatalf("%+v %v", res, err)
+	}
+	f.expect(`SELECT COUNT(*) FROM tasks WHERE title = 'alpha' AND flag IS NULL`, "1")
+	f.expect(`SELECT title, score FROM tasks WHERE title = 'alpha'`, "alpha|1.5")
+	// SET x = NULL still stores a null: only REMOVE removes.
+	if _, err = f.commitDML(`UPDATE tasks SET score = NULL WHERE title = 'alpha'`); err != nil {
+		t.Fatal(err)
+	}
+	f.expect(`SELECT _doc FROM tasks WHERE title = 'alpha'`,
+		`{"title":"alpha","status":"done","tags":["x","y"],"projectIds":["p1","p2"],"collaborators":[{"userId":"u1"},{"userId":"u2"}],"steps":[{"text":"plan"},{"text":"deploy staging"}],"score":null}`)
+	for _, bad := range []string{
+		`UPDATE tasks REMOVE kdb_id WHERE title = 'alpha'`,
+		`UPDATE tasks REMOVE _doc WHERE title = 'alpha'`,
+		`UPDATE tasks REMOVE steps[*] WHERE title = 'alpha'`,
+	} {
+		if _, err := f.commitDML(bad); err == nil {
+			t.Errorf("%s: accepted", bad)
+		}
+	}
+}

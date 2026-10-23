@@ -242,6 +242,16 @@ cols, rows, err := c.ExecReturning(ctx, "app/docs", `UPDATE docs SET status = 'p
 // len(rows) == 0: nothing to do. rows[0][0] is the id, rows[0][1] the job (json.RawMessage).
 ```
 
+`REMOVE` takes fields out of the documents an `UPDATE` touches - MongoDB's `$unset`, DynamoDB's
+`REMOVE` - where `SET x = NULL` stores a null. It follows the `SET` list, or stands alone, and takes
+dotted paths; a path that is not there, or that runs through something other than an object, is
+left as it is. Attachments are kept.
+
+```sql
+UPDATE docs SET status = 'completed' REMOVE lastError WHERE kdb_id = ? LIMIT 1 RETURNING kdb_id
+UPDATE docs REMOVE staging WHERE _c = 'projects' AND parentId = ?
+```
+
 The TypeScript client's `execReturning(ns, sql, args)` returns `{ columns, rows, rowsAffected }`
 the same way. Such a statement commits on its own, so it is refused inside a transaction that has
 already buffered writes, and it acts on the session's own namespace only.

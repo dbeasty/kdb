@@ -2,6 +2,7 @@ package sql
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -72,8 +73,16 @@ func (d *DMLExecutor) ExecuteUpdate(upd UpdateStatement, ctx QueryContext) ([]do
 // the candidates found before the gate (UpdateCandidates) plus whatever changed since, and this
 // re-checks every one of them at the live head.
 func (d *DMLExecutor) ExecuteUpdateAmong(upd UpdateStatement, ctx QueryContext, among []codec.UUID) (DMLResult, error) {
-	if len(upd.Assignments) == 0 && len(upd.Attachments) == 0 {
+	if len(upd.Assignments) == 0 && len(upd.Attachments) == 0 && len(upd.Removes) == 0 {
 		return DMLResult{}, NewPlanningError("UPDATE needs at least one assignment", "")
+	}
+	for _, r := range upd.Removes {
+		switch path := stripTableAlias(r, upd.Table); {
+		case path == colKdbID || path == colDoc || path == colAttachments:
+			return DMLResult{}, NewPlanningError(path+" cannot be removed", "")
+		case !ctx.Schema.IsSchemaless() && !ctx.Schema.HasField(rootSegment(path)):
+			return DMLResult{}, NewPlanningError("unknown column: "+path, "")
+		}
 	}
 	env := newEvalEnv(ctx.Schema, ctx.Parameters, upd.Table)
 	env.attach = ctx.attach
@@ -115,7 +124,7 @@ func (d *DMLExecutor) ExecuteUpdateAmong(upd UpdateStatement, ctx QueryContext, 
 			}
 			res.Operations = append(res.Operations, attachOps...)
 		}
-		if len(upd.Assignments) > 0 {
+		if len(upd.Assignments) > 0 || len(upd.Removes) > 0 {
 			jsonText := ed.doc.JSON
 			for _, a := range upd.Assignments {
 				jsonText, err = assignPath(jsonText, stripTableAlias(a.Path, upd.Table), env.cell(a.Value, ed))
@@ -123,10 +132,17 @@ func (d *DMLExecutor) ExecuteUpdateAmong(upd UpdateStatement, ctx QueryContext, 
 					return DMLResult{}, err
 				}
 			}
+			for _, r := range upd.Removes {
+				if jsonText, err = removePath(jsonText, stripTableAlias(r, upd.Table)); err != nil {
+					return DMLResult{}, err
+				}
+			}
 			if err := validateJSON(ed.doc.ID, jsonText, ctx.Schema); err != nil {
 				return DMLResult{}, err
 			}
-			res.Operations = append(res.Operations, document.WriteOp{DocID: ed.doc.ID, Patch: jsonText})
+			// A write's patch is merged into the stored document, which keeps every field it does not
+			// name; one that removes fields replaces the document instead, or they would stay.
+			res.Operations = append(res.Operations, document.WriteOp{DocID: ed.doc.ID, Patch: jsonText, Replace: len(upd.Removes) > 0})
 			after = newEvalDoc(document.Document{ID: ed.doc.ID, JSON: jsonText})
 		}
 		if len(upd.Returning) > 0 {
@@ -287,6 +303,27 @@ func assignPath(jsonText, path string, value Cell) (string, error) {
 		return "", err
 	}
 	return kdbjson.Set(jsonText, compiled, jv)
+}
+
+// removePath takes the field at a dotted path out of a document. A path that is not there, or that
+// runs through a value other than an object, leaves the document as it is (MongoDB's $unset).
+func removePath(jsonText, path string) (string, error) {
+	compiled, err := kdbjson.CompilePath("$." + path)
+	if err != nil {
+		return "", err
+	}
+	if compiled.HasWildcards() {
+		return "", NewPlanningError("REMOVE takes a field path, not a wildcard: "+path, "")
+	}
+	out, err := kdbjson.Delete(jsonText, compiled)
+	if err != nil {
+		var pathErr *kdberr.JsonPathError
+		if errors.As(err, &pathErr) {
+			return jsonText, nil
+		}
+		return "", err
+	}
+	return out, nil
 }
 
 func validateJSON(id codec.UUID, jsonText string, sch schema.KdbSchema) error {
