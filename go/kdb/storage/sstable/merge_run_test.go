@@ -299,12 +299,14 @@ func (s *renameCrashShim) DeleteSegment(name string) error {
 // next open. That is safe - they hold the inputs' own bytes - and the next merge takes them in.
 func TestCrashDuringARunsRenamesIsHarmless(t *testing.T) {
 	smallMergeTables(t, 100, 1<<40)
-	shim := &renameCrashShim{InMemoryPlatformIO: testShim(t), crashAt: 3}
+	shim := &renameCrashShim{InMemoryPlatformIO: testShim(t)}
 	ns := "app/docs"
 	store := NewLsmBlobStore(shim, ns, NewBlockCache(1<<20))
 	for i := 0; i < DefaultCompactionTrigger; i++ {
 		store.AddTable(bigTable(t, shim, ns, 120, 100, int64(i), nil))
 	}
+	// Armed after the setup, whose flushes rename too.
+	shim.renames, shim.crashAt = 0, 3
 	func() {
 		defer func() {
 			if recover() == nil {

@@ -1,11 +1,14 @@
 package syncnode
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -32,22 +35,57 @@ func freeAddrs(t *testing.T, n int) []string {
 	return out
 }
 
-// meshNodes starts n nodes listening on addrs, node i dialing the peers peersOf(i) names.
-func meshNodes(t *testing.T, addrs []string, peersOf func(i int) []replication.PeerConfig, debounce time.Duration) []testNode {
+// meshNodes starts n nodes on loopback, node i dialing the peers peersOf(i, addrs) names. The
+// ports are reserved and released before the nodes bind them, so another process can take one in
+// between (seen on CI as "bind: address already in use"); then the whole mesh is rebuilt on fresh
+// ports, since every node's peer list names the others' addresses.
+func meshNodes(t *testing.T, n int, peersOf func(i int, addrs []string) []replication.PeerConfig, debounce time.Duration) ([]testNode, []string) {
+	t.Helper()
+	const attempts = 5
+	for attempt := 1; ; attempt++ {
+		addrs := freeAddrs(t, n)
+		nodes, err := startMesh(t, addrs, peersOf, debounce)
+		if err == nil {
+			return nodes, addrs
+		}
+		if attempt == attempts || !addrInUse(err) {
+			t.Fatal(err)
+		}
+		t.Logf("attempt %d: %v; retrying on fresh ports", attempt, err)
+	}
+}
+
+// addrInUse: the bind lost its port. Windows reports WSAEADDRINUSE, which errors.Is does not
+// match to syscall.EADDRINUSE, hence the message check too.
+func addrInUse(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE) ||
+		strings.Contains(err.Error(), "address already in use") ||
+		strings.Contains(err.Error(), "Only one usage of each socket address")
+}
+
+func startMesh(t *testing.T, addrs []string, peersOf func(i int, addrs []string) []replication.PeerConfig, debounce time.Duration) ([]testNode, error) {
 	t.Helper()
 	nodes := make([]testNode, len(addrs))
+	closeAll := func() {
+		for _, nd := range nodes {
+			if nd.node != nil {
+				nd.node.Close()
+			}
+		}
+	}
 	for i := range nodes {
-		nodes[i] = newTestNode(t, meshNS, Config{Peers: peersOf(i), Debounce: debounce})
+		nodes[i] = newTestNode(t, meshNS, Config{Peers: peersOf(i, addrs), Debounce: debounce})
 		if _, err := nodes[i].node.Listen("tcp://" + addrs[i] + "?bind=true"); err != nil {
+			closeAll()
+			return nil, err
+		}
+	}
+	for _, nd := range nodes {
+		if err := nd.node.Start(); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, n := range nodes {
-		if err := n.node.Start(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return nodes
+	return nodes, nil
 }
 
 func (n testNode) head(t *testing.T) codec.Hash {
@@ -99,8 +137,7 @@ func sameHeads(t *testing.T, nodes []testNode) ([]codec.Hash, bool) {
 // have this shape.
 func TestReplicatorRingSettlesOnOneHead(t *testing.T) {
 	const n = 4
-	addrs := freeAddrs(t, n)
-	nodes := meshNodes(t, addrs, func(i int) []replication.PeerConfig {
+	nodes, _ := meshNodes(t, n, func(i int, addrs []string) []replication.PeerConfig {
 		return []replication.PeerConfig{{
 			Name: "next", Addr: "tcp://" + addrs[(i+1)%n], Namespaces: []string{meshNS},
 			Mode: peersync.SyncPull, Interval: time.Hour, CreateLocal: true,
@@ -167,8 +204,7 @@ func TestFullMeshSettlesAfterConcurrentWrites(t *testing.T) {
 		t.Skip("soak")
 	}
 	const n = 5
-	addrs := freeAddrs(t, n)
-	nodes := meshNodes(t, addrs, func(i int) []replication.PeerConfig {
+	nodes, _ := meshNodes(t, n, func(i int, addrs []string) []replication.PeerConfig {
 		var peers []replication.PeerConfig
 		for j := 0; j < n; j++ {
 			if j != i {

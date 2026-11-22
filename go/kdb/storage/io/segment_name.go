@@ -102,6 +102,15 @@ func (segmentNameBuilder) SSTablePartialPrefix(namespaceID string) string {
 	return fmt.Sprintf("ns/%s/%s-partial/", namespaceID, SegmentKindSSTable.String())
 }
 
+// SSTableUnfinished is where a merge moves a table it found under sstable/ that never got its
+// footer - the trace of a writer that died between its last block and its footer (see
+// sstable.unfinishedTable). Like SSTablePartial it sits beside sstable/ so nothing registers it;
+// unlike a partial table it is kept, not deleted, so the bytes stay for anyone who wants them.
+// rel is the table's name below sstable/ ("L4/<id>").
+func (segmentNameBuilder) SSTableUnfinished(namespaceID string, rel string) string {
+	return fmt.Sprintf("ns/%s/%s-unfinished/%s", namespaceID, SegmentKindSSTable.String(), rel)
+}
+
 func (segmentNameBuilder) NamespacePrefix(namespaceID string) string {
 	return "ns/" + namespaceID + "/"
 }
