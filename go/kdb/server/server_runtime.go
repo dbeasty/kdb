@@ -677,31 +677,37 @@ func (s *KdbServerRuntime) Commit(namespaceID string, tx document.Transaction, s
 // matching component 40 spec §3/§5's Upsert contract: no BaseVersion, never conflicts. A new
 // document is stored exactly as supplied; an existing one is updated by a shallow root-level
 // merge of jsonBody onto the stored body (document.Document.Merge), so a key jsonBody omits
-// keeps its stored value. Always anchors on the current head internally,
-// since callers of Upsert by definition don't have (and don't want) one.
+// keeps its stored value.
+//
+// The merge reads the document at the head the write lands on, resolved at the front of the
+// write gate where nothing else can move it - the way Cassandra applies a mutation to the
+// partition as it is at that moment (AtomicBTreePartition) rather than to a snapshot taken
+// earlier. Resolving the head before queueing, as this once did, merged a writer that had queued
+// behind another onto the version before that one, and wrote back a body without the fields the
+// writer ahead had just set; LAST_WRITE detects no conflicts, so nothing reported the loss. It is
+// also the cheaper read: the live tree is always resident, so there is no base tree to pin or,
+// under load, to page back in.
 func (s *KdbServerRuntime) Upsert(namespaceID string, docID codec.UUID, jsonBody string, principal auth.Principal) (document.Commit, error) {
-	head, err := s.Runtime.DAG.Head()
-	if err != nil {
-		return document.Commit{}, err
-	}
 	txID, err := codec.RandomUUID()
 	if err != nil {
 		return document.Commit{}, err
 	}
-	// Pinned here rather than left to runTransaction, and the difference is the whole fix.
-	// Between this Head() and the front of the write gate every other writer commits, each
-	// publishing a newer tree; with the history cache sized in whole trees that is more than
-	// enough to push this one out before runTransaction is even entered. Pinning at the instant
-	// the base is resolved - when it is still the live tree and certain to be resident - is the
-	// only placement that closes that window. See ServerEngine.PinTree.
-	defer s.pinBaseTree(head)()
-	tx := document.Transaction{
-		ID:          txID,
-		BaseVersion: head,
-		Operations:  []document.Op{document.WriteOp{DocID: docID, Patch: jsonBody}},
-		Timestamp:   codec.TimestampNow(),
-	}
-	return s.commitWith(s.UpsertEngine, tx, principal)
+	tx := s.authored(document.Transaction{
+		ID:         txID,
+		Operations: []document.Op{document.WriteOp{DocID: docID, Patch: jsonBody}},
+		Timestamp:  codec.TimestampNow(),
+	})
+	return s.clientWrite(tx, func() (document.Commit, error) {
+		return s.runTransaction(tx, principal, txOptions{atHead: true}, func() (transactionResult, error) {
+			live := tx
+			head, err := s.dag.Head()
+			if err != nil {
+				return nil, err
+			}
+			live.BaseVersion = head
+			return s.UpsertEngine.Commit(live, s.dag, s.Runtime.Storage, s.Schema(), nil, s.clientMessage(live))
+		})
+	})
 }
 
 // pinBaseTree keeps the document tree of commit base resolvable without a rebuild until the
@@ -816,6 +822,9 @@ type txOptions struct {
 	// inside this package, never from a principal a client presented. The commit message travels
 	// with the engine call the caller builds, not here.
 	system bool
+	// atHead marks a transaction that takes its base version at the front of the write gate
+	// (Upsert): there is no earlier base for the queue wait to pin.
+	atHead bool
 }
 
 // runTransaction holds every cross-cutting concern Commit/Upsert/Replay share (draining,
@@ -838,17 +847,22 @@ func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal aut
 	// writers - and Commit hard-fails with BaseNotFoundError if it has been reclaimed by then.
 	// Nothing else roots it: a base version is not a branch head. (Replay needs no equivalent -
 	// it ignores tx.BaseVersion and targets the live head, which is a branch head already.)
-	defer s.dag.Pin(tx.BaseVersion)()
+	if !opts.atHead {
+		defer s.dag.Pin(tx.BaseVersion)()
+	}
 	// The base version's *tree* has to survive the same window, and for a sharper reason than
 	// the commit does. Keeping the commit only keeps Commit from hard-failing; keeping the tree
 	// is what stops the schema phase rebuilding it, once per operation, on the commit path.
 	//
 	// Best-effort here on purpose: a client-supplied BaseVersion can name a tree that was
 	// evicted long before this call, and no pin can retroactively make it resident. Callers
-	// that resolve their own base - Upsert, which anchors on head - pin it at that moment
-	// instead, which is the only point at which the tree is certain to still be there. This one
-	// then nests harmlessly on top; tree pins are counted.
-	defer s.pinBaseTree(tx.BaseVersion)()
+	// that resolve their own base from head before queueing (the system writes in meta.go and
+	// expiry.go) pin it at that moment instead, which is the only point at which the tree is
+	// certain to still be there. This one then nests harmlessly on top; tree pins are counted.
+	// Upsert has no such base: it reads the live head at the gate front (opts.atHead).
+	if !opts.atHead {
+		defer s.pinBaseTree(tx.BaseVersion)()
+	}
 	timeout := s.WriteTimeout
 	if timeout <= 0 {
 		timeout = DefaultWriteTimeout
