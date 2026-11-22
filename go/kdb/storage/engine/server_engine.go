@@ -550,6 +550,17 @@ func (e *ServerEngine) GetDocument(namespaceID string, docID codec.UUID, atCommi
 	return &cp, nil
 }
 
+// DocumentHash is storage.DocumentHasher: the version of docID that tree treeHash holds, read off
+// the trie without touching docsByHash, so it is never a cold load.
+func (e *ServerEngine) DocumentHash(namespaceID string, docID codec.UUID, treeHash codec.Hash) (codec.Hash, bool, bool) {
+	tree, ok, err := e.treeAt(treeHash)
+	if err != nil || !ok {
+		return codec.Hash{}, false, false
+	}
+	h, found := tree.HashFor(docID)
+	return h, found, true
+}
+
 // loadCold re-reads a version docsByHash no longer holds, and re-admits it
 // so a run of reads over the same history pays for it once. A nil loader
 // or a version the loader cannot find reports "not found" rather than an

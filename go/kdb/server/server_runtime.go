@@ -684,9 +684,14 @@ func (s *KdbServerRuntime) Commit(namespaceID string, tx document.Transaction, s
 // partition as it is at that moment (AtomicBTreePartition) rather than to a snapshot taken
 // earlier. Resolving the head before queueing, as this once did, merged a writer that had queued
 // behind another onto the version before that one, and wrote back a body without the fields the
-// writer ahead had just set; LAST_WRITE detects no conflicts, so nothing reported the loss. It is
-// also the cheaper read: the live tree is always resident, so there is no base tree to pin or,
-// under load, to page back in.
+// writer ahead had just set; LAST_WRITE detects no conflicts, so nothing reported the loss.
+//
+// The merge itself is worked out before the gate, also as AtomicBTreePartition does it: build the
+// update off the lock, then install it only if what it was built from is still current (there a
+// compare-and-swap of the partition's root, here a comparison of the document's content hash at
+// the gate front), else redo it under the lock. Reading the stored body, parsing both sides,
+// re-encoding and validating were over half of what each write held the gate for; at the front
+// only a hash lookup in the live tree remains when nothing else wrote the document meanwhile.
 func (s *KdbServerRuntime) Upsert(namespaceID string, docID codec.UUID, jsonBody string, principal auth.Principal) (document.Commit, error) {
 	txID, err := codec.RandomUUID()
 	if err != nil {
@@ -697,17 +702,80 @@ func (s *KdbServerRuntime) Upsert(namespaceID string, docID codec.UUID, jsonBody
 		Operations: []document.Op{document.WriteOp{DocID: docID, Patch: jsonBody}},
 		Timestamp:  codec.TimestampNow(),
 	})
+	pre, havePre := s.premerge(namespaceID, docID, jsonBody)
 	return s.clientWrite(tx, func() (document.Commit, error) {
 		return s.runTransaction(tx, principal, txOptions{atHead: true}, func() (transactionResult, error) {
 			live := tx
-			head, err := s.dag.Head()
+			head, commit, ok, err := s.Runtime.DAG.HeadCommit()
 			if err != nil {
 				return nil, err
 			}
 			live.BaseVersion = head
+			if havePre && ok && pre.stillCurrent(s, namespaceID, docID, commit.DocumentTreeHash) {
+				live.Operations = []document.Op{document.WriteOp{DocID: docID, Patch: pre.body, Replace: true, Prevalidated: true}}
+			}
 			return s.UpsertEngine.Commit(live, s.dag, s.Runtime.Storage, s.Schema(), nil, s.clientMessage(live))
 		})
 	})
+}
+
+// premergedUpsert is an Upsert's result worked out ahead of the write gate: the whole document it
+// would store, and the version of the document it was merged onto (absent for a new document).
+type premergedUpsert struct {
+	body   string
+	source codec.Hash
+	absent bool
+}
+
+// premerge resolves an Upsert against the live head before the gate. ok is false when the gate
+// should do the work as it always has: no DAG, a body that does not merge (the gate reports the
+// error), or storage that cannot say which version a tree holds. The schema is still checked at
+// the gate, against the schema as it is then; only the JSON-object check is not repeated.
+func (s *KdbServerRuntime) premerge(namespaceID string, docID codec.UUID, patch string) (premergedUpsert, bool) {
+	hasher, isHasher := s.Runtime.Storage.(storage.DocumentHasher)
+	if s.dag == nil || !isHasher {
+		return premergedUpsert{}, false
+	}
+	_, commit, ok, err := s.Runtime.DAG.HeadCommit()
+	if err != nil || !ok {
+		return premergedUpsert{}, false
+	}
+	tree := commit.DocumentTreeHash
+	source, found, resolved := hasher.DocumentHash(namespaceID, docID, tree)
+	if !resolved {
+		return premergedUpsert{}, false
+	}
+	if !found {
+		if _, err := document.FromJSONWithID(docID, patch); err != nil {
+			return premergedUpsert{}, false
+		}
+		return premergedUpsert{body: patch, absent: true}, true
+	}
+	stored, err := s.Runtime.Storage.GetDocument(namespaceID, docID, tree)
+	if err != nil || stored == nil {
+		return premergedUpsert{}, false
+	}
+	merged, err := stored.Merge(patch)
+	if err != nil {
+		return premergedUpsert{}, false
+	}
+	return premergedUpsert{body: merged.JSON, source: source}, true
+}
+
+// stillCurrent reports whether the document the merge was built from is still the one tree holds.
+func (p premergedUpsert) stillCurrent(s *KdbServerRuntime, namespaceID string, docID codec.UUID, tree codec.Hash) bool {
+	hasher, ok := s.Runtime.Storage.(storage.DocumentHasher)
+	if !ok {
+		return false
+	}
+	h, found, resolved := hasher.DocumentHash(namespaceID, docID, tree)
+	if !resolved {
+		return false
+	}
+	if p.absent {
+		return !found
+	}
+	return found && h == p.source
 }
 
 // pinBaseTree keeps the document tree of commit base resolvable without a rebuild until the
