@@ -29,6 +29,21 @@ func commitDocs(t *testing.T, e *ServerEngine, ids []codec.UUID, rev int) docume
 	return tree
 }
 
+// settledHeapNow is the live heap once pending cleanups have run: it collects until the heap
+// stops shrinking, since a cleanup that frees a slab runs after the GC that found it unreachable.
+func settledHeapNow() int64 {
+	h := heapNow()
+	for i := 0; i < 20; i++ {
+		time.Sleep(5 * time.Millisecond)
+		next := heapNow()
+		if next >= h {
+			return next
+		}
+		h = next
+	}
+	return h
+}
+
 // Trees published commit by commit are charged what they add - their changed paths - not a full
 // copy each. Charged as copies, every tree of a 20,000-document namespace "cost" 3.5 MB, so a
 // 1 MiB history budget held exactly one and every read at an older commit rebuilt its tree; in
@@ -60,11 +75,14 @@ func TestHistoryTreesChargedByTheirDelta(t *testing.T) {
 	}
 	// The charge is honest: what the held trees retain beyond the live tree is about what they
 	// were charged. Measured by dropping them all and seeing what the heap gives back.
+	// Settled on both sides: cleanups (slab frees) from earlier tests run asynchronously to the
+	// GC, and landing after "before" they were counted as freed here - 222 KB against 68 KB
+	// charged on a Windows runner, where this test alone frees about 21 KB.
 	charged := e.treesByHash.ResidentBytes()
-	before := heapNow()
+	before := settledHeapNow()
 	e.treesByHash.SetBudget(1) // keeps one: the live tree's own entry
 	history = nil
-	freed := before - heapNow()
+	freed := before - settledHeapNow()
 	t.Logf("%d trees held, charged %.0f KB, freed %.0f KB when evicted", held, float64(charged)/1e3, float64(freed)/1e3)
 	if freed > 3*charged {
 		t.Fatalf("trees charged %d bytes held %d: the delta estimate undercounts by more than 3x", charged, freed)
