@@ -588,6 +588,7 @@ func withCompaction(res TruncationResult, eng *engine.ServerEngine, namespaceID 
 		log.Printf("kdb: namespace %s: could not compact the blob store (%v) - it keeps its current tables", namespaceID, err)
 		return res
 	}
+	logSetAside(namespaceID, c)
 	if c.Postponed != 0 {
 		log.Printf("kdb: namespace %s: left a merge of %s of its %d sstables to maintenance or the next open, over the %d-byte close limit",
 			namespaceID, postponedBytes(c.Postponed), eng.BlobTableCount(), limit)

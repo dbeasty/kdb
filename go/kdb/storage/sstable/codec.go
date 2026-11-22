@@ -272,6 +272,10 @@ type DefaultWriter struct {
 	// seq names the table (see tiering.go): its store's (LsmBlobStore.NewWriter), or, for a
 	// writer made without one, a sequence of its own that lists the namespace at Finish.
 	seq *Sequence
+	// store is the store that made this writer, if one did: Finish tells it which partial name
+	// it is writing, so that store's merge does not delete it as a dead merge's (see
+	// LsmBlobStore.removePartialTables).
+	store *LsmBlobStore
 }
 
 type kv struct {
@@ -386,18 +390,29 @@ func (w *DefaultWriter) Finish() (Handle, error) {
 		return Handle{}, err
 	}
 	segmentName := io.SegmentNameBuilder.SSTable(w.namespaceID, w.level, fileID)
-	b := newTableBuilder(w.io, segmentName, len(w.entries))
-	for _, e := range w.entries {
-		if e.deleted {
-			b.delete(e.key)
-			continue
-		}
-		if err := b.put(e.key, e.value); err != nil {
-			return Handle{}, err
+	// Written under a partial name and renamed once the footer is down, as a merge's tables are
+	// (runWriter). The blocks and the footer are separate appends, so a table written under its
+	// own name by a process that died between them was left under sstable/ - where every open
+	// registers it - as a run of blocks with no footer, which no merge could read again (zolik's
+	// L4 table, written by v0.7.x). A shim that cannot rename still writes the name directly.
+	writing := segmentName
+	renamer, _ := w.io.(storage.SegmentRenamer)
+	if renamer != nil {
+		writing = io.SegmentNameBuilder.SSTablePartial(w.namespaceID, fileID)
+		if w.store != nil {
+			w.store.startWriting(writing)
+			defer w.store.doneWriting(writing)
 		}
 	}
-	tableSize, fileHash, err := b.finish()
+	b := newTableBuilder(w.io, writing, len(w.entries))
+	tableSize, fileHash, err := w.build(b)
+	if err == nil && writing != segmentName {
+		err = renamer.RenameSegment(writing, segmentName)
+	}
 	if err != nil {
+		if writing != segmentName {
+			_ = w.io.DeleteSegment(writing)
+		}
 		return Handle{}, err
 	}
 	if err := w.io.SealSegment(segmentName); err != nil {
@@ -405,6 +420,20 @@ func (w *DefaultWriter) Finish() (Handle, error) {
 	}
 	writeSidecar(w.io, segmentName, b.index, tableSize, fileHash)
 	return Handle{FileHash: fileHash, Level: w.level, SegmentName: segmentName}, nil
+}
+
+// build writes every entry and the footer through b.
+func (w *DefaultWriter) build(b *tableBuilder) (int64, codec.Hash, error) {
+	for _, e := range w.entries {
+		if e.deleted {
+			b.delete(e.key)
+			continue
+		}
+		if err := b.put(e.key, e.value); err != nil {
+			return 0, codec.Hash{}, err
+		}
+	}
+	return b.finish()
 }
 
 // writeSidecar writes a finished, sealed table's sidecar. The sidecar is an optional extra
@@ -604,7 +633,69 @@ func (r *DefaultReader) Index() (map[codec.Hash]BlockHandle, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The trailer's length led here, so the footer must start with the magic and repeat that
+	// length. A table with no footer at all (unfinishedTable) ends in the last 4 bytes of a
+	// block, which can decode to any length that fits; parsing what sits there as an index would
+	// read garbage, or an empty index that drops every key the table holds.
+	if len(footer) != bodyLen || readInt(footer, 0) != footerMagic || readInt(footer, 4) != indexLen {
+		return nil, fmt.Errorf("%w: %s: no footer where its trailer points", ErrCorruptTable, r.handle.SegmentName)
+	}
 	return parseFooter(footer)
+}
+
+// unfinishedTable reports whether segmentName is a table whose writer stopped before its footer:
+// from the start, a run of whole blocks, followed either by nothing or by the beginning of a
+// footer shorter than the footer it declares. That is the one shape a crash between a table's
+// last block and the end of its footer leaves (they are separate appends), and no finished table
+// has it - every finished table ends in a whole footer. Damage anywhere else - a torn block, a
+// block header that is not one, a whole footer with a bad index - is not this, and reports false.
+//
+// Only a table that fails to open is asked (LsmBlobStore.compactContext), so this reads the whole
+// file block by block without minding the cost.
+func unfinishedTable(shim storage.PlatformIOShim, h Handle) (bool, error) {
+	r := NewDefaultReader(shim, h)
+	size, err := r.segmentSize()
+	if err != nil {
+		return false, err
+	}
+	var off int64
+	for off+blockHeaderSize <= size {
+		hdr, err := shim.ReadFromSegment(h.SegmentName, off, blockHeaderSize)
+		if err != nil {
+			return false, err
+		}
+		if len(hdr) != blockHeaderSize {
+			return false, nil
+		}
+		if hdr[0] != blockFormatVersion {
+			break // not a block: a footer, or damage
+		}
+		body := int64(uint32(readInt(hdr, 4)))
+		if hdr[1] > blockCodecZSTD || hdr[2] != 0 || hdr[3] != 0 || off+blockHeaderSize+body > size {
+			return false, nil // a block header that is not one, or a torn last block
+		}
+		off += blockHeaderSize + body
+	}
+	if off == size {
+		return off > 0, nil // blocks and no footer
+	}
+	// Something follows the blocks. Unfinished only if it is a footer cut short.
+	rest := size - off
+	if rest < 8 {
+		head, err := shim.ReadFromSegment(h.SegmentName, off, int(rest))
+		if err != nil || int64(len(head)) != rest {
+			return false, err
+		}
+		var magic [4]byte
+		writeInt(magic[:], 0, footerMagic)
+		return string(head) == string(magic[:len(head)]), nil
+	}
+	head, err := shim.ReadFromSegment(h.SegmentName, off, 8)
+	if err != nil || len(head) != 8 || readInt(head, 0) != footerMagic {
+		return false, err
+	}
+	whole := int64(40 + uint32(readInt(head, 4)) + footerTrailerSize)
+	return rest < whole, nil
 }
 
 // ReadBlockAt decodes the value a BlockHandle from this table's Index

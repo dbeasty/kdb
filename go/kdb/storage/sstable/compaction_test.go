@@ -574,13 +574,16 @@ type crashingShim struct {
 	crashAfter int
 	appends    int
 	crashed    bool
+	// armed starts the count: flushed tables are written under partial names too, and the
+	// setup's must not be the ones that crash.
+	armed bool
 }
 
 func (s *crashingShim) AppendToSegment(name string, b []byte) (int64, error) {
 	if s.crashed {
 		return 0, errors.New("process is dead")
 	}
-	if strings.Contains(name, "sstable-partial/") {
+	if s.armed && strings.Contains(name, "sstable-partial/") {
 		if s.appends++; s.appends > s.crashAfter {
 			s.crashed = true
 			panic("crash")
@@ -610,6 +613,7 @@ func TestCrashMidMergeLeavesNothingDiscoverable(t *testing.T) {
 	for _, h := range store.Tables() {
 		inputs[h.SegmentName] = true
 	}
+	shim.armed = true
 	func() {
 		defer func() {
 			if recover() == nil {

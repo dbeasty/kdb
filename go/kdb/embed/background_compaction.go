@@ -63,6 +63,7 @@ func startBackgroundCompaction(eng *engine.ServerEngine, namespaceID string) *ba
 	go func() {
 		defer close(b.done)
 		c, err := eng.CompactBlobStoreContext(ctx)
+		logSetAside(namespaceID, c)
 		switch {
 		case ctx.Err() != nil:
 			// Closed first. Nothing was written; the next open or maintenance pass merges.
@@ -83,4 +84,12 @@ func (b *backgroundCompaction) stop() {
 	}
 	b.cancel()
 	<-b.done
+}
+
+// logSetAside reports the tables a merge moved aside because they never got their footer
+// (sstable.CompactionResult.SetAside): the trace of a writer that died mid-table.
+func logSetAside(namespaceID string, c sstable.CompactionResult) {
+	for _, name := range c.SetAside {
+		log.Printf("kdb: namespace %s: set aside sstable %s - its writer stopped before the footer, so it held nothing readable; the merge went on without it", namespaceID, name)
+	}
 }

@@ -2,6 +2,7 @@ package sstable
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strconv"
 	"strings"
@@ -90,6 +91,10 @@ type LsmBlobStore struct {
 	// seq names the tables this store's writers finish (NewWriter).
 	seq *Sequence
 
+	// writing names the partial tables this store's flushes are writing right now, which a merge
+	// must not take for a dead merge's leftovers (removePartialTables). Guarded by mu.
+	writing map[string]struct{}
+
 	// afterSearchOrder, when set, runs between a lookup taking its table list and reading any
 	// table - the window a concurrent compaction used to delete an input in. Tests only.
 	afterSearchOrder func()
@@ -100,6 +105,7 @@ type LsmBlobStore struct {
 func (s *LsmBlobStore) NewWriter(level int) *DefaultWriter {
 	w := NewDefaultWriter(s.io, s.namespaceID, level)
 	w.seq = s.seq
+	w.store = s
 	return w
 }
 
@@ -107,6 +113,7 @@ func (s *LsmBlobStore) NewWriter(level int) *DefaultWriter {
 func (s *LsmBlobStore) NewWriterUnique(level, n int) *DefaultWriter {
 	w := NewDefaultWriterUnique(s.io, s.namespaceID, level, n)
 	w.seq = s.seq
+	w.store = s
 	return w
 }
 
@@ -361,6 +368,10 @@ type CompactionResult struct {
 	// large to merge then: the bytes they hold, or -1 when the shim could not say. Zero for a
 	// merge that ran or had nothing to do.
 	Postponed int64
+	// SetAside names the tables this merge moved out of the store because they never got their
+	// footer (a writer that died mid-table, see unfinishedTable), at their new names. They held
+	// nothing any lookup could read.
+	SetAside []string
 }
 
 // Compact merges every registered table into one run (see DefaultCompactionTrigger), when they
@@ -435,6 +446,69 @@ func (s *LsmBlobStore) compactContext(ctx context.Context, trigger int, keep fun
 	}
 	s.compactMu.Lock()
 	defer s.compactMu.Unlock()
+	var setAside []string
+	for {
+		result, err := s.compactLocked(ctx, trigger, keep, maxBytes, all)
+		result.SetAside = setAside
+		var unreadable *tableReadError
+		if err == nil || !errors.As(err, &unreadable) || !errors.Is(err, ErrCorruptTable) {
+			return result, err
+		}
+		// One input cannot be read. A merge never completes around a table it cannot read - that
+		// would drop its keys - except a table that provably never got its footer: nothing could
+		// ever read its keys, lookups already pass it by, and its writer never returned, so no
+		// state was built on it (a merge's inputs were still in place; a flush's writes are still
+		// in the delta log). Set it aside and merge the rest.
+		moved, aerr := s.setAsideUnfinished(unreadable.table)
+		if aerr != nil || moved == "" {
+			return result, err
+		}
+		setAside = append(setAside, moved)
+	}
+}
+
+// setAsideUnfinished moves h out of the store if it is an unfinished table (unfinishedTable):
+// unregistered here, and renamed under SSTableUnfinished so no later open registers it either.
+// Returns where it went, or "" when h is not unfinished or cannot be moved. Callers hold compactMu.
+func (s *LsmBlobStore) setAsideUnfinished(h Handle) (string, error) {
+	renamer, ok := s.io.(storage.SegmentRenamer)
+	if !ok {
+		return "", nil
+	}
+	unfinished, err := unfinishedTable(s.io, h)
+	if err != nil || !unfinished {
+		return "", err
+	}
+	prefix := storio.SegmentNameBuilder.NamespacePrefix(s.namespaceID) + "sstable/"
+	if !strings.HasPrefix(h.SegmentName, prefix) {
+		return "", nil
+	}
+	to := storio.SegmentNameBuilder.SSTableUnfinished(s.namespaceID, h.SegmentName[len(prefix):])
+	// Renamed while still registered, so a failure leaves the store as it was. A lookup that
+	// reads it by its old name in between gets an error, which it treats as "cannot answer" - as
+	// it already did, the table having no index.
+	if err := renamer.RenameSegment(h.SegmentName, to); err != nil {
+		return "", err
+	}
+	s.mu.Lock()
+	next := make([]Handle, 0, len(s.tables))
+	for _, t := range s.tables {
+		if t.SegmentName != h.SegmentName {
+			next = append(next, t)
+		}
+	}
+	s.setTablesLocked(next)
+	s.indexes.remove(h.SegmentName)
+	slot := s.takeSidecarLocked(h.SegmentName)
+	s.mu.Unlock()
+	closeSidecars([]*sidecarSlot{slot})
+	s.cache.RemoveSegment(h.SegmentName)
+	s.removeSidecarFile(h.SegmentName)
+	return to, nil
+}
+
+// compactLocked is one merge attempt. Callers hold compactMu.
+func (s *LsmBlobStore) compactLocked(ctx context.Context, trigger int, keep func(codec.Hash) bool, maxBytes int64, all bool) (CompactionResult, error) {
 	// The inputs are pinned like any reader's tables, so the release below is what deletes them -
 	// immediately when no lookup holds one, otherwise when the last one lets go.
 	pinned := s.pin()
@@ -601,10 +675,36 @@ func (s *LsmBlobStore) removePartialTables() {
 	}
 	prefix := storio.SegmentNameBuilder.SSTablePartialPrefix(s.namespaceID)
 	for _, name := range names {
-		if strings.HasPrefix(name, prefix) {
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		// A flush's partial table is live while the flush runs, and a flush does not take
+		// compactMu. Checked per name, under mu, so a flush that starts after the listing
+		// (writing a name the listing does not hold) and one that started before it are both
+		// left alone.
+		s.mu.Lock()
+		_, live := s.writing[name]
+		s.mu.Unlock()
+		if !live {
 			_ = s.io.DeleteSegment(name)
 		}
 	}
+}
+
+// startWriting and doneWriting bracket a flush's partial table (DefaultWriter.Finish).
+func (s *LsmBlobStore) startWriting(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.writing == nil {
+		s.writing = make(map[string]struct{})
+	}
+	s.writing[name] = struct{}{}
+}
+
+func (s *LsmBlobStore) doneWriting(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.writing, name)
 }
 
 // TableBytes reports how many bytes the registered tables occupy on disk, and false when the

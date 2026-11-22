@@ -352,12 +352,24 @@ func openMergeSources(io storage.PlatformIOShim, inputs []Handle, sidecarOf func
 			// compaction, and must not silently drop the keys it held
 			// either - so the compaction is abandoned rather than
 			// completed with a hole in it.
-			return nil, fmt.Errorf("sstable: compaction could not read %s: %w", in.SegmentName, err)
+			return nil, &tableReadError{table: in, err: err}
 		}
 		sources = append(sources, src)
 	}
 	return sources, nil
 }
+
+// tableReadError is a merge input that could not be opened, naming which.
+type tableReadError struct {
+	table Handle
+	err   error
+}
+
+func (e *tableReadError) Error() string {
+	return fmt.Sprintf("sstable: compaction could not read %s: %v", e.table.SegmentName, e.err)
+}
+
+func (e *tableReadError) Unwrap() error { return e.err }
 
 func openMergeSource(io storage.PlatformIOShim, paths storage.LocalPathResolver, in Handle, sidecarOf func(Handle) *sidecar) (mergeSource, error) {
 	if sidecarOf != nil {
