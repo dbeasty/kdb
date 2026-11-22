@@ -45,7 +45,21 @@ type OSByteStore struct {
 	// and the open dominated it: ~45 of 58 seconds for 100k documents. Bounded, and never evicted
 	// while in use: past maxReadHandles a read simply opens its own handle as before.
 	readers map[string]*os.File
+	// unsyncedDirs are directories whose entries changed - a segment file created in one, or a
+	// directory created in one - and have not been fsynced since. Fsyncing a new file makes its
+	// data durable but not its name: until the directory holding it is synced too, a power loss
+	// can drop the whole file on ext4/xfs, taking every commit already acknowledged in it. The
+	// next Flush with fsync (any segment's) syncs them, so they cost one directory sync per new
+	// segment, only in the modes that fsync at all.
+	unsyncedDirs map[string]struct{}
+	// dirMu serializes creating a segment's directories with recording them in unsyncedDirs, so
+	// a second segment created in a directory the first is still making cannot be flushed - and
+	// acknowledged - before that directory's own entry is pending a sync.
+	dirMu sync.Mutex
 }
+
+// syncDir is fsx.SyncDir, a variable so tests can see which directories are synced.
+var syncDir = fsx.SyncDir
 
 const maxReadHandles = 512
 
@@ -64,6 +78,7 @@ func NewOSByteStore(config PlatformIOConfig) (*OSByteStore, error) {
 		preallocateBytes: config.PreallocateBytes,
 		handles:          make(map[string]*openSegment),
 		readers:          make(map[string]*os.File),
+		unsyncedDirs:     make(map[string]struct{}),
 	}, nil
 }
 
@@ -109,7 +124,10 @@ func (s *OSByteStore) openFor(segmentName string) (*openSegment, error) {
 	}
 
 	p := s.pathFor(segmentName)
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	s.dirMu.Lock()
+	defer s.dirMu.Unlock()
+	created, err := s.mkdirAllRecorded(filepath.Dir(p))
+	if err != nil {
 		return nil, err
 	}
 	// Create and reopen are distinguished with O_EXCL rather than a prior Stat,
@@ -133,6 +151,7 @@ func (s *OSByteStore) openFor(segmentName string) (*openSegment, error) {
 		}
 		// Created: no data in it yet, whatever its physical size.
 		logicalSize = 0
+		created = append(created, filepath.Dir(p))
 	case os.IsExist(err):
 		f, err = fsx.OpenFile(p, os.O_WRONLY, 0o644)
 		if err != nil {
@@ -162,6 +181,9 @@ func (s *OSByteStore) openFor(segmentName string) (*openSegment, error) {
 	}
 
 	s.mu.Lock()
+	for _, d := range created {
+		s.unsyncedDirs[d] = struct{}{}
+	}
 	if existing, raced := s.handles[segmentName]; raced {
 		s.mu.Unlock()
 		_ = f.Close()
@@ -171,6 +193,58 @@ func (s *OSByteStore) openFor(segmentName string) (*openSegment, error) {
 	s.handles[segmentName] = seg
 	s.mu.Unlock()
 	return seg, nil
+}
+
+// mkdirAllRecorded is os.MkdirAll(dir), returning the directories whose entries it changed: the
+// parent of each directory it had to create.
+func (s *OSByteStore) mkdirAllRecorded(dir string) ([]string, error) {
+	var missing []string
+	for d := dir; ; {
+		if _, err := os.Stat(d); err == nil || !os.IsNotExist(err) {
+			break
+		}
+		missing = append(missing, d)
+		parent := filepath.Dir(d)
+		if parent == d {
+			break
+		}
+		d = parent
+	}
+	if len(missing) == 0 {
+		return nil, nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	changed := make([]string, 0, len(missing))
+	for _, d := range missing {
+		changed = append(changed, filepath.Dir(d))
+	}
+	return changed, nil
+}
+
+// syncPendingDirs fsyncs every directory in unsyncedDirs, forgetting each once it is synced. A
+// directory removed since (its namespace deleted) has nothing left to make durable.
+func (s *OSByteStore) syncPendingDirs() error {
+	s.mu.Lock()
+	if len(s.unsyncedDirs) == 0 {
+		s.mu.Unlock()
+		return nil
+	}
+	dirs := make([]string, 0, len(s.unsyncedDirs))
+	for d := range s.unsyncedDirs {
+		dirs = append(dirs, d)
+	}
+	s.mu.Unlock()
+	for _, d := range dirs {
+		if err := syncDir(d); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		s.mu.Lock()
+		delete(s.unsyncedDirs, d)
+		s.mu.Unlock()
+	}
+	return nil
 }
 
 func (s *OSByteStore) Append(segmentName string, bytes []byte) (int64, error) {
@@ -399,6 +473,9 @@ func (s *OSByteStore) Flush(segmentName string, fsync bool) error {
 	s.mu.Unlock()
 	if ok {
 		err := syncFile(seg.file, s.syncMode)
+		if err == nil {
+			return s.syncPendingDirs()
+		}
 		if !errors.Is(err, os.ErrClosed) {
 			return err
 		}
@@ -424,7 +501,10 @@ func (s *OSByteStore) Flush(segmentName string, fsync bool) error {
 		return err
 	}
 	defer f.Close()
-	return syncFile(f, s.syncMode)
+	if err := syncFile(f, s.syncMode); err != nil {
+		return err
+	}
+	return s.syncPendingDirs()
 }
 
 // Close releases all cached file handles. Safe to call multiple times.
@@ -533,7 +613,17 @@ func (s *OSByteStore) Rename(from, to string) error {
 		}
 	}
 	dst := s.pathFor(to)
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	s.dirMu.Lock()
+	created, err := s.mkdirAllRecorded(filepath.Dir(dst))
+	if err == nil && len(created) > 0 {
+		s.mu.Lock()
+		for _, d := range created {
+			s.unsyncedDirs[d] = struct{}{}
+		}
+		s.mu.Unlock()
+	}
+	s.dirMu.Unlock()
+	if err != nil {
 		return err
 	}
 	if _, err := os.Stat(dst); err == nil {

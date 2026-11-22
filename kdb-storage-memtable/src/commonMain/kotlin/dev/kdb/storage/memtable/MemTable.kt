@@ -120,7 +120,22 @@ public class MemTableManager(
     // remain visible via pendingFlush until whatever called flush() decides how to recover.
     public suspend fun flush(level: Int = 0): SsTableHandle? =
         mutex.withLock {
-            val snap = active
+            // A generation an earlier flush failed to write is still only in pendingFlush; fold it
+            // under the active table rather than replace it. Replacing it lost it: a retry with
+            // nothing new written found zero entries and returned null, and a flush with new
+            // writes persisted only those - either way its writes left active, pendingFlush and
+            // the blob store alike. (Go's Manager.Flush has the same replace-on-retry gap.)
+            val failed = pendingFlush
+            val snap =
+                if (failed == null) {
+                    active
+                } else {
+                    SortedMemTable().also { merged ->
+                        for (gen in listOf(failed, active)) {
+                            for ((k, v) in gen.snapshotEntries()) if (v != null) merged.put(k, v) else merged.delete(k)
+                        }
+                    }
+                }
             pendingFlush = snap
             active = SortedMemTable()
             val writer = blobStore.newWriter(level)

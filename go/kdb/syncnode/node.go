@@ -127,6 +127,11 @@ func Open(host *embed.Host, set *server.NamespaceSet, primary *server.KdbServerR
 	if set == nil || primary == nil {
 		return nil, errors.New("syncnode: a namespace set and its primary runtime are required")
 	}
+	// Checked before anything starts: refused after, it left the authority-expiry and procedure
+	// goroutines running, the meta runtime open and registered in set, and primary rewired.
+	if cfg.Idle != nil && host == nil {
+		return nil, errors.New("syncnode: idle close needs a host - an in-memory namespace closed is gone")
+	}
 	if cfg.AuthorityExpiryInterval <= 0 {
 		cfg.AuthorityExpiryInterval = 30 * time.Second
 	}
@@ -178,10 +183,6 @@ func Open(host *embed.Host, set *server.NamespaceSet, primary *server.KdbServerR
 	n.authorityProcs = server.StartConflictProcedure(set, primary.NodeID.String(), &server.ConflictProcedure{
 		Interval: cfg.AuthorityExpiryInterval,
 	})
-
-	if cfg.Idle != nil && host == nil {
-		return nil, errors.New("syncnode: idle close needs a host - an in-memory namespace closed is gone")
-	}
 	if host != nil {
 		// Every namespace on disk is served, open or not: a peer's sync opens the one it reaches.
 		if ids, err := embed.ListNamespaces(host.DataRoot()); err == nil {

@@ -77,7 +77,7 @@ func (t *defaultTransport) Connect(uri string) (stream.ConnectionHandle, error) 
 		_ = tc.SetNoDelay(true)
 	}
 	if parsed.Secure {
-		tlsConn, err := tlsClientHandshake(conn, tlsCfg)
+		tlsConn, err := tlsClientHandshake(conn, tlsCfg, timeoutFromMs(t.options.ConnectTimeoutMs))
 		if err != nil {
 			_ = conn.Close()
 			return nil, err
@@ -92,9 +92,15 @@ func (t *defaultTransport) Connect(uri string) (stream.ConnectionHandle, error) 
 // underlying socket before the handshake starts. Explicitly calling HandshakeContext (rather
 // than letting the first Read/Write trigger it lazily) fails fast: a Connect call should report
 // a bad cert/CA immediately, not on the first unrelated read.
-func tlsClientHandshake(conn net.Conn, cfg *tls.Config) (net.Conn, error) {
+//
+// The handshake is bounded by the connect timeout: the dial's own timeout ends once the TCP
+// connection is up, so a peer that accepted and then never answered the ClientHello used to hang
+// Connect forever - and with it client.ConnectWithOptions, whose ctx never reaches this far.
+func tlsClientHandshake(conn net.Conn, cfg *tls.Config, timeout time.Duration) (net.Conn, error) {
 	tlsConn := tls.Client(conn, cfg)
-	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		return nil, fmt.Errorf("tls handshake: %w", err)
 	}
 	return tlsConn, nil

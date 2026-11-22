@@ -25,6 +25,10 @@ const (
 	MaxObjectFetchItems = 1024
 	// DefaultTreeEntryLimit is the subtree size below which TREE_NODES lists entries outright.
 	DefaultTreeEntryLimit = 32
+	// MaxTreeEntryLimit bounds the EntryLimit a TREE_NODES request may name. Unbounded, one
+	// request for the root at a huge limit listed every entry of the tree - once per prefix, up to
+	// MaxTreeNodePrefixes times over.
+	MaxTreeEntryLimit = 1024
 )
 
 // treeAt resolves ns's tree by hash from store: directly when the store can, else by walking it.
@@ -100,6 +104,7 @@ func treeNodesPage(env IngestEnv, m wire.TreeNodesMessage) (wire.TreeNodesResult
 	if limit <= 0 {
 		limit = DefaultTreeEntryLimit
 	}
+	limit = min(limit, MaxTreeEntryLimit)
 	out := wire.TreeNodesResultMessage{Namespace: env.NamespaceID, TreeHex: th.Hex(), Nodes: make([]wire.TreeNodeInfo, len(m.Prefixes))}
 	for i, p := range m.Prefixes {
 		n, err := tree.Node(p, limit)

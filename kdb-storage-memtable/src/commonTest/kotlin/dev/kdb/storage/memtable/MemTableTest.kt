@@ -62,6 +62,34 @@ class MemTableTest {
             assertEquals(value.decodeToString(), got?.decodeToString())
         }
 
+    /**
+     * The generation a failed flush left in pendingFlush must survive the next flush. It did not:
+     * the next flush overwrote pendingFlush with the (new) active table, so a retry with nothing
+     * new written returned "nothing to flush" and the failed generation's writes were gone from
+     * active, pendingFlush and the blob store alike - and a flush with new writes persisted only
+     * those, dropping the earlier ones the same way.
+     */
+    @Test
+    fun flushAfterAFailedFlushKeepsTheFailedGeneration() =
+        runTest {
+            for (writeMoreBeforeRetry in listOf(false, true)) {
+                val shim = SealFailingShim(InMemoryPlatformIoShim())
+                val blobStore = LsmBlobStore(shim, "ns", BlockCache(1024 * 1024))
+                val manager = MemTableManager("ns", shim, blobStore)
+
+                val k1 = randomKey("retry-k1")
+                val k2 = randomKey("retry-k2")
+                manager.put(k1, "one".encodeToByteArray())
+                shim.failNextSeal = true
+                assertFails { manager.flush() }
+                if (writeMoreBeforeRetry) manager.put(k2, "two".encodeToByteArray())
+
+                requireNotNull(manager.flush()) { "the retry must flush the failed generation (writeMore=$writeMoreBeforeRetry)" }
+                assertEquals("one", manager.get(k1)?.decodeToString(), "writeMore=$writeMoreBeforeRetry")
+                if (writeMoreBeforeRetry) assertEquals("two", manager.get(k2)?.decodeToString())
+            }
+        }
+
     @Test
     fun flushSucceedsNormallyAndDataRemainsReadableFromBlobStore() =
         runTest {

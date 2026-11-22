@@ -107,3 +107,25 @@ func TestIdleNamespacesCloseAndReopenOnSync(t *testing.T) {
 		t.Fatal("a restart should not open every namespace")
 	}
 }
+
+// Idle close without a host is refused before Open starts anything: refused after, it left the
+// node's background loops running, its meta namespace open and registered in the caller's set, and
+// the primary rewired - with no Node returned to Close any of it.
+func TestOpenRefusesIdleWithoutAHostBeforeStartingAnything(t *testing.T) {
+	rt, err := embed.OpenMemoryRuntime(embed.CatalogFromNamespace("app"), "app", schema.None())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	primary := server.NewKdbServerRuntime(rt)
+	set := server.NewNamespaceSet(nil)
+	if err := set.Add(primary); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(nil, set, primary, Config{Idle: &IdleConfig{MaxOpen: 1}}); err == nil {
+		t.Fatal("idle close without a host was accepted")
+	}
+	if primary.Namespaces != nil {
+		t.Fatal("a refused Open rewired the primary runtime (and started the node's background loops)")
+	}
+}

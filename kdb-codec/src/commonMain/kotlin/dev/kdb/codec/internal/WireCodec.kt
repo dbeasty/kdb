@@ -348,16 +348,20 @@ object WireCodec {
         }
 
     private fun decodeRecord(c: Cursor, schema: RecordSchema, reg: KdbTypeRegistry): KdbValue {
-        val slab = c.raw(c.leb().toInt())
+        val slab = c.raw(checkByteLength(c, c.leb(), "record"))
         val pos = Pos(0)
         val map = linkedMapOf<Int, KdbValue>()
         while (pos.i < slab.size) {
             val fid = readLeb128U64(slab, pos).toInt()
+            if (pos.i >= slab.size) throw KdbDecodeException("truncated record", pos.mark())
             val tag = slab[pos.i++]
             val kind =
                 PhysicalKind.fromTag(tag) ?: throw KdbDecodeException("unknown record tag", pos.mark())
             val field = schema.fieldsById[fid]
             if (field == null) {
+                // skipTaggedBytes reads the tag itself; step back onto the one just consumed
+                // (Go's decodeRecord passes that tag to skipTagged instead of re-reading).
+                pos.i--
                 skipTaggedBytes(slab, pos, slab.size)
                 continue
             }
@@ -450,9 +454,19 @@ object WireCodec {
         return p + raw
     }
 
-    private fun readLebBytes(c: Cursor): ByteArray {
-        val n = c.leb().toInt()
-        return c.raw(n)
+    private fun readLebBytes(c: Cursor): ByteArray = c.raw(checkByteLength(c, c.leb(), "bytes"))
+
+    /**
+     * A byte length straight off the wire. `toInt()` alone truncates: a varint of 2^32 + 3 read
+     * as 3, so the Kotlin decoder accepted (and misread) input Go's decoder rejects with "length
+     * exceeds remaining input".
+     */
+    private fun checkByteLength(c: Cursor, n: Long, kind: String): Int {
+        val remaining = c.remaining()
+        if (n < 0 || n > Int.MAX_VALUE || (remaining >= 0 && n > remaining)) {
+            throw KdbDecodeException("$kind length exceeds remaining input", c.mark())
+        }
+        return n.toInt()
     }
 
     private fun readLebString(c: Cursor): String {

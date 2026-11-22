@@ -79,8 +79,10 @@ internal object WalCodec {
                 throw WalCorruptionException("bad magic", partitionKey, segmentName, offset.toLong())
             }
             val recordLen = readInt(bytes, offset + 4)
+            // In Long: a damaged length near Int.MAX_VALUE overflowed `offset + 12 + recordLen`
+            // to a negative end that passed this check and then indexed the array below it.
+            if (recordLen < HEADER_LEN || offset.toLong() + 12 + recordLen > bytes.size) break
             val recordEnd = offset + 12 + recordLen
-            if (recordEnd > bytes.size || recordLen < HEADER_LEN) break
             val headerCrc = readInt(bytes, recordEnd - 4)
             if (headerCrc != Crc32.of(bytes, offset, recordEnd - offset - 4)) {
                 if (skipCorrupt) {

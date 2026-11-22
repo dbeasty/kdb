@@ -122,6 +122,9 @@ func (e *defaultEngine) plan(
 		return PreparedCommit{}, ResultSchemaError{Violations: attachViolations}, nil
 	}
 	schemaFrame := runSchemaPhase(tx, store, d.NamespaceID, incomingSchema, baselineDocTreeHash)
+	if schemaFrame.err != nil {
+		return PreparedCommit{}, nil, schemaFrame.err
+	}
 	if len(schemaFrame.violations) > 0 {
 		return PreparedCommit{}, ResultSchemaError{Violations: schemaFrame.violations}, nil
 	}
@@ -135,7 +138,10 @@ func (e *defaultEngine) plan(
 	// insert-if-absent is used.
 	guarded := map[int]struct{}{}
 	if e.preconditions && len(tx.Preconditions) > 0 {
-		preFailures, preViolations := evaluatePreconditions(tx, d.NamespaceID, store, targetDocTreeHash)
+		preFailures, preViolations, err := evaluatePreconditions(tx, d.NamespaceID, store, targetDocTreeHash)
+		if err != nil {
+			return PreparedCommit{}, nil, err
+		}
 		if len(preViolations) > 0 {
 			return PreparedCommit{}, ResultSchemaError{Violations: preViolations}, nil
 		}
@@ -150,7 +156,11 @@ func (e *defaultEngine) plan(
 	case ConflictPolicyAppendOnly, ConflictPolicyLastWrite:
 		conflicts = nil
 	default:
-		conflicts = detectConflicts(tx, d.NamespaceID, store, baseDocTreeHash, targetDocTreeHash, writes, guarded)
+		var err error
+		conflicts, err = detectConflicts(tx, d.NamespaceID, store, baseDocTreeHash, targetDocTreeHash, writes, guarded)
+		if err != nil {
+			return PreparedCommit{}, nil, err
+		}
 		attachConflicts, err := detectAttachmentConflicts(tx, d.NamespaceID, d, store, baseDocTreeHash, targetDocTreeHash, anchorCommit, guarded)
 		if err != nil {
 			return PreparedCommit{}, nil, err

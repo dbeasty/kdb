@@ -127,6 +127,9 @@ func (s *RegistryAuthStore) DeleteUser(id string) error {
 	if existing == nil {
 		return fmt.Errorf("%w: %s", ErrUserNotFound, id)
 	}
+	if err := s.revokeTokensOfLocked(id); err != nil {
+		return err
+	}
 	return s.deleteDoc(s.userDag, UsersNamespace, userDocID(id))
 }
 

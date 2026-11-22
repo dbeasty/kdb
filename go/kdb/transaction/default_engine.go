@@ -192,6 +192,9 @@ func (e *defaultEngine) Validate(
 		return nil, err
 	}
 	out := runSchemaPhase(tx, store, d.NamespaceID, sch, base.DocumentTreeHash)
+	if out.err != nil {
+		return nil, out.err
+	}
 	return out.violations, nil
 }
 
@@ -229,7 +232,7 @@ func detectConflicts(
 	baseTreeHash, targetTreeHash codec.Hash,
 	projectedWrites map[int]document.Document,
 	guarded map[int]struct{},
-) []OperationConflict {
+) ([]OperationConflict, error) {
 	var out []OperationConflict
 	for index, op := range tx.Operations {
 		// An operation with an explicit precondition has already been checked against the tree
@@ -245,8 +248,12 @@ func detectConflicts(
 		}
 		switch o := op.(type) {
 		case document.WriteOp:
-			baseDoc, _ := store.GetDocument(namespaceID, o.DocID, baseTreeHash)
-			existingDoc, _ := store.GetDocument(namespaceID, o.DocID, targetTreeHash)
+			// A failed read is not an absent document: two failed reads compare equal (both
+			// nil) and would wave a concurrent write through under STRICT.
+			baseDoc, existingDoc, err := readBaseAndTarget(store, namespaceID, o.DocID, baseTreeHash, targetTreeHash)
+			if err != nil {
+				return nil, err
+			}
 			if contentHashEqual(baseDoc, existingDoc) {
 				continue
 			}
@@ -268,8 +275,10 @@ func detectConflicts(
 				ExistingDoc: existingDoc, IncomingDoc: &incoming, BaseDoc: baseDoc,
 			})
 		case document.DeleteOp:
-			baseDoc, _ := store.GetDocument(namespaceID, o.DocID, baseTreeHash)
-			existingDoc, _ := store.GetDocument(namespaceID, o.DocID, targetTreeHash)
+			baseDoc, existingDoc, err := readBaseAndTarget(store, namespaceID, o.DocID, baseTreeHash, targetTreeHash)
+			if err != nil {
+				return nil, err
+			}
 			if baseDoc == nil && existingDoc == nil {
 				continue
 			}
@@ -288,7 +297,19 @@ func detectConflicts(
 			})
 		}
 	}
-	return out
+	return out, nil
+}
+
+func readBaseAndTarget(store storage.Adapter, namespaceID string, docID codec.UUID, baseTreeHash, targetTreeHash codec.Hash) (*document.Document, *document.Document, error) {
+	baseDoc, err := store.GetDocument(namespaceID, docID, baseTreeHash)
+	if err != nil {
+		return nil, nil, err
+	}
+	existingDoc, err := store.GetDocument(namespaceID, docID, targetTreeHash)
+	if err != nil {
+		return nil, nil, err
+	}
+	return baseDoc, existingDoc, nil
 }
 
 func preflightFileWrites(tx document.Transaction, store storage.Adapter) []OperationViolation {
@@ -317,6 +338,10 @@ type schemaOutcome struct {
 	rollingSchema   schema.KdbSchema
 	violations      []OperationViolation
 	writesByOpIndex map[int]document.Document
+	// err is a storage failure reading a document the transaction writes. It aborts the
+	// transaction: treating the failed read as "absent" would stage the merge patch as the whole
+	// document and silently drop every field the patch does not name.
+	err error
 }
 
 func runSchemaPhase(
@@ -356,7 +381,11 @@ func runSchemaPhase(
 		case document.WriteOp:
 			baseDoc, touched := pending[o.DocID]
 			if !touched {
-				baseDoc, _ = store.GetDocument(namespaceID, o.DocID, baselineTreeHash)
+				var readErr error
+				baseDoc, readErr = store.GetDocument(namespaceID, o.DocID, baselineTreeHash)
+				if readErr != nil {
+					return schemaOutcome{rollingSchema: rolling, err: readErr}
+				}
 			}
 			var candidate document.Document
 			var err error

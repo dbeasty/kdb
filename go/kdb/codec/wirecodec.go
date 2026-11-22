@@ -411,6 +411,9 @@ func decodeRecord(c *cursor, sch *schema.RecordSchema, reg *schema.Registry) (Va
 	if err != nil {
 		return nil, err
 	}
+	if slabLen > uint64(c.limit-c.pos) {
+		return nil, kdberr.NewDecodeError("record length exceeds remaining input", c.pos, nil)
+	}
 	slab, err := c.rawN(int(slabLen))
 	if err != nil {
 		return nil, err

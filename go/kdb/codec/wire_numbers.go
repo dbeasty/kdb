@@ -63,7 +63,9 @@ func (c *cursor) u8() (byte, error) {
 }
 
 func (c *cursor) rawN(n int) ([]byte, error) {
-	if n < 0 || c.pos+n > c.limit {
+	// n > c.limit-c.pos, not c.pos+n > c.limit: n comes straight off a varint, and a value
+	// near MaxInt wraps c.pos+n negative, which slipped past the check into make([]byte, n).
+	if n < 0 || n > c.limit-c.pos {
 		return nil, kdberr.NewDecodeError("eof raw", c.pos, nil)
 	}
 	s := make([]byte, n)
@@ -137,6 +139,9 @@ func readLebBytes(c *cursor) ([]byte, error) {
 	n, err := c.leb()
 	if err != nil {
 		return nil, err
+	}
+	if n > uint64(c.limit-c.pos) {
+		return nil, kdberr.NewDecodeError("length exceeds remaining input", c.pos, nil)
 	}
 	return c.rawN(int(n))
 }

@@ -318,6 +318,10 @@ type Manager struct {
 	mu           sync.Mutex
 	active       *SortedTable
 	pendingFlush *SortedTable
+	// failedFlush is a generation whose flush failed: it is still visible through pendingFlush
+	// and is folded under the active table by the next Flush, so a retry writes it out instead
+	// of replacing (and so losing) it.
+	failedFlush *SortedTable
 }
 
 // NewManager returns a memtable manager for a namespace.
@@ -422,11 +426,27 @@ func (mgr *Manager) Contains(key codec.Hash) bool {
 // neither active (already swapped), pendingFlush, nor the blob store (AddTable never
 // reached), so Get reported every write in it as simply absent. On failure the generation
 // stays visible through pendingFlush until the caller decides how to recover; it is still not
-// durable, and a subsequent successful flush replaces pendingFlush with its own snapshot.
-// Mirrors MemTableManager.flush in kdb-storage-memtable.
+// durable, and the next flush folds it under the active generation and writes both. Replacing
+// it instead lost it: a retry with nothing new written found zero entries, and one with new
+// writes persisted only those - either way the failed generation's writes were reachable from
+// nowhere. Mirrors MemTableManager.flush in kdb-storage-memtable.
 func (mgr *Manager) Flush(level int) (sstable.Handle, error) {
 	mgr.mu.Lock()
 	snap := mgr.active
+	if failed := mgr.failedFlush; failed != nil {
+		merged := NewSortedTable()
+		for _, gen := range []*SortedTable{failed, snap} {
+			for _, e := range gen.snapshotEntries() {
+				if e.deleted {
+					merged.Delete(e.key)
+				} else {
+					merged.Put(e.key, e.value)
+				}
+			}
+		}
+		snap = merged
+		mgr.failedFlush = nil
+	}
 	mgr.pendingFlush = snap
 	mgr.active = NewSortedTable()
 	mgr.mu.Unlock()
@@ -455,6 +475,11 @@ func (mgr *Manager) Flush(level int) (sstable.Handle, error) {
 	}
 	handle, err := writer.Finish()
 	if err != nil {
+		mgr.mu.Lock()
+		if mgr.pendingFlush == snap {
+			mgr.failedFlush = snap
+		}
+		mgr.mu.Unlock()
 		return sstable.Handle{}, err
 	}
 	mgr.blobStore.AddTable(handle)

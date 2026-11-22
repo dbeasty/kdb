@@ -89,14 +89,14 @@ func repairTornTail(shim storage.PlatformIOShim, namespaceID string, f Finding) 
 	good := raw[:f.Offset]
 	torn := raw[f.Offset:]
 	quarantineName := quarantineSegmentName(namespaceID, f.Segment)
-	if _, err := shim.AppendToSegment(quarantineName, torn); err != nil {
+	if err := writeSegment(shim, quarantineName, torn); err != nil {
 		return RepairStep{}, fmt.Errorf("quarantining torn tail of segment %d: %w", f.Segment, err)
 	}
 	if err := shim.DeleteSegment(name); err != nil {
 		return RepairStep{}, fmt.Errorf("removing segment %d before rewrite: %w", f.Segment, err)
 	}
 	if len(good) > 0 {
-		if _, err := shim.AppendToSegment(name, good); err != nil {
+		if err := writeSegment(shim, name, good); err != nil {
 			return RepairStep{}, fmt.Errorf("rewriting segment %d without its torn tail: %w", f.Segment, err)
 		}
 	}
@@ -192,7 +192,7 @@ func repairMidLogCorruption(shim storage.PlatformIOShim, namespaceID string, f F
 		return RepairStep{}, err
 	}
 	quarantineName := quarantineSegmentName(namespaceID, f.Segment)
-	if _, err := shim.AppendToSegment(quarantineName, raw); err != nil {
+	if err := writeSegment(shim, quarantineName, raw); err != nil {
 		return RepairStep{}, fmt.Errorf("quarantining corrupt segment %d: %w", f.Segment, err)
 	}
 	if err := shim.DeleteSegment(name); err != nil {
@@ -200,7 +200,7 @@ func repairMidLogCorruption(shim storage.PlatformIOShim, namespaceID string, f F
 	}
 	good := raw[:goodPrefixLen]
 	if len(good) > 0 {
-		if _, err := shim.AppendToSegment(name, good); err != nil {
+		if err := writeSegment(shim, name, good); err != nil {
 			return RepairStep{}, fmt.Errorf("rewriting segment %d prefix: %w", f.Segment, err)
 		}
 	}
@@ -208,6 +208,26 @@ func repairMidLogCorruption(shim storage.PlatformIOShim, namespaceID string, f F
 		Finding: f, Action: ActionRewroteSegmentPrefix, QuarantineName: quarantineName,
 		Detail: fmt.Sprintf("kept %d of %d commit(s) from segment %d (frames before the corrupt one); full original preserved in %s", len(prefixCommits), len(prefixCommits)+1, f.Segment, quarantineName),
 	}, nil
+}
+
+// writeSegment appends data to name in pieces the shim accepts and flushes it. One append of the
+// whole thing is refused by a shim with a smaller append limit - FileBackedPlatformIO's default is
+// 16 MiB against a 64 MiB delta segment - and the repairs call this after deleting the original,
+// so a refusal there lost the segment. The flush makes the quarantined copy durable before the
+// original is deleted, and the rewrite durable before repair reports it done.
+func writeSegment(shim storage.PlatformIOShim, name string, data []byte) error {
+	max := 1 << 20
+	if l, ok := shim.(interface{ MaxAppendBytes() int }); ok && l.MaxAppendBytes() > 0 {
+		max = l.MaxAppendBytes()
+	}
+	for len(data) > 0 {
+		n := min(len(data), max)
+		if _, err := shim.AppendToSegment(name, data[:n]); err != nil {
+			return err
+		}
+		data = data[n:]
+	}
+	return shim.FlushSegment(name)
 }
 
 // intactCommitsAfter returns the hashes of the commits in raw's intact frames after offset,

@@ -92,6 +92,7 @@ func (t *Transport) Connect(uri string) (stream.ConnectionHandle, error) {
 	c := &grpcConnection{
 		cc:       cc,
 		stream:   s,
+		ctx:      ctx,
 		cancel:   cancel,
 		incoming: make(chan []byte, incomingBufferFrames),
 	}
@@ -111,12 +112,18 @@ const (
 type grpcConnection struct {
 	cc     *grpc.ClientConn
 	stream grpc.BidiStreamingClient[kdbwirev1.Frame, kdbwirev1.Frame]
+	ctx    context.Context
 	cancel context.CancelFunc
 
 	incoming chan []byte
 
 	mu     sync.Mutex
 	closed bool
+	// sendMu serializes Send. client.Client sends from every goroutine that makes a request,
+	// relying on the transport to make that safe (tcp and ws lock around the write), and a gRPC
+	// stream is documented as unsafe for concurrent SendMsg - the listener side already locks
+	// for the same reason (streamConn.sendMu).
+	sendMu sync.Mutex
 }
 
 func (c *grpcConnection) Send(frame []byte) error {
@@ -126,6 +133,8 @@ func (c *grpcConnection) Send(frame []byte) error {
 	if closed {
 		return fmt.Errorf("kdb/grpc: connection closed")
 	}
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 	return c.stream.Send(&kdbwirev1.Frame{Payload: frame})
 }
 
@@ -166,6 +175,12 @@ func (c *grpcConnection) readLoop() {
 			// pending requests fail; there is nothing to report from here.
 			return
 		}
-		c.incoming <- frame.GetPayload()
+		// Interruptible by Close: a consumer that stopped reading used to leave this send
+		// blocked forever, so incoming was never closed and the goroutine leaked.
+		select {
+		case c.incoming <- frame.GetPayload():
+		case <-c.ctx.Done():
+			return
+		}
 	}
 }

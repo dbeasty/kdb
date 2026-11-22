@@ -925,6 +925,15 @@ func Main() {
 	if sqlListener != nil {
 		_ = sqlListener.Close()
 	}
+	// The WebSocket and gRPC data-plane listeners too: they were left to the deferred closes,
+	// which run only after Release, so browsers and gRPC clients kept connecting and querying
+	// through the drain and into closed storage.
+	if wsListener != nil {
+		_ = wsListener.Close()
+	}
+	if grpcListener != nil {
+		_ = grpcListener.Close()
+	}
 	if streamListener != nil {
 		_ = streamListener.Close()
 	}
