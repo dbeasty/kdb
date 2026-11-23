@@ -5,11 +5,15 @@ Written 2026-11-22 against `main` 6bc4d0e9 (v0.9.3 plus docs); measured rebased 
 read-error handling, not the paths measured here); branch `perf/basic-rw`. Every item that changes architecture names the Cassandra mechanism it
 follows, as `kdb-memory-cassandra-plan.md` and `kdb-qtask-cpu-plan.md` do. Pure local fixes do not.
 
-**Status (2026-11-22):** W1-W4, F1 and D1 are implemented and measured in this branch. Reads beat
-MongoDB 1.3-2.1x; concurrent writes went from 0.29-0.32x to 0.41-0.46x MongoDB (fast durability);
-durable writes are now 0.78-1.11x MongoDB `j:true` with kdb-service's new Linux default (D1). Open:
-W8 (several writes per commit), the only item that takes concurrent writes past the per-namespace
-commit rate, needs a design before it can be switched on.
+**Status (2026-11-22, follow-up stack):** W1-W4, F1 and D1 landed in this branch; D2, W6, W5, R1,
+R2, W7 and E1 are implemented and measured in a stack of one PR each on top of it (see
+[Done in the follow-up stack](#done-in-the-follow-up-stack)). Final matrix: reads 1.3-1.9x
+MongoDB; durable writes 0.80-1.13x MongoDB `j:true` (v0.9.4: 0.43-0.69x) with worst cases 2-4x
+lower than before D2 and below MongoDB's; concurrent writes under fast durability still
+0.36-0.47x, bound by the per-namespace commit rate (~20-24k/s), which only W8 (several writes per
+commit) gets past. M1 found what holds KDB's memory - the commit graph's
+resident tier, unbounded between maintenance passes - and proposes a fix that needs a design.
+**Waiting on the user:** W8 (design below, with the decisions it needs) and E2 (trade-off below).
 
 ## Goal and constraints
 
@@ -215,24 +219,386 @@ Measured, the branch with no flags against v0.9.4 with no flags, durable, two pa
 | insert | 1 | 2,609 | 4,030 | +54% | 5 / 29-31 |
 | insert | 32 | 15,602 | 23,355 | +50% | 21-236 / 55-142 |
 
+## Done in the follow-up stack
+
+One PR per item, stacked on this branch in the order below, each measured against the one before
+it with `ab.sh` (binaries alternated over two passes; read cells are the control): D2 #346 ->
+W6 #347 -> W5 #348 -> R1 #349 -> R2 #350 -> W7 #351 -> E1 #352 -> this document's results.
+
+At the matrix level only D2 moves anything measurable (durable tails). W6, W5, R1, R2 and W7 each
+land within +-5% of their predecessor: they remove real work, but not work that limits these
+cells - W6's validation already ran before the gate, W5 and W7 are 1-4% of gate time, R1 matters
+only when the cache holds the wrong versions and cold reads are cheap here, and the benchmark never
+reaches R2's path. They are kept because each removes a cost that grows somewhere else (inserts'
+CPU, the gate's share at higher rates, cache pressure on larger data, cold reads after a restart).
+
+### D2 - durable tails: the next segment ready ahead of need, background writers trickle-synced
+
+With D1 a new segment's 64 MiB of zeros were written and synced by the commit-log writer at
+rotation, and every durable commit queued behind it waited (27-35 ms worst writes in every write
+cell). The next segment is now prepared on a goroutine once the active one is half written: an
+unnamed `O_TMPFILE` file in the segment directory, linked in under its name at rotation. It is the
+same file, size and synced zeros as before, invisible until then - every reader (Go, Kotlin,
+older builds) refuses an unknown file in `delta/`, so a named spare there would have broken a
+rollback - and a crash or close leaves nothing behind. Linux only; elsewhere segments are created
+by name as before.
+
+An execution trace (`/debug/pprof/trace`, update at 32 workers, durable) then attributed what was
+left: the slowest commits (30-36 ms) all waited on the commit log's `fdatasync` while one
+background writer's single final sync pushed tens of megabytes to the device - a flushed
+memtable's SSTable (39 ms) or the spare's zeros (25-36 ms). No checkpoint, GC pause or gate hold
+came near. Those writers now sync every MiB as they write.
+
+*Cassandra:* `CommitLogSegmentManager` keeps the next segment ready before the active one fills;
+`trickle_fsync` / `trickle_fsync_interval` for the background writers.
+
+Durable, base = this branch, two passes; write p99.9 / max ms per pass:
+
+| cell | c | base ops/s | D2 ops/s | change | base p99.9 / max | D2 p99.9 / max |
+|---|--:|--:|--:|--:|---|---|
+| update | 1 | 4,247 | 4,820 | +13% | 0.6/29, 1.1/33 | 0.6/9, 0.6/9 |
+| update | 8 | 12,030 | 12,637 | +5% | 4.5/31, 4.0/34 | 4.0/12, 4.8/12 |
+| update | 32 | 21,500 | 22,695 | +6% | 12.9/35, 8.1/45 | 7.6/13, 7.0/13 |
+| mixed50 | 8 | 21,338 | 21,647 | +1% | 5.5/25, 5.7/20 | 4.6/7, 4.7/6 |
+| mixed50 | 32 | 40,521 | 42,361 | +5% | 22.7/49, 12.9/49 | 9.4/24, 8.3/20 |
+| insert | 1 | 4,133 | 3,875 | -6% | 1.0/31, 0.8/28 | 0.7/5, 0.8/6 |
+| insert | 32 | 22,706 | 23,158 | +2% | 16.1/30, 15.9/34 | 14.5/21, 14.0/18 |
+| read | 32 | 116,211 | 125,754 | (control) | | |
+
+Worst-case durable writes fall 2-4x in every write cell; throughput moves within the run's noise.
+
+### W6 - a document's JSON is validated with a scan, not a map
+
+`validateObjectJSON` (every insert, `Replace` and replayed write) unmarshalled the body into a
+`map[string]any` to check it was an object: 5.1 us and 39 allocations for a 1 KB document; the
+scan takes ~1 us and none. Only the scan's *yes* is an answer: anything it rejects goes to
+`json.Unmarshal` as before, which decides and produces its own error, so accepted inputs and
+error texts are unchanged. The scan follows encoding/json's grammar plus the one way decoding
+into `any` fails after the scanner accepts - a number out of float64's range (`1e400`). A
+differential fuzz target holds it to Unmarshal (24M inputs, no mismatch).
+
+Matrix effect: none outside noise (inserts +1-3%): Upsert already validated a new document in its
+premerge, before the gate, so this saves CPU, not gate time.
+
+### W5 - each commit is encoded once
+
+The DAG encoded a new commit's payload to hash it and the persisting DAG encoded it again for the
+delta record. `BuildCommitWithPayload` encodes once and hashes those bytes; the DAG keeps them for
+the commit it appended last and `PersistAsync` takes them by commit hash. The log is byte-identical
+(Go interop goldens unmoved). *Cassandra:* a `Mutation` is serialized once. Matrix effect: none
+outside noise (it is ~1% of gate time).
+
+### R1 - superseded versions leave the body cache first
+
+Under bounded live bodies a live version and the versions it replaced share one budget, and a
+superseded version of a hot document sat near the front of the CLOCK ring. A commit now demotes
+the version it supersedes (or deletes) to the tail with its second chance cleared - or, while
+its commit is not yet durable and it is still pinned, to the tail when the last pin goes.
+*Cassandra:* the memtable keeps only the latest cells of a row.
+
+Neutral even with the cache under pressure: `--cache-mb 128` (document budget ~38 MiB for ~105 MiB of
+live bodies), interleaved with the W5 binary over two passes - read 0.98-0.99x, update 0.99-1.00x,
+mixed50 1.00-1.01x, read95 0.99-1.02x. Cold reads here are served by location records and the
+frame cache cheaply enough that which versions stay resident barely shows; R1 keeps the resident
+set the right one, it does not make the benchmark faster.
+
+### R2 - a cold read never rescans the open segment
+
+A miss in the delta cold loader's index refreshed it by listing the log (rescanning the open
+segment to describe it) and re-indexing that whole segment: up to 64 MiB read and decoded per
+miss. The index now remembers how far it has read the segment this process is writing and, when
+no segment came or went, reads only the frames appended since (`DeltaTailReader`); rotation,
+damage and other processes' segments take the full refresh as before. *Cassandra:* reads never
+touch the commit log. The benchmark does not reach this path after F1 (neutral in the A/B); a test
+pins the bound - lookups while the open segment grows ten times cause no rescan.
+
+### W7 - one trie walk per write under the gate
+
+Of the remaining Merkle work, the profile (update at 32 workers, fast, gate held ~85% of wall
+time) put the trie update at 32% of gate time, the DAG append at 15%, and a re-merge of documents
+whose premerge went stale at 11%. One part was a safe win: each write walked the trie three times
+(`HashFor` for the version it replaces, a `get` to count the tree's size, then the insert). The
+insert now reports what it replaced; same tree, same pins, one walk (~4% of gate time). The
+internal node hashes along the path cannot be shared without several writes per commit (W8).
+
+Measured against R2 (two passes, 8 and 32 workers): writes 0.98-1.02x, the read control 0.95x in
+both passes. A 1M-op read-only rerun came out equal in one pass (131.7k vs 131.6k reads/s at 32
+workers) and 9% lower in the other. W7 changes nothing a read executes (the trees it builds are
+identical), so this reads as run noise, but it is recorded as measured. The ~4% of gate time is
+below what the matrix resolves.
+
+### E1 - `kdb/docdb`, a concurrent document API for embedders
+
+`docdb.Open(dir, namespace, opts)` and `Get`, `Put` (whole document), `Merge` (shallow merge at
+the head the write lands on), `Delete`, `Close` - safe for concurrent use, every write through the
+server runtime's write gate (W1-W4 apply), `Runtime()` for the rest. Backed by two new
+`KdbServerRuntime` methods, `Replace` and `Delete` (last-write-wins at head; `Replace` validated
+and hashed before the gate). No new dependency: it is `embed` + `server`, already in the
+embeddable source bundle, which now lists `kdb/docdb` as an entry point.
+
+### M1 - what holds KDB's memory (measured; the fix needs a design)
+
+Measured on the final binary at the end of the matrix sequence (load + read/update/mixed50/insert
+at 1, 8 and 32 workers: 100k documents, ~820k commits), fast durability, 3 GB container
+(`mem.sh`: cgroup `memory.stat`, `/proc` status, a heap profile and the server's
+`kdb_namespace_memory_bytes`):
+
+| what | MiB | note |
+|---|--:|---|
+| `docker stats` | 1,249 | = cgroup anon + active file pages |
+| cgroup anon (all Go heap + runtime) | 1,203 | Go heap in use 970 MiB, runtime total 1,343 |
+| cgroup file pages | 1,251 | **not** what `docker stats` shows: 1,249 of it is inactive page cache (log, SSTables) |
+| **commit graph, resident tier** | **333** | ~400 B per commit, every commit since the last graph flush |
+| document bodies | 125 | its budget: 30% of the 384 MiB cache pool (live 105) |
+| memtable | 124 | its bound: 20% of the pool, up to twice that while a generation is being flushed (W4) |
+| live tree (slab) | 67 | |
+| rescue reserve | 48 | deliberate: the memory guard's ballast |
+| commit operations | 38 | its budget: 10% of the pool |
+| delta frame cache | 26 | |
+| history trees | 19 | |
+| document index | 10 | |
+
+With `--cache-mb 128` instead of 384 the container ends at 760-790 MiB; the pool's budgets account
+for that difference, the commit graph does not shrink.
+
+**What is unbounded: the commit graph's resident tier.** Since #159 the commit graph lives in
+mapped segments (`graph.file`, on by default), but new commits stay in the heap until a
+maintenance pass writes them out, and maintenance runs every 5 minutes by default. So resident
+graph memory is bounded by time, not size: ~400 B x commit rate x 5 min - at 20k commits/s that is
+~2.4 GB before the first pass. And the pass itself doubles it: `snapshotForSegment` copies every
+resident record before writing (+318 MiB at 820k commits; the container peaked at 1.69 GB during
+that flush, run with `--maintenance-interval 15s`).
+
+**Why not a quick fix:** flushing by size under today's write policy (a full rewrite whenever the
+resident tier is at least half the segments, or after 8 segments) would rewrite the whole graph
+every ~8 flushes - at 10M commits, 2.5 GB every ~25 s at 20k commits/s. A size trigger needs a
+compaction that keeps write amplification logarithmic.
+
+**Proposed fix (needs a design pass on the graph file, #159's area):**
+
+1. Flush the resident tier as a segment when it passes a size (e.g. 16 MiB / ~50k commits), on a
+   goroutine, not only on the maintenance tick - *Cassandra:* memtables flush on
+   `memtable_heap_space` / `memtable_cleanup_threshold`, not on a timer.
+2. Merge graph segments size-tiered - merge the smallest similar-sized ones, never rewrite
+   everything - *Cassandra:* SizeTieredCompactionStrategy. This needs a rule for crash
+   consistency of a partial merge (today "a full segment supersedes lower sequences" is the only
+   supersession rule).
+3. Stream a flush from the resident chunks in key order instead of copying the whole tier first -
+   *Cassandra:* a memtable flush iterates the memtable.
+
+Expected: resident graph memory bounded at a few tens of MiB whatever the write rate, and no
+2x peak at flush; the container at this workload would drop by ~300 MiB, to ~0.9 GB.
+
 ## Not done yet - the plan
 
-Ordered by expected gain per effort. Gate-time shares are from the latest profile.
-
-| # | item | Cassandra mechanism | expected | risk / cost |
+| # | item | Cassandra mechanism | expected | status |
 |---|---|---|---|---|
-| D2 | Durable tails: durable cells still show single 30-450 ms writes (fast mode: under 60 ms). One known cause: with D1 a new segment is created - 64 MiB of zeros written and synced - on the log writer at rotation, in line with commits. Create the next segment ahead of need on a goroutine, then attribute what is left (checkpoint, SSTable sync) with a block profile | `CommitLogSegmentManager`'s allocator keeps the next segment ready before the active one fills | p99.9 / max under durable writes | medium |
-| W5 | Serialize each commit once: the DAG's commit hash and the delta record encode the same payload twice under the gate | a `Mutation` is serialized once and the buffer reused (commit log, messaging) | ~5% of gate | low |
-| W6 | Insert validation: a new document is parsed into `map[string]any` (encoding/json) just to check it is an object; a validating scan is enough | - | inserts | low |
-| W7 | Remaining Merkle work under the gate: internal node hashes along the path (~7%), child record reads (~6%) | (Merkle off the write path) - only a batch can share them, see W8 | | medium |
-| W8 | **Coalesce concurrent single-document writes into one commit** (one trie update shares internal nodes, one DAG append, one log record). The gate caps ~25-30k commits/s per namespace; MongoDB's 50-60k concurrent writes need it. | commit-log group sync + mutation batching | the only path past ~1/(gate time) | **Decision needed:** one commit then carries several clients' writes - history, idempotency (tx id -> commit) and peer sync see batches, not single writes; off by default |
-| R1 | Superseded versions first out of the body cache: with bounded live bodies a live version competes with the versions it replaced, so hot documents get evicted and read back from frames | the memtable holds only the latest cells of a partition | read p99, fewer cold loads | low |
-| R2 | A cold read must never rescan the log: bound or remove the delta cold loader's refresh on the hot path (F1 removed the common cause) | reads never read the commit log | tail latency | medium |
-| M1 | **Memory footprint:** at 100k 1 KB documents the KDB container ends at ~1.2-1.3 GB against MongoDB's 0.55-0.7 GB. Find what holds it (mapped tree pages, slab, memtables, index) before tuning | Cassandra's off-heap memtables + chunk cache with explicit budgets | lighter embedding | measure first |
-| E1 | Embedded API: `embed.PutJSONDocument` is not safe for concurrent callers and goes around the gate; embedders use `server.NewKdbServerRuntime(rt)` or `database/sql`. A small concurrent document API over the same path (W1-W4 included) | - | embedded = no network, see below | low |
-| E2 | Embedded cache default is a fixed 64 MiB; the service sizes from the machine (1/8). An embedded store with more hot data than that runs from cold reads | Cassandra sizes caches from the heap | embedded reads | decision (memory vs speed) |
+| W8 | **Several writes per commit**: the only way past the per-namespace commit rate (~22-25k/s) | commit-log group sync + applying a batch of mutations as one update | concurrent writes towards MongoDB's 46-60k/s | **design below; needs the user's decisions before any code** |
+| E2 | Embedded cache default: fixed 64 MiB vs machine-sized | caches sized from the heap | embedded reads with hot data > 64 MiB | **trade-off below; the user's decision** |
+| W9 | **Stale premerges** (new, from the W7 profile): a zipfian-hot document is often written again between an Upsert's premerge and its turn at the gate, so the gate re-merges it - 11% of gate time at update@32. Merge faster at the gate: one parse of the stored body instead of several - the merge is of top-level keys only | `AtomicBTreePartition` retries its CAS before taking the lock | up to ~10% of gate time on hot keys | low (faster merge) |
+| M1 | Bound the commit graph's resident tier: flush by size, merge graph segments size-tiered, stream the flush | memtable flush on heap space; SizeTieredCompactionStrategy | ~300 MiB less at this workload, no 2x flush peak, bounded at any write rate | measured and diagnosed (M1 above); needs a design pass on the graph file (#159) |
 
-## Results
+### W8 - several writes per commit (design; not implemented)
+
+**Why:** every write is one commit, and a commit does serially, under the namespace's write gate,
+work whose cost does not depend on how much the commit changes: one Merkle path from leaf to root
+(a node hash at each of ~7 levels, slab records placed, child records read), one DAG append
+(payload encode + SHA-256), one log record, one tree publish. The W7 profile puts the gate at ~40
+us per commit (trie update 32%, DAG append 15%, a re-merge for documents whose premerge went stale
+11%), so a namespace commits at most ~25k times a second whatever the CPU count; MongoDB's 46-60k concurrent writes/s cannot be
+reached one write per commit. Committing the writes that are waiting at the gate together pays
+that fixed cost once per batch, and N documents' Merkle paths share their upper levels, so the
+trie work per write falls too.
+
+**Cassandra:** the commit log's group sync (`commitlog_sync: group`/`batch`) already shares one
+fsync across concurrent mutations, which KDB copies today; W8 goes one step further, like applying
+an unlogged batch of mutations to a partition as one update: the memtable (here, the trie) is
+updated once for all of them.
+
+**Mechanism (flat combining at the gate):** the write gate becomes a queue of requests instead of a
+semaphore. The writer that takes the gate drains the requests queued behind it - up to a cap (64
+writes or 1 MiB of bodies) - and commits their operations as one transaction: one `CommitTree`
+(one trie update over all the documents), one DAG append, one log record. Each waiting writer is
+handed the result for its own write and waits for that commit's durability, exactly as now. Off
+by default (`--coalesce-writes`, `coalesceWrites` in the config file, `StorageOptions` for
+embedders); with it off nothing changes.
+
+**What it is allowed to batch:** only last-write-wins writes at head - `Upsert`, `Replace`,
+`Delete` (the paths that today never conflict). Transactions with a base version (STRICT/conflict
+detection), schema migrations, cross-namespace groups and anything with attachments stay one per
+commit, so no conflict report ever has to be split across clients.
+
+**Semantics, and what changes for users:**
+
+| area | today | with W8 | proposed rule |
+|---|---|---|---|
+| per-document history | every version of a document has its own commit and tree | unchanged if a batch never holds two writes to one document | a second write to a document already in the batch closes the batch; it starts the next one |
+| commit history | one commit per client write | one commit per batch; a commit's operations come from several clients | documented; `kdb_namespace_commits` counts batches |
+| reads "as of" a commit | every intermediate state has a tree | no tree between the writes of one batch | acceptable: each tree is still a consistent state that some order of the writes produced |
+| tx-id idempotency (`txIndex`: transaction id -> commit, used by retries) | a transaction's `TransactionID` is the client's; `Upsert`, `Replace` and `Delete` mint theirs on the server, so nothing retries by them | the batch commit carries one fresh id | batch only writes whose id the server minted - all three paths today. If a client-supplied id ever reaches them: (a) per-write ids in memory only (a retry after a restart re-applies: a second, identical LWW commit), or (b) a new optional commit field - a format change, Kotlin included - is the decision |
+| validation failures | the write fails alone | each write is validated alone at the gate front (premerge already does most of it); a failing one is dropped from the batch with its own error, the rest commit | |
+| peer sync | commits travel one per write | batches travel as ordinary multi-op commits - no wire or format change; LWW merge resolves per document as now | |
+| conflict reports (STRICT) | per commit | not affected: STRICT writes are never batched | |
+| durability / acknowledgement | each write waits for its commit | each waits for the batch commit; group sync is unchanged | |
+| audit / authorship | one author per commit | one author per batch commit | batch only writes from the same principal, or record the commit as the runtime's own (decision) |
+
+**Expected effect (estimate, to be measured):** at 32 writers a batch would hold up to 31 queued
+writes. If the ~40 us per commit splits into roughly 25 us that a batch pays once and 15 us per
+write (the re-merge, the leaf, the body store), update throughput at 32 workers would move from
+~22-24k/s towards ~50k/s, with the CPU spent before the gate (premerge, the wire) the next limit.
+Single-writer latency is unchanged: a lone writer forms a batch of one.
+
+**Open questions for the user:** whether "one commit = one client write" is a property any user or
+tool relies on (history UIs, `kdb inspect`, audit exports, peers counting commits); whether a
+batch may mix principals (or the batch commit is authored by the runtime); the cap; and the tx-id
+rule should a client-supplied id ever reach these paths.
+
+### E2 - embedded cache default (decision)
+
+kdb-service sizes its document cache from the machine (an eighth of the container, via
+`server.CachePoolBytes`); an embedded runtime takes a fixed 64 MiB (`MemoryBudgetBytes` zero). An
+embedded store whose hot data is larger than that serves reads from cold loads. Measured with the
+benchmark's `kdb-embed` target (KDB in the client process, 4 CPUs / 3 GB, bounded live bodies as
+`FileRuntimeOptionsFromEnv` sets them, 100k 1 KB documents, 1M-operation cells), the embedded
+default against the service's sizing (384 MiB pool), two passes alternated:
+
+| cell | c | 64 MiB (embedded default) | 384 MiB (service sizing) | sized / default |
+|---|--:|--:|--:|--:|
+| read | 1 | 351,916 | 1,169,946 | 3.32x |
+| read | 8 | 835,292 | 3,996,327 | 4.78x |
+| read | 32 | 1,048,759 | 4,350,950 | 4.15x |
+| read95 | 1 | 169,913 | 318,159 | 1.87x |
+| read95 | 8 | 183,098 | 293,606 | 1.60x |
+| read95 | 32 | 170,538 | 267,191 | 1.57x |
+
+So an embedder with ~100 MB of hot documents gets a quarter of the read throughput the same
+library gives when it is sized like the service (still 16-35x MongoDB over its network, but the
+default decides it, and most embedders never change defaults). The cost of sizing up is the cache
+itself: 320 MiB more resident in the host process at this data size.
+
+Options:
+
+1. **Keep 64 MiB** (today): predictable for a host process that embeds KDB next to its own data;
+   embedders who want more set `StorageOptions.MemoryBudgetBytes` (or call
+   `server.CachePoolBytes`). Document it prominently.
+2. **Machine-sized, like the service** (1/8 of the cgroup limit or physical memory): fastest
+   reads out of the box, but an embedded library that takes an eighth of its host's memory
+   without being asked is a surprise, and N embedded namespaces each sized that way would
+   overcommit unless the budget is shared.
+3. **Middle:** min(1/16 of the limit, 256 MiB), shared across the runtimes of one process.
+
+Recommendation: 1 or 3 - a library should not size itself like a server; the choice is the
+user's.
+
+## Results after the follow-up stack
+
+Final matrix, 2026-11-22, on the top of the stack (#352) with kdb-service's defaults (on Linux:
+`fdatasync` into preallocated segments, D1; spare segments and trickle sync, D2), two passes in
+alternating order, every number the mean of both: v0.9.4, the branch, the branch embedded in the
+benchmark process (no network, same 4 CPUs and 3 GB, the service's cache sizing; durable embedded
+runs use the embedded defaults - full `fsync`, no preallocation - so D1/D2 do not apply to them),
+and MongoDB 7. ops/s; ratios against v0.9.4 and MongoDB. Every pass was checked against the host's
+load while it ran (peak 1-minute load 4.6-7.0; a pass that saw more than 10 was rerun - another
+project's test suite and a Spotlight reindex shared the machine that evening).
+
+### fast
+
+| cell | c | v0.9.4 | branch | branch embedded | MongoDB 7 | branch / v0.9.4 | branch / Mongo | embedded / Mongo |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| load | 32 | 18,915 | 24,772 | 33,061 | 61,957 | 1.31x | **0.40x** | 0.53x |
+| read | 1 | 14,871 | 14,484 | 1,018,749 | 11,303 | 0.97x | **1.28x** | 90.13x |
+| read | 8 | 103,798 | 103,323 | 4,023,452 | 61,630 | 1.00x | **1.68x** | 65.28x |
+| read | 32 | 125,055 | 120,148 | 4,079,095 | 67,992 | 0.96x | **1.77x** | 59.99x |
+| update | 1 | 8,228 | 7,836 | 21,637 | 10,718 | 0.95x | **0.73x** | 2.02x |
+| update | 8 | 14,122 | 21,907 | 21,995 | 55,706 | 1.55x | **0.39x** | 0.39x |
+| update | 32 | 14,007 | 19,961 | 20,337 | 48,121 | 1.43x | **0.41x** | 0.42x |
+| mixed50 | 1 | 10,203 | 9,674 | 41,715 | 11,254 | 0.95x | **0.86x** | 3.71x |
+| mixed50 | 8 | 20,258 | 42,209 | 41,160 | 58,323 | 2.08x | **0.72x** | 0.71x |
+| mixed50 | 32 | 24,052 | 42,120 | 36,725 | 54,836 | 1.75x | **0.77x** | 0.67x |
+| read95 | 1 | 13,708 | 13,303 | 324,528 | 10,209 | 0.97x | **1.30x** | 31.79x |
+| read95 | 8 | 65,827 | 95,031 | 290,765 | 59,341 | 1.44x | **1.60x** | 4.90x |
+| read95 | 32 | 83,062 | 106,862 | 290,926 | 62,682 | 1.29x | **1.70x** | 4.64x |
+| insert | 1 | 8,484 | 8,542 | 30,185 | 9,740 | 1.01x | **0.88x** | 3.10x |
+| insert | 8 | 17,454 | 22,098 | 28,877 | 47,034 | 1.27x | **0.47x** | 0.61x |
+| insert | 32 | 16,980 | 20,819 | 26,939 | 57,677 | 1.23x | **0.36x** | 0.47x |
+
+write p99 / max at 32 workers (fast), ms, per pass:
+
+| cell | v0.9.4 | branch | branch embedded | MongoDB 7 |
+|---|--:|--:|--:|--:|
+| update | 4.0 / 45 ; 4.0 / 1658 | 3.9 / 17 ; 4.0 / 16 | 2.9 / 27 ; 2.8 / 20 | 2.7 / 65 ; 2.2 / 62 |
+| mixed50 | 4.5 / 1357 ; 4.1 / 1378 | 3.2 / 24 ; 3.4 / 18 | 3.5 / 33 ; 2.8 / 27 | 2.1 / 54 ; 2.4 / 71 |
+| insert | 3.0 / 21 ; 2.8 / 18 | 2.7 / 20 ; 2.9 / 20 | 2.4 / 119 ; 2.3 / 142 | 2.0 / 56 ; 2.4 / 54 |
+
+### durable
+
+| cell | c | v0.9.4 | branch | branch embedded | MongoDB 7 | branch / v0.9.4 | branch / Mongo | embedded / Mongo |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| load | 32 | 14,874 | 26,784 | 22,965 | 28,595 | 1.80x | **0.94x** | 0.80x |
+| read | 1 | 14,554 | 13,955 | 1,206,095 | 10,620 | 0.96x | **1.31x** | 113.57x |
+| read | 8 | 106,924 | 102,924 | 4,982,368 | 61,608 | 0.96x | **1.67x** | 80.87x |
+| read | 32 | 132,480 | 126,118 | 5,158,308 | 68,188 | 0.95x | **1.85x** | 75.65x |
+| update | 1 | 2,074 | 4,488 | 3,477 | 4,816 | 2.16x | **0.93x** | 0.72x |
+| update | 8 | 7,197 | 12,964 | 6,312 | 16,252 | 1.80x | **0.80x** | 0.39x |
+| update | 32 | 14,785 | 23,967 | 20,005 | 28,379 | 1.62x | **0.84x** | 0.70x |
+| mixed50 | 1 | 4,668 | 6,199 | 6,072 | 7,206 | 1.33x | **0.86x** | 0.84x |
+| mixed50 | 8 | 15,376 | 22,292 | 17,167 | 26,614 | 1.45x | **0.84x** | 0.65x |
+| mixed50 | 32 | 24,974 | 43,176 | 37,566 | 45,295 | 1.73x | **0.95x** | 0.83x |
+| read95 | 1 | 16,038 | 14,331 | 65,680 | 17,965 | 0.89x | **0.80x** | 3.66x |
+| read95 | 8 | 69,849 | 88,128 | 164,581 | 58,613 | 1.26x | **1.50x** | 2.81x |
+| read95 | 32 | 91,402 | 106,050 | 370,937 | 62,721 | 1.16x | **1.69x** | 5.91x |
+| insert | 1 | 2,867 | 4,141 | 3,736 | 4,623 | 1.44x | **0.90x** | 0.81x |
+| insert | 8 | 8,601 | 13,047 | 8,614 | 11,531 | 1.52x | **1.13x** | 0.75x |
+| insert | 32 | 16,976 | 24,572 | 20,304 | 24,490 | 1.45x | **1.00x** | 0.83x |
+
+write p99 / max at 32 workers (durable), ms, per pass:
+
+| cell | v0.9.4 | branch | branch embedded | MongoDB 7 |
+|---|--:|--:|--:|--:|
+| update | 5.4 / 1294 ; 4.8 / 1203 | 4.1 / 12 ; 4.1 / 13 | 4.0 / 198 ; 3.0 / 17 | 2.1 / 74 ; 2.2 / 181 |
+| mixed50 | 5.3 / 1521 ; 5.0 / 1190 | 4.7 / 46 ; 4.5 / 75 | 6.6 / 50 ; 4.6 / 145 | 4.5 / 69 ; 3.8 / 33 |
+| insert | 7.0 / 142 ; 5.1 / 177 | 3.7 / 115 ; 3.1 / 21 | 3.1 / 353 ; 3.2 / 114 | 3.6 / 110 ; 4.5 / 357 |
+
+What it says:
+
+- **Reads** stay 1.3-1.9x MongoDB over the wire (point reads) and 1.5-1.7x on 95/5 mixes from 8
+  workers; embedded, 1-5M point reads/s.
+- **Durable writes are at parity with MongoDB `j:true`:** 0.80-1.13x on writes, the load phase
+  0.94x, inserts at 8 and 32 workers 1.13x and 1.00x - against v0.9.4's 0.43-0.69x. And their tails
+  are better than MongoDB's: worst update at 32 workers 12-13 ms against 74-181 ms.
+- **Fast writes are where they were (0.36-0.47x MongoDB from 8 workers):** the per-namespace commit
+  rate (~20-24k/s) is the limit, and nothing in this stack changes how many commits a namespace can
+  make. W8 is the item that does.
+- **Single-worker writes:** 0.73-0.88x MongoDB fast, 0.90-0.93x durable.
+
+### The whole stack against its base
+
+Does the stack cost anything anywhere? The top of the stack against this branch (#345), fast,
+three passes alternated, every pass load-checked; write p99.9 / max ms per pass:
+
+| cell | c | base | final | final / base | write p99.9 / max ms (base, final) |
+|---|--:|--:|--:|--:|---|
+| load | 32 | 26,202 (27,616 / 25,642 / 25,347) | 28,442 (29,072 / 28,296 / 27,959) | 1.09x | 9.8/31, 10.0/39, 11.2/33 ; 7.8/30, 8.8/33, 9.4/31 |
+| read | 1 | 13,428 (13,899 / 13,452 / 12,931) | 13,684 (13,435 / 13,859 / 13,759) | 1.02x |  |
+| read | 8 | 102,131 (100,494 / 105,979 / 99,919) | 103,284 (105,569 / 102,430 / 101,853) | 1.01x |  |
+| read | 32 | 126,396 (127,737 / 129,730 / 121,720) | 127,218 (127,925 / 128,548 / 125,182) | 1.01x |  |
+| update | 1 | 8,205 (8,309 / 8,206 / 8,100) | 8,195 (8,316 / 7,825 / 8,445) | 1.00x | 0.5/10, 0.4/10, 0.5/11 ; 0.4/9, 0.5/9, 0.4/10 |
+| update | 8 | 24,238 (24,571 / 24,855 / 23,289) | 23,855 (25,427 / 22,623 / 23,515) | 0.98x | 3.8/17, 3.9/21, 4.2/17 ; 3.7/11, 4.4/15, 3.9/13 |
+| update | 32 | 21,622 (22,071 / 21,983 / 20,811) | 20,942 (22,612 / 20,110 / 20,105) | 0.97x | 7.9/25, 10.5/23, 8.3/22 ; 7.1/14, 7.3/195, 7.8/14 |
+| mixed50 | 1 | 9,773 (9,940 / 9,945 / 9,433) | 9,695 (9,927 / 9,796 / 9,363) | 0.99x | 0.5/9, 0.5/9, 0.6/12 ; 0.9/9, 1.2/27, 0.7/10 |
+| mixed50 | 8 | 41,780 (43,102 / 42,600 / 39,638) | 43,800 (44,763 / 44,101 / 42,535) | 1.05x | 4.7/10, 4.9/18, 5.2/16 ; 4.4/6, 4.7/6, 5.0/6 |
+| mixed50 | 32 | 42,825 (43,421 / 43,555 / 41,500) | 42,430 (44,343 / 40,434 / 42,513) | 0.99x | 7.3/18, 11.5/27, 10.9/26 ; 6.9/17, 7.6/45, 8.1/18 |
+| insert | 1 | 8,387 (8,450 / 8,415 / 8,297) | 8,597 (8,775 / 8,253 / 8,762) | 1.02x | 0.5/5, 0.9/5, 0.5/6 ; 0.5/5, 0.5/4, 0.7/6 |
+| insert | 8 | 24,908 (24,917 / 25,139 / 24,667) | 23,926 (25,843 / 22,140 / 23,795) | 0.96x | 4.6/20, 4.8/19, 5.4/20 ; 2.8/11, 4.8/15, 3.8/13 |
+| insert | 32 | 24,095 (24,322 / 24,237 / 23,725) | 23,728 (24,656 / 23,457 / 23,072) | 0.98x | 13.6/22, 15.3/21, 15.0/20 ; 14.4/17, 13.8/22, 14.1/20 |
+
+Everything is within 0.96-1.09x (read controls 1.01-1.02x). One pass of the final binary had a
+single 195 ms write in update@32 (the other two: 14 ms; base: 22-25 ms). It is not a rotation
+waiting for its spare - preparing a 64 MiB spare takes 47-62 ms with trickle syncs (30 ms with one
+sync) on this disk, against ~1.3 s for half a segment to fill at this rate - and it did not recur;
+it is recorded here unattributed.
+
+## Results at #345 (before the follow-up stack)
 
 Final matrix, 2026-11-22, two passes alternating order, every number the mean of both: v0.9.4,
 this branch, this branch with the D1 durable configuration (`--sync-mode fast` +
@@ -329,3 +695,22 @@ What it says:
   preceding cells; a fresh store showed +31%.
 - `docker pull` from this shell hung on Docker Desktop's credential helper; a clean
   `DOCKER_CONFIG` pulls the public image.
+- **`run.sh` compiles the KDB module from the checkout it lives in** (the client embeds KDB for
+  the `kdb-embed` target), so editing Go code in that checkout during an A/B can fail a run's
+  client build and silently drop that run from the table. Run A/Bs from a separate, frozen
+  worktree's copy of the harness.
+- **A background writer's big final sync shows up as commit latency.** On this Docker VM a 64 MiB
+  zero-fill or an SSTable's single closing `fsync` made the commit log's concurrent `fdatasync`
+  take 20-30 ms. Find it with an execution trace (`/debug/pprof/trace`), not a CPU profile: the
+  CPU profile sees nothing.
+- `storage/delta TestListSegmentsRescansASegmentChangedInPlace` fails in a `golang:1.26` container
+  (overlayfs mtime granularity) on any commit; it passes on macOS and in CI.
+- **`docker stats` is not the page cache.** It reports cgroup usage minus inactive file pages; at
+  the end of the matrix KDB's 1.25 GB of written log and SSTable pages were all inactive and
+  uncounted, and the 1.2 GB shown was Go heap (cgroup `anon`). Read `memory.stat` (a sidecar
+  container with `--pid container:<kdb> --cgroupns host -v /sys/fs/cgroup:/sys/fs/cgroup:ro`)
+  before blaming mapped files or the page cache.
+- **Read cells swing 5-9% between runs of the same code.** W7's read control came out 5% low in
+  both passes of a short-cell A/B, then equal in one pass and 9% low in the other of a 1M-op rerun,
+  for a change that runs nothing on the read path. Use 1M-op read cells, and more than two passes
+  before reading a single-digit read delta into anything.

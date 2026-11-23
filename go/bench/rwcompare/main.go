@@ -66,6 +66,7 @@ type store interface {
 func main() {
 	target := flag.String("target", "kdb", "kdb, kdb-embed or mongo")
 	embedDur := flag.String("embed-durability", "fast", "kdb-embed only: fast (async, 100 ms flush) or durable (sync)")
+	embedCache := flag.Int64("embed-cache", 0, "kdb-embed only: document cache budget in bytes; 0 = the service's sizing (an eighth of the container), -1 = the embedded runtime's own default (64 MiB)")
 	addr := flag.String("addr", "127.0.0.1:9090", "kdb-service address (kdb) or mongodb:// URI (mongo)")
 	label := flag.String("label", "", "free-form label copied into every result line (e.g. image tag, durability)")
 	ns := flag.String("namespace", "bench/ycsb", "KDB namespace / Mongo database.collection")
@@ -90,7 +91,7 @@ func main() {
 		case "kdb":
 			st, err = openKDB(ctx, *addr, *ns, max(maxInt(parseInts(*concs)), *loadConc))
 		case "kdb-embed":
-			st, err = openEmbedded(*addr, *ns, *embedDur)
+			st, err = openEmbedded(*addr, *ns, *embedDur, *embedCache)
 		case "mongo":
 			st, err = openMongo(ctx, *addr, *ns, max(maxInt(parseInts(*concs)), *loadConc), *mongoJ)
 		default:
@@ -426,9 +427,14 @@ type embedStore struct {
 // openEmbedded opens a file runtime in this process the way kdb-service opens one, with the
 // service's cache pool sizing (an eighth of the container) instead of the embedded 64 MiB default,
 // so the comparison with the wire target is about the network and not the cache.
-func openEmbedded(dir, ns, durability string) (*embedStore, error) {
+func openEmbedded(dir, ns, durability string, cacheBytes int64) (*embedStore, error) {
 	opts := embed.FileRuntimeOptionsFromEnv()
-	opts.Storage.MemoryBudgetBytes, _ = server.CachePoolBytes(0)
+	switch {
+	case cacheBytes == 0:
+		opts.Storage.MemoryBudgetBytes, _ = server.CachePoolBytes(0)
+	case cacheBytes > 0:
+		opts.Storage.MemoryBudgetBytes = cacheBytes
+	}
 	if durability == "fast" {
 		opts.Storage.Durability = storage.DurabilityAsync
 		opts.Storage.AsyncSyncIntervalMillis = 100
