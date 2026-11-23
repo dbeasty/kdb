@@ -157,6 +157,10 @@ type ServiceSettings struct {
 	// each sync into a data-only fdatasync. Costs one segment of disk (64 MiB by default) per
 	// open namespace up front. On by default on Linux, off elsewhere - see defaultSyncPath.
 	PreallocateSegments bool
+	// CoalesceWrites commits the last-write-wins single-document writes queued at a namespace's
+	// write gate together, several per commit (server.KdbServerRuntime.CoalesceWrites). Off by
+	// default.
+	CoalesceWrites bool
 }
 
 // defaultSyncPath is the durable-write path kdb-service uses unless configured otherwise, per
@@ -282,6 +286,7 @@ type ServiceFile struct {
 	Compression         *string `json:"compression"`
 	SyncMode            *string `json:"syncMode"`
 	PreallocateSegments *bool   `json:"preallocateSegments"`
+	CoalesceWrites      *bool   `json:"coalesceWrites"`
 }
 
 // ServiceTLSFile is ServiceFile's nested TLS block, matching the --tls-* flags.
@@ -403,6 +408,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		setIf(&s.Compression, file.Compression)
 		setIf(&s.SyncMode, file.SyncMode)
 		setIf(&s.PreallocateSegments, file.PreallocateSegments)
+		setIf(&s.CoalesceWrites, file.CoalesceWrites)
 	}
 
 	// Layer 3: environment.
@@ -550,6 +556,9 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 	if err := envBool("KDB_PREALLOCATE_SEGMENTS", &s.PreallocateSegments); err != nil {
 		return s, err
 	}
+	if err := envBool("KDB_COALESCE_WRITES", &s.CoalesceWrites); err != nil {
+		return s, err
+	}
 
 	// Layer 4: explicitly-set flags.
 	flagOverrides := []struct {
@@ -600,6 +609,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		{"compression", func() { s.Compression = flags.Compression }},
 		{"sync-mode", func() { s.SyncMode = flags.SyncMode }},
 		{"preallocate-segments", func() { s.PreallocateSegments = flags.PreallocateSegments }},
+		{"coalesce-writes", func() { s.CoalesceWrites = flags.CoalesceWrites }},
 	}
 	for _, o := range flagOverrides {
 		if flagWasSet(o.name) {

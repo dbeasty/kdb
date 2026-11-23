@@ -121,6 +121,12 @@ type KdbServerRuntime struct {
 	// embedded caller driving Engine.Commit on a shared *InMemoryCommitDag still wants for
 	// throughput, but the correctness floor is in the DAG itself now.
 	writeGate *writeGate
+	// CoalesceWrites commits the last-write-wins single-document writes (Upsert, Replace, Delete)
+	// queued at the write gate together, several per commit, never two to one document (W8; see
+	// write_batch.go). Off by default: with it off every write is its own commit, as always.
+	CoalesceWrites bool
+	batcher        writeBatcher
+
 	// WriteTimeout bounds how long a commit may wait queued before *DeadlineExceededError.
 	// Defaults to DefaultWriteTimeout; safe to change at any time.
 	WriteTimeout time.Duration
@@ -723,6 +729,11 @@ func (s *KdbServerRuntime) Upsert(namespaceID string, docID codec.UUID, jsonBody
 		Timestamp:  codec.TimestampNow(),
 	})
 	opts := txOptions{atHead: true, deadline: time.Now().Add(s.writeTimeout())}
+	if s.coalescing() {
+		if c, err, alone := s.upsertCoalesced(namespaceID, docID, jsonBody, tx, principal); !alone {
+			return c, err
+		}
+	}
 	return s.clientWrite(tx, func() (document.Commit, error) {
 		for attempt := 0; ; attempt++ {
 			c, err := s.upsertAttempt(namespaceID, docID, jsonBody, tx, principal, opts, attempt)
@@ -731,6 +742,34 @@ func (s *KdbServerRuntime) Upsert(namespaceID string, docID codec.UUID, jsonBody
 			}
 		}
 	})
+}
+
+// upsertCoalesced is an Upsert's trip through a batch of writes committed together (W8),
+// premerged and recorded in flight like any attempt. A premerge stale at the gate front is merged
+// there, as shared work in the batch's one commit, rather than sent back. alone: the batch was
+// rejected, and the caller commits the write by itself (upsertAttempt, which may retry).
+func (s *KdbServerRuntime) upsertCoalesced(namespaceID string, docID codec.UUID, jsonBody string, tx document.Transaction, principal auth.Principal) (document.Commit, error, bool) {
+	pre, flight, havePre := s.premerge(namespaceID, docID, jsonBody)
+	committed := false
+	if havePre {
+		defer func() { s.inFlight.done(docID, flight, committed) }()
+	}
+	s.runAfterPremergeHook(0)
+	w := &batchedWrite{tx: tx, docID: docID, bytes: len(jsonBody), op: func(headOK bool, headTree codec.Hash) document.Op {
+		switch {
+		case !havePre || !headOK:
+			s.premerges.none.Add(1)
+		case pre.stillCurrent(s, namespaceID, docID, headTree):
+			s.premerges.current.Add(1)
+			return document.WriteOp{DocID: docID, Patch: pre.body, Replace: true, Prevalidated: true}
+		default:
+			s.premerges.mergedAtGate.Add(1)
+		}
+		return document.WriteOp{DocID: docID, Patch: jsonBody}
+	}}
+	c, err, alone := s.commitCoalesced(w, principal)
+	committed = !alone && err == nil
+	return c, err, alone
 }
 
 // upsertAttempt is one trip of an Upsert through the write gate: the premerge, the queue, and at
@@ -801,6 +840,12 @@ func (s *KdbServerRuntime) writeAtHead(ops []document.Op, principal auth.Princip
 		return document.Commit{}, err
 	}
 	tx := s.authored(document.Transaction{ID: txID, Operations: ops, Timestamp: codec.TimestampNow()})
+	if len(ops) == 1 && s.coalescing() {
+		w := &batchedWrite{tx: tx, docID: opDocID(ops[0]), bytes: transactionPayloadBytes(tx), op: singleOp(ops[0])}
+		if c, err, alone := s.commitCoalesced(w, principal); !alone {
+			return c, err
+		}
+	}
 	return s.clientWrite(tx, func() (document.Commit, error) {
 		return s.runTransaction(tx, principal, txOptions{atHead: true}, func() (transactionResult, error) {
 			live := tx

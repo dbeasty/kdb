@@ -475,7 +475,10 @@ func openEmbedded(dir, ns, durability string, cacheBytes int64) (*embedStore, er
 	if err != nil {
 		return nil, err
 	}
-	return &embedStore{rt: rt, srv: server.NewKdbServerRuntime(rt), ns: ns}, nil
+	srv := server.NewKdbServerRuntime(rt)
+	// The service's --coalesce-writes, for the embedded target (W8).
+	srv.CoalesceWrites = os.Getenv("KDB_COALESCE_WRITES") == "true"
+	return &embedStore{rt: rt, srv: srv, ns: ns}, nil
 }
 
 func (s *embedStore) Insert(_ context.Context, _ int, id string, doc [fields]string) error {

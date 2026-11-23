@@ -21,7 +21,20 @@ import (
 // gate: a writer that queued behind another one merged onto the version before it and wrote
 // that back, dropping whatever the writer ahead had set. LAST_WRITE namespaces skip conflict
 // detection, so nothing reported it either.
+//
+// The same with writes committed in batches (W8, CoalesceWrites), where an Upsert's premerge is
+// checked and, if stale, merged at the gate inside its batch's commit. Either way every Upsert
+// leaves the in-flight record once it is done - else the document's later Upserts would build on
+// a write that is gone.
 func TestConcurrentUpsertsToOneDocumentKeepEveryField(t *testing.T) {
+	for _, coalesce := range []bool{false, true} {
+		t.Run(fmt.Sprintf("coalesce=%v", coalesce), func(t *testing.T) {
+			concurrentUpsertsKeepEveryField(t, coalesce)
+		})
+	}
+}
+
+func concurrentUpsertsKeepEveryField(t *testing.T, coalesce bool) {
 	const ns = "app/data"
 	const writers = 16
 	const rounds = 20
@@ -35,6 +48,7 @@ func TestConcurrentUpsertsToOneDocumentKeepEveryField(t *testing.T) {
 	t.Cleanup(func() { rt.Close() })
 	srv := NewKdbServerRuntime(rt)
 	srv.SetWriteQueueCapacityForTest(4096)
+	srv.CoalesceWrites = coalesce
 
 	for round := 0; round < rounds; round++ {
 		id := mustRandomUUID(t)
@@ -79,6 +93,9 @@ func TestConcurrentUpsertsToOneDocumentKeepEveryField(t *testing.T) {
 		}
 		if len(missing) > 0 {
 			t.Fatalf("round %d: %d of %d concurrent upserts lost: missing %v from %s", round, len(missing), writers+1, missing, body)
+		}
+		if p := srv.inFlight.newest(id); p != nil {
+			t.Fatalf("round %d: a finished upsert is still in flight", round)
 		}
 	}
 }
@@ -419,3 +436,49 @@ func TestAnUpsertThatPanicsLeavesNothingInFlight(t *testing.T) {
 }
 
 var errRefusedForTest = fmt.Errorf("refused for test")
+
+// TestStaleUpsertPremergeInABatchMergesAtTheGate: with writes committed in batches (W8), an Upsert
+// whose premerge went stale is merged at the gate inside its batch's commit, as shared work, rather
+// than sent back to retry - and keeps every field, and leaves nothing in flight.
+func TestStaleUpsertPremergeInABatchMergesAtTheGate(t *testing.T) {
+	const ns = "app/data"
+	srv := openUpsertTestRuntime(t, ns)
+	srv.CoalesceWrites = true
+	id := mustRandomUUID(t)
+	if _, err := srv.Upsert(ns, id, `{"seed":true}`, auth.Principal{}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	var interfered atomic.Bool
+	srv.SetAfterPremergeHookForTest(func(int) {
+		if interfered.CompareAndSwap(false, true) {
+			if _, err := srv.Replace(ns, id, `{"seed":true,"between":1}`, auth.Principal{}); err != nil {
+				t.Errorf("interfering write: %v", err)
+			}
+		}
+	})
+	before, commitsBefore := srv.PremergeOutcomes(), srv.dag.CommitCount()
+	if _, err := srv.Upsert(ns, id, `{"mine":2}`, auth.Principal{}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	srv.SetAfterPremergeHookForTest(nil)
+
+	after := srv.PremergeOutcomes()
+	if got := after.MergedAtGate - before.MergedAtGate; got != 1 {
+		t.Errorf("merged at gate = %d, want 1", got)
+	}
+	if got := after.Retried - before.Retried; got != 0 {
+		t.Errorf("retried = %d, want 0 (a batch merges a stale premerge at the gate)", got)
+	}
+	if got := srv.dag.CommitCount() - commitsBefore; got != 2 {
+		t.Errorf("commits = %d, want 2 (the interfering write and the upsert)", got)
+	}
+	got := readFields(t, srv, ns, id)
+	for _, k := range []string{"seed", "between", "mine"} {
+		if _, ok := got[k]; !ok {
+			t.Errorf("field %q lost: %v", k, got)
+		}
+	}
+	if p := srv.inFlight.newest(id); p != nil {
+		t.Error("the upsert is still in flight")
+	}
+}
