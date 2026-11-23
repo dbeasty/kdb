@@ -62,6 +62,9 @@ type OSByteStore struct {
 	// noSpares is set once creating a spare has failed for want of O_TMPFILE, so later segments
 	// do not try again.
 	noSpares atomic.Bool
+	// trickleBytes, when positive, is how much is appended to an SSTable between syncs (see
+	// trickleSyncBytes): only on Linux, and only for a store that syncs at all.
+	trickleBytes int64
 }
 
 // syncDir is fsx.SyncDir, a variable so tests can see which directories are synced.
@@ -77,16 +80,25 @@ type openSegment struct {
 	next string
 	// spareStarted is set once preparing next has begun.
 	spareStarted atomic.Bool
+	// trickle is set for an SSTable segment, which is synced every OSByteStore.trickleBytes as it
+	// is written; unsynced counts the bytes appended since the last such sync.
+	trickle  bool
+	unsynced int64 // atomic
 }
 
 func NewOSByteStore(config PlatformIOConfig) (*OSByteStore, error) {
 	if config.RootDirectory == nil || *config.RootDirectory == "" {
 		return nil, fmt.Errorf("os byte store requires root directory")
 	}
+	var trickle int64
+	if trickleSupported && config.FsyncOnFlush {
+		trickle = trickleSyncBytes
+	}
 	return &OSByteStore{
 		root:             *config.RootDirectory,
 		syncMode:         config.SyncMode,
 		preallocateBytes: config.PreallocateBytes,
+		trickleBytes:     trickle,
 		handles:          make(map[string]*openSegment),
 		readers:          make(map[string]*os.File),
 		unsyncedDirs:     make(map[string]struct{}),
@@ -232,10 +244,16 @@ func (s *OSByteStore) openFor(segmentName string) (*openSegment, error) {
 		_ = f.Close()
 		return existing, nil
 	}
-	seg = &openSegment{file: f, size: logicalSize, next: next}
+	seg = &openSegment{file: f, size: logicalSize, next: next, trickle: s.trickleBytes > 0 && isSSTableSegment(segmentName)}
 	s.handles[segmentName] = seg
 	s.mu.Unlock()
 	return seg, nil
+}
+
+// isSSTableSegment reports whether segmentName is an SSTable, finished or still being written
+// (ns/<id>/sstable/... or ns/<id>/sstable-partial/...).
+func isSSTableSegment(segmentName string) bool {
+	return strings.Contains(segmentName, "/sstable/") || strings.Contains(segmentName, "/sstable-partial/")
 }
 
 // mkdirAllRecorded is os.MkdirAll(dir), returning the directories whose entries it changed: the
@@ -321,6 +339,14 @@ func (s *OSByteStore) appendOnce(segmentName string, bytes []byte) (int64, error
 	offset := atomic.LoadInt64(&seg.size)
 	if _, err := seg.file.WriteAt(bytes, offset); err != nil {
 		return 0, err
+	}
+	if seg.trickle && atomic.AddInt64(&seg.unsynced, int64(len(bytes))) >= s.trickleBytes {
+		// Before the size advances, so that a failed sync fails the append like a failed write:
+		// an error from fsync must reach the writer, since a later sync may no longer report it.
+		if err := syncFile(seg.file, s.syncMode); err != nil {
+			return 0, err
+		}
+		atomic.StoreInt64(&seg.unsynced, 0)
 	}
 	newSize := atomic.AddInt64(&seg.size, int64(len(bytes)))
 	s.maybePrepareSpare(seg, newSize)

@@ -21,10 +21,16 @@ import (
 // zero-fill, which is slower to create but produces the same initialized
 // extents.
 func preallocateFile(f *os.File, bytes int64) error {
+	return preallocateFileTrickle(f, bytes, 0)
+}
+
+// preallocateFileTrickle is preallocateFile with the zeros synced every trickle bytes as they are
+// written (see trickleSyncBytes).
+func preallocateFileTrickle(f *os.File, bytes, trickle int64) error {
 	if err := syscall.Fallocate(int(f.Fd()), 0, 0, bytes); err != nil {
 		if err != syscall.EOPNOTSUPP && err != syscall.ENOSYS && err != syscall.EINVAL {
 			return err
 		}
 	}
-	return zeroFill(f, bytes)
+	return zeroFillTrickle(f, bytes, trickle)
 }

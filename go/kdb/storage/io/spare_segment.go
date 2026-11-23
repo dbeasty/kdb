@@ -84,7 +84,7 @@ func (s *OSByteStore) prepareSpare(segmentName string) {
 			// No O_TMPFILE here: stop trying, segments are created by name as before.
 			s.noSpares.Store(true)
 			f = nil
-		} else if err := preallocateFile(f, size); err != nil {
+		} else if err := preallocateFileTrickle(f, size, trickleSyncBytes); err != nil {
 			_ = f.Close()
 			f = nil
 		}

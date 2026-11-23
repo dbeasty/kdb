@@ -16,3 +16,6 @@ var errUnnamedUnsupported = errors.New("unnamed files are not supported on this 
 func createUnnamedFile(dir string) (*os.File, error) { return nil, errUnnamedUnsupported }
 
 func linkUnnamedFile(f *os.File, path string) error { return errUnnamedUnsupported }
+
+// preallocateFileTrickle is only used for spares, which exist only on Linux.
+func preallocateFileTrickle(f *os.File, bytes, trickle int64) error { return preallocateFile(f, bytes) }
