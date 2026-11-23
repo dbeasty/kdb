@@ -389,6 +389,102 @@ compaction that keeps write amplification logarithmic.
 Expected: resident graph memory bounded at a few tens of MiB whatever the write rate, and no
 2x peak at flush; the container at this workload would drop by ~300 MiB, to ~0.9 GB.
 
+### M1 design - the commit graph as an LSM that flushes by size
+
+The graph's resident tier is already a memtable and its segments already SSTables (#159): one
+record format for both, a flush that writes the resident tier as a new segment, a full rewrite as
+the major compaction. What is missing is everything that makes an LSM's memory bounded by size:
+the trigger, a flush that does not copy, a compaction whose cost is logarithmic, and the read
+path that makes many segments cheap. Nothing here changes a segment's bytes, a checkpoint's
+bytes or a wire message.
+
+| piece | Cassandra mechanism | KDB |
+|---|---|---|
+| when to flush | memtable flush when `memtable_heap_space` / `memtable_cleanup_threshold` is reached, not on a timer | the resident tier is flushed when it holds `graph.rebuildCommits` commits (50,000, ~20 MiB) - checked on every commit, run on a goroutine |
+| how a flush reads | the memtable is switched out and flushed while a new one takes writes | the slots a flush reads are frozen; writes go to new slots (copy-on-write); no copy of the tier |
+| which segments merge | SizeTieredCompactionStrategy: buckets of similar size (0.5x-1.5x the bucket mean), `min_threshold` 4, `max_threshold` 32, small files bucketed together | the same rule over record counts; the smallest full bucket merges first |
+| dead records | single-SSTable tombstone compaction past `tombstone_threshold` 0.2 | a segment more than 20% hidden is rewritten alone (today: everything is rewritten when 20% of *all* records are hidden) |
+| major compaction | `nodetool compact`: flush, then compact everything | `CompactGraphFile`: unchanged contract, one full segment |
+| lookups across many files | a bloom filter per SSTable (`bloom_filter_fp_chance` 0.01) | a bloom filter per segment over its commit hashes and transaction ids, built when it is mapped |
+| crash during a compaction | the lifecycle transaction log: new files become live, old ones go, as one step | no new file kind: a merge's inputs are deleted before its output gets its final name (below) |
+
+**Thresholds.** The flush trigger is `graph.rebuildCommits`, the setting that was always
+documented as this bound but was only read by the 5-minute maintenance pass. A commit that takes
+the tier to the threshold starts the namespace's flusher if it is not already running (one
+goroutine, exits when idle - no pool). Commits that may yet be taken back (provisional,
+unlogged, and their descendants) stay resident, as today. The head is flushed like any commit:
+only the first write after a flush finds its parent in a segment. The maintenance pass and
+open still call `MaybeRebuildGraphFile`, now as a backstop. `graph.maxSegments` changes meaning:
+from "rewrite everything past this many" to "past this many, merge the smallest four even if no
+size tier is full"; its default rises from 8 to 16, since bloom filters make a segment that does
+not hold a key nearly free to skip. Expected shape at 10M commits: tiers of ~50k, ~200k, ~800k
+and ~3.2M records, at most three of each waiting, each record rewritten ~4 times in its life
+(log4 of commits / 50k) instead of once per full rewrite.
+
+**The streaming flush.** Today `snapshotForSegment` copies every resident record (256 B plus side
+data) before writing - the 2x. Instead the flush, under the lock, notes `(hash, slot, flags)` for
+each commit it will write (40 B each, sorted outside the lock) and freezes every slot below the
+current high-water mark. While frozen, nothing writes a frozen slot: a write to one (a new
+generation, a re-put with operations) copies the record to a fresh slot first and the old slot is
+freed when the flush ends; deletes free nothing until then; the free list is not reused. Side data
+(messages, octopus parents, attachment roots) is captured by reference - their values are never
+mutated in place. The writer reads the frozen bytes with no lock held. Peak extra memory is the
+40 B list, about a tenth of the tier, instead of all of it. The has-operations flag and
+transaction ownership are decided at the snapshot, as now.
+
+**Lookups while a flush or merge is in flight.** Unchanged in kind: a commit is in exactly one
+place at every instant readers can see. During a flush the commits it writes are still resident
+(their frozen slots are what the index points at); during a merge its inputs are still attached.
+The swap is one critical section under the DAG's write lock: the new segment is attached, the
+flushed commits leave the resident tier (or the inputs leave the segment list), and lookups that
+start after it see the new layout. A flush and a merge can run at the same time - they touch
+disjoint commits, the flush only commits no segment has a record for (as today) and the merge
+only segment records - so a long merge never holds the resident tier above its bound. Attaching a
+merge output costs O(hidden records + generation overrides), not O(records): the records it holds
+are exactly its inputs' visible ones, and only what changed since the merge started (commits
+deleted, generations recomputed) is reconciled. Attaching a flush drops exactly the flushed
+commits' transaction-index entries, instead of probing every segment for every entry.
+
+**Bloom filters.** Every write looks up three things that are almost always absent: its own
+commit hash (twice) and its transaction id (the idempotent-retry check, twice). Today almost all
+history is resident, so these are map misses; once it is flushed they would be misses against
+every segment - a fanout plus interpolation search each, or ~20 probes of the transaction index -
+on the write gate. A split-block bloom filter per segment (~10 bits per key, ~1% false positives,
+pointer-free) answers those misses without touching the mapping: ~2.5 bytes per commit, built in
+the same pass that checks the segment's checksum at open.
+
+**Crash and reopen.** Two supersession rules exist today: segments never share a commit, and a
+full segment supersedes every lower sequence (a crash between a full rewrite's rename and its
+deletes). A partial merge cannot use the second rule, and older readers know no other, so merges
+are ordered so that the files on disk never share a commit:
+
+1. write the output under a temporary name, sync it, attach it in memory;
+2. delete every input the checkpoint on disk does not name;
+3. if no input remains on disk, rename the output to its final name; otherwise rename it to
+   `graph-<seq>.kdbg.pending`, and finish the rename after the next checkpoint (which names the
+   output) has been written and the inputs it replaced have been deleted.
+
+A crash anywhere leaves a disjoint set: before (3) the output is not a segment (a stale temporary
+or pending file, removed at open), and the inputs already deleted were not named by the
+checkpoint, so either their commits are in the checkpoint's resident list or the log (the
+checkpoint path) or every commit is resident (the replay path, where segments only take commits
+out of the heap). The one window with a cost is between a checkpoint naming a pending output and
+the rename: open then finds the `.pending` file, checks its sequence, checksum and count against
+the checkpoint, and renames it - an older reader replays the log instead, which is correct. A
+checkpoint pins the segments it names from the moment it captures them (today only after it is
+written; a background merge could otherwise delete a segment between the two).
+
+`CompactGraphFile` keeps its contract and its file order (rename, then delete or defer the
+inputs): it holds the flush and merge locks, so its output - every segment plus the resident
+tier, one segment marked full - really does supersede every lower sequence, and the existing rule
+still covers a crash after its rename. The first segment a namespace writes is full, as today.
+
+**Compatibility.** Segment layout (v5), checkpoint format and graph references are unchanged, so
+older Go readers open everything a newer one leaves after a clean close, and after any crash too
+(they ignore `.pending` and temporary files; at worst they replay). The Kotlin checkpoint reader
+does not read graph segments at all - a checkpoint with graph references already makes it
+replay - so nothing changes for it.
+
 ## Not done yet - the plan
 
 | # | item | Cassandra mechanism | expected | status |
