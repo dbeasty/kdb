@@ -756,16 +756,34 @@ func (e *ServerEngine) stashPendingLocations(treeHash codec.Hash, changed []Tree
 	e.pendingMu.Lock()
 	defer e.pendingMu.Unlock()
 	if e.pendingLocations == nil {
-		e.pendingLocations = make(map[codec.Hash][]TreeChange)
+		e.pendingLocations = make(map[codec.Hash][][]TreeChange)
 	}
-	if _, seen := e.pendingLocations[treeHash]; !seen {
-		e.pendingOrder = append(e.pendingOrder, treeHash)
-	}
-	e.pendingLocations[treeHash] = changed
+	// Queued, not replaced: a second commit with the same tree used to overwrite the first one's
+	// stash, so the first commit's report filed the second one's versions at the first one's
+	// frame (where a read then failed to find them) and the second one's report found nothing.
+	// Either way a later cold read of those versions fell through to indexing the delta log.
+	e.pendingLocations[treeHash] = append(e.pendingLocations[treeHash], changed)
+	e.pendingOrder = append(e.pendingOrder, treeHash)
 	for len(e.pendingOrder) > maxPendingLocationTrees {
-		delete(e.pendingLocations, e.pendingOrder[0])
+		e.popPendingLocationsLocked(e.pendingOrder[0])
 		e.pendingOrder = e.pendingOrder[1:]
 	}
+}
+
+// popPendingLocationsLocked takes the oldest stash queued under treeHash. pendingMu is held.
+func (e *ServerEngine) popPendingLocationsLocked(treeHash codec.Hash) ([]TreeChange, bool) {
+	queue := e.pendingLocations[treeHash]
+	if len(queue) == 0 {
+		return nil, false
+	}
+	changed := queue[0]
+	if len(queue) == 1 {
+		delete(e.pendingLocations, treeHash)
+	} else {
+		queue[0] = nil
+		e.pendingLocations[treeHash] = queue[1:]
+	}
+	return changed, true
 }
 
 // RecordCommitLocation is told where in the delta log the commit naming
@@ -781,9 +799,8 @@ func (e *ServerEngine) RecordCommitLocation(treeHash codec.Hash, segmentSeq, fra
 		return
 	}
 	e.pendingMu.Lock()
-	changed, ok := e.pendingLocations[treeHash]
+	changed, ok := e.popPendingLocationsLocked(treeHash)
 	if ok {
-		delete(e.pendingLocations, treeHash)
 		for i, h := range e.pendingOrder {
 			if h == treeHash {
 				e.pendingOrder = append(e.pendingOrder[:i], e.pendingOrder[i+1:]...)

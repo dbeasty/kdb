@@ -148,9 +148,12 @@ type ServerEngine struct {
 	frameReads atomic.Pointer[frameReads]
 	// pendingLocations holds the content hashes a commit tree produced,
 	// keyed by that tree's hash, waiting for the log to report where the
-	// commit naming it landed. See RecordCommitLocation.
+	// commit naming it landed. See RecordCommitLocation. Several commits in
+	// flight can produce the same tree (a write that changes nothing leaves
+	// its parent's tree), so each tree hash holds a queue, oldest first, the
+	// order the log reports them in - as durablePins does.
 	pendingMu        sync.Mutex
-	pendingLocations map[codec.Hash][]TreeChange
+	pendingLocations map[codec.Hash][][]TreeChange
 	pendingOrder     []codec.Hash
 	pending          *shardedPendingStore
 	enlistmentStates map[codec.UUID]storage.EnlistmentEvictionState

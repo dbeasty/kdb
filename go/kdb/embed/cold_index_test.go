@@ -181,3 +181,44 @@ func TestColdIndexSidecarsServeTheReplayStrategy(t *testing.T) {
 		})
 	}
 }
+
+// A write can leave the tree exactly as an earlier commit left it - change A, change B, change B
+// back - and both commits can still be waiting for the log to report their position. Their
+// versions differ (the first wrote A, the last wrote B), so each one's report has to file its
+// own: the stash used to be one entry per tree, the later commit's replaced the earlier one's,
+// and the earlier report filed B at a frame that does not hold it while A was never filed.
+// Either way a cold read of them indexed the delta log, which under a fast writer meant
+// rescanning every commit since the last index refresh.
+func TestColdReadsResolveByLocationAfterWritesThatRestoreATree(t *testing.T) {
+	root := t.TempDir()
+	rt := coldIndexRuntime(t, root, nil)
+	ids, texts := writeLiveSet(t, rt, 1600, 2500) // ~4 MB of live bodies against a 4 MiB floor
+	for k := 0; k+1 < len(ids); k += 2 {
+		a, b := ids[k], ids[k+1]
+		changedA := strings.Replace(texts[a], `"n":`, `"changed":true,"n":`, 1)
+		changedB := strings.Replace(texts[b], `"n":`, `"changed":true,"n":`, 1)
+		for _, body := range []string{changedA, changedB, texts[b]} {
+			if _, err := embed.PutJSONDocument(rt, boundedNS, body); err != nil {
+				t.Fatal(err)
+			}
+		}
+		texts[a] = changedA
+	}
+	// More live data than the cache, so most of what was just written is read back cold.
+	more, moreTexts := writeLiveSet(t, rt, 1600, 2500)
+	for id, text := range moreTexts {
+		texts[id] = text
+	}
+	ids = append(ids, more...)
+	rt.Close()
+
+	reopened := coldIndexRuntime(t, root, nil)
+	requireAllLive(t, reopened, ids, texts, "after reopen")
+	eng := serverEngine(t, reopened)
+	if eng.ColdDocumentLoads() == 0 {
+		t.Fatal("nothing was read back from durable storage, so nothing was evicted")
+	}
+	if st := eng.ColdIndexStats(); st.Segments != 0 {
+		t.Fatalf("the cold loader indexed %d delta segments (%d versions): some version had no location record", st.Segments, st.Keys)
+	}
+}
