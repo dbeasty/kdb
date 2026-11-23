@@ -699,7 +699,7 @@ func envOnlySpecs() []envOnlySpec {
 		{
 			key: "graph.rebuildCommits", env: "KDB_GRAPH_REBUILD_COMMITS",
 			scope: ScopeNamespace, mutability: MutabilityNamespaceReopen, unit: "commits",
-			help:  "how many commits may accumulate in memory before they are flushed to a new graph segment. Ignored when graph.file is off",
+			help:  "how many commits may accumulate in memory before they are flushed to a new graph segment (default 50000, ~20 MB). Checked on every commit; the flush runs in the background. Ignored when graph.file is off",
 			parse: count,
 		},
 		{
@@ -723,7 +723,7 @@ func envOnlySpecs() []envOnlySpec {
 		{
 			key: "graph.maxSegments", env: "KDB_GRAPH_MAX_SEGMENTS",
 			scope: ScopeNamespace, mutability: MutabilityNamespaceReopen, unit: "segments",
-			help:  "how many graph segment files may accumulate before the next write rewrites them all as one (a full compaction). Ignored when graph.file is off",
+			help:  "how many graph segment files may accumulate before the smallest are merged even if no size tier is full (default 16). Segments are merged size-tiered regardless; this only bounds their number. Ignored when graph.file is off",
 			parse: count,
 		},
 		{

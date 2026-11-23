@@ -6,21 +6,22 @@ import (
 )
 
 // DefaultGraphRebuildCommits is how many commits may accumulate in the
-// resident tail before the on-disk graph is rebuilt, when the caller has
-// not said.
+// resident tier before they are flushed to a new graph segment, when the
+// caller has not said.
 //
-// 50,000 rather than a round 100,000 because the tail is the part still
-// held the old way: at the 519 bytes per commit measured in
-// docs/kdb-commit-graph-memory.md, a full tail is about 26 MB, which sits
-// alongside the other per-namespace budgets rather than dwarfing them. It
-// is a memory bound expressed as a count, which is only sound because a
-// graph record is fixed width - see GraphSettings.RebuildCommits.
+// At the ~400 bytes a resident commit costs (its record, its index entry and
+// its transaction-index entry), a full tier is about 20 MB, which sits
+// alongside the other per-namespace budgets rather than dwarfing them. It is
+// a memory bound expressed as a count, which is only sound because a graph
+// record is fixed width - see GraphSettings.RebuildCommits.
 const DefaultGraphRebuildCommits = 50_000
 
-// DefaultGraphMaxSegments is how many graph segments may accumulate before the next write is a
-// full rewrite instead of a flush. Each segment is one more binary search on a lookup that misses
-// the resident tier, so this bounds history-read cost; it is not a memory bound.
-const DefaultGraphMaxSegments = 8
+// DefaultGraphMaxSegments is how many graph segments may accumulate before the smallest are merged
+// even though no size tier is full. Size-tiered merging keeps the count logarithmic on its own;
+// this is the backstop. A lookup that misses passes each segment's bloom filter - one cache line -
+// so the count bounds history-read cost far more loosely than it did before the filters, when it
+// was 8 and past it everything was rewritten. It is not a memory bound.
+const DefaultGraphMaxSegments = 16
 
 // DefaultGraphChunkSlots is how many commit records a full resident chunk holds: 4096 of
 // graphRecordSize bytes, 1 MiB. A namespace's first chunk starts at minChunkSlots and doubles to
@@ -101,9 +102,11 @@ type GraphSettings struct {
 	FileEnabled bool
 
 	// RebuildCommits is how many commits may accumulate in the resident
-	// tail before the graph file is rebuilt in the background. This, and
-	// not the namespace's commit count, is what bounds resident graph
-	// memory once FileEnabled is on.
+	// tier before they are flushed to a new segment - checked on every commit
+	// once the embedding runtime has started size-triggered writes
+	// (StartGraphAutoFlush), and by every maintenance pass. This, and not the
+	// namespace's commit count or the maintenance interval, is what bounds
+	// resident graph memory once FileEnabled is on.
 	//
 	// A count rather than a byte budget, unlike DocumentCacheBytes and the
 	// rest, because a graph record is fixed width - so here a count *is* a
@@ -112,8 +115,8 @@ type GraphSettings struct {
 	// off, since there is no file to rebuild.
 	RebuildCommits int
 
-	// MaxSegments is how many segment files may accumulate before the next write is a full
-	// rewrite. Zero means DefaultGraphMaxSegments. Ignored when FileEnabled is off.
+	// MaxSegments is how many segment files may accumulate before the smallest are merged even
+	// if no size tier is full. Zero means DefaultGraphMaxSegments. Ignored when FileEnabled is off.
 	MaxSegments int
 
 	// ChunkBytes is the size of a full resident chunk of commit records (rounded down to whole

@@ -12,7 +12,10 @@ MongoDB; durable writes 0.80-1.13x MongoDB `j:true` (v0.9.4: 0.43-0.69x) with wo
 lower than before D2 and below MongoDB's; concurrent writes under fast durability still
 0.36-0.47x, bound by the per-namespace commit rate (~20-24k/s), which only W8 (several writes per
 commit) gets past. M1 found what holds KDB's memory - the commit graph's
-resident tier, unbounded between maintenance passes - and proposes a fix that needs a design.
+resident tier, unbounded between maintenance passes - and is now fixed (branch
+`perf/rw-m1-graph-memory`, [M1 - measured](#m1---measured)): the commit graph flushes by size and
+merges size-tiered, the container at this workload drops from 1.29 GB to 0.9 GB (MongoDB 7:
+0.6-0.7 GB), write throughput unchanged.
 **Waiting on the user:** W8 (design below, with the decisions it needs). E2 is decided (option 3,
 built; below).
 **W9 (stale premerges) done:** an Upsert's premerge builds on the Upsert of the same document
@@ -393,6 +396,236 @@ compaction that keeps write amplification logarithmic.
 Expected: resident graph memory bounded at a few tens of MiB whatever the write rate, and no
 2x peak at flush; the container at this workload would drop by ~300 MiB, to ~0.9 GB.
 
+### M1 design - the commit graph as an LSM that flushes by size
+
+The graph's resident tier is already a memtable and its segments already SSTables (#159): one
+record format for both, a flush that writes the resident tier as a new segment, a full rewrite as
+the major compaction. What is missing is everything that makes an LSM's memory bounded by size:
+the trigger, a flush that does not copy, a compaction whose cost is logarithmic, and the read
+path that makes many segments cheap. Nothing here changes a segment's bytes, a checkpoint's
+bytes or a wire message.
+
+| piece | Cassandra mechanism | KDB |
+|---|---|---|
+| when to flush | memtable flush when `memtable_heap_space` / `memtable_cleanup_threshold` is reached, not on a timer | the resident tier is flushed when it holds `graph.rebuildCommits` commits (50,000, ~20 MiB) - checked on every commit, run on a goroutine |
+| how a flush reads | the memtable is switched out and flushed while a new one takes writes | the slots a flush reads are frozen; writes go to new slots (copy-on-write); no copy of the tier |
+| which segments merge | SizeTieredCompactionStrategy: buckets of similar size (0.5x-1.5x the bucket mean), `min_threshold` 4, `max_threshold` 32, small files bucketed together | the same rule over record counts; the smallest full bucket merges first |
+| dead records | single-SSTable tombstone compaction past `tombstone_threshold` 0.2 | a segment more than 20% hidden is rewritten alone (today: everything is rewritten when 20% of *all* records are hidden) |
+| major compaction | `nodetool compact`: flush, then compact everything | `CompactGraphFile`: unchanged contract, one full segment |
+| lookups across many files | a bloom filter per SSTable (`bloom_filter_fp_chance` 0.01) | a bloom filter per segment over its commit hashes and transaction ids, built when it is mapped |
+| crash during a compaction | the lifecycle transaction log: new files become live, old ones go, as one step | no new file kind: a merge's inputs are deleted before its output gets its final name (below) |
+
+**Thresholds.** The flush trigger is `graph.rebuildCommits`, the setting that was always
+documented as this bound but was only read by the 5-minute maintenance pass. A commit that takes
+the tier to the threshold starts the namespace's flusher if it is not already running (one
+goroutine, exits when idle - no pool). Commits that may yet be taken back (provisional,
+unlogged, and their descendants) stay resident, as today. The head is flushed like any commit:
+only the first write after a flush finds its parent in a segment. The maintenance pass and
+open still call `MaybeRebuildGraphFile`, now as a backstop. `graph.maxSegments` changes meaning:
+from "rewrite everything past this many" to "past this many, merge the smallest four even if no
+size tier is full"; its default rises from 8 to 16, since bloom filters make a segment that does
+not hold a key nearly free to skip. Expected shape at 10M commits: tiers of ~50k, ~200k, ~800k
+and ~3.2M records, at most three of each waiting, each record rewritten ~4 times in its life
+(log4 of commits / 50k) instead of once per full rewrite.
+
+**The streaming flush.** Today `snapshotForSegment` copies every resident record (256 B plus side
+data) before writing - the 2x. Instead the flush, under the lock, notes `(hash, slot, flags)` for
+each commit it will write (40 B each, sorted outside the lock) and freezes every slot below the
+current high-water mark. While frozen, nothing writes a frozen slot: a write to one (a new
+generation, a re-put with operations) copies the record to a fresh slot first and the old slot is
+freed when the flush ends; deletes free nothing until then; the free list is not reused. Side data
+(messages, octopus parents, attachment roots) is captured by reference - their values are never
+mutated in place. The writer reads the frozen bytes with no lock held. Peak extra memory is the
+40 B list, about a tenth of the tier, instead of all of it. The has-operations flag and
+transaction ownership are decided at the snapshot, as now.
+
+**Lookups while a flush or merge is in flight.** Unchanged in kind: a commit is in exactly one
+place at every instant readers can see. During a flush the commits it writes are still resident
+(their frozen slots are what the index points at); during a merge its inputs are still attached.
+The swap is one critical section under the DAG's write lock: the new segment is attached, the
+flushed commits leave the resident tier (or the inputs leave the segment list), and lookups that
+start after it see the new layout. A flush and a merge can run at the same time - they touch
+disjoint commits, the flush only commits no segment has a record for (as today) and the merge
+only segment records - so a long merge never holds the resident tier above its bound. Attaching a
+merge output costs O(hidden records + generation overrides), not O(records): the records it holds
+are exactly its inputs' visible ones, and only what changed since the merge started (commits
+deleted, generations recomputed) is reconciled. Attaching a flush drops exactly the flushed
+commits' transaction-index entries, instead of probing every segment for every entry.
+
+**Bloom filters.** Every write looks up three things that are almost always absent: its own
+commit hash (twice) and its transaction id (the idempotent-retry check, twice). Today almost all
+history is resident, so these are map misses; once it is flushed they would be misses against
+every segment - a fanout plus interpolation search each, or ~20 probes of the transaction index -
+on the write gate. A split-block bloom filter per segment (~10 bits per key, ~1% false positives,
+pointer-free) answers those misses without touching the mapping: ~2.5 bytes per commit, built in
+the same pass that checks the segment's checksum at open.
+
+**Crash and reopen.** Two supersession rules exist today: segments never share a commit, and a
+full segment supersedes every lower sequence (a crash between a full rewrite's rename and its
+deletes). A partial merge cannot use the second rule, and older readers know no other, so merges
+are ordered so that the files on disk never share a commit:
+
+1. write the output under a temporary name, sync it, attach it in memory;
+2. delete every input the checkpoint on disk does not name;
+3. if no input remains on disk, rename the output to its final name; otherwise rename it to
+   `graph-<seq>.kdbg.pending`, and finish the rename after the next checkpoint (which names the
+   output) has been written and the inputs it replaced have been deleted.
+
+A crash anywhere leaves a disjoint set: before (3) the output is not a segment (a stale temporary
+or pending file, removed at open), and the inputs already deleted were not named by the
+checkpoint, so either their commits are in the checkpoint's resident list or the log (the
+checkpoint path) or every commit is resident (the replay path, where segments only take commits
+out of the heap). The one window with a cost is between a checkpoint naming a pending output and
+the rename: open then finds the `.pending` file, checks its sequence, checksum and count against
+the checkpoint, and renames it - an older reader replays the log instead, which is correct. A
+checkpoint pins the segments it names from the moment it captures them (today only after it is
+written; a background merge could otherwise delete a segment between the two).
+
+`CompactGraphFile` keeps its contract and its file order (rename, then delete or defer the
+inputs): it holds the flush and merge locks, so its output - every segment plus the resident
+tier, one segment marked full - really does supersede every lower sequence, and the existing rule
+still covers a crash after its rename. The first segment a namespace writes is full, as today.
+
+**Compatibility.** Segment layout (v5), checkpoint format and graph references are unchanged, so
+older Go readers open everything a newer one leaves after a clean close, and after any crash too
+(they ignore `.pending` and temporary files; at worst they replay). The Kotlin checkpoint reader
+does not read graph segments at all - a checkpoint with graph references already makes it
+replay - so nothing changes for it.
+
+### M1 - implemented (branch `perf/rw-m1-graph-memory`)
+
+As designed, plus what building it turned up:
+
+- **The flush floor.** The threshold counts from what the last flush could not take (commits held
+  back as provisional or unlogged), not from what was resident when it finished - counting the
+  commits that arrived during the flush stopped the flusher after the first round, and the first
+  test run showed a 500-commit threshold holding 17,678.
+- **Sizing, not copying.** The first streaming flush still allocated 597 B per flushed commit: the
+  entry list grown by `append` (Go grows large slices 1.25x at a time, so the allocations sum to
+  ~5x the final size), the same for the transaction list, and a 1 MiB write buffer. Sized up front
+  and with a 256 KiB buffer it is ~100 B per commit (`TestGraphFlushDoesNotCopyTheResidentTier`
+  pins < 120; a copy of the tier is > 256).
+- **`attachRoot` allocated on every call**, found or not (the variable escaped from inside the
+  `if`): a pre-existing cost on every resident commit read, now only on a hit.
+- **Syncs.** Segments were synced once at the end with `os.File.Sync`, which on macOS is
+  `F_FULLFSYNC` - contrary to the format comment, harmless every 5 minutes, not every few seconds.
+  Now a plain `fsync` on macOS, and on Linux a sync every megabyte as the segment is written
+  (Cassandra's `trickle_fsync`, as D2 does for SSTables), so a flush never queues a whole segment
+  ahead of the commit log's `fdatasync`.
+- **Background writers stop before the close checkpoint** (`StopGraphWork`), so a merge never
+  finishes after the last checkpoint and leaves its output pending for a checkpoint that never
+  comes; a write in flight gives up and leaves everything where it was.
+
+Tests (`go/kdb/dag/graph_lsm_test.go`): the bounded tier (resident never above threshold + one
+batch, < threshold once idle, ~2.8 records written per commit at 20k commits), convergence when
+appends outrun every flush, the flush's allocation, copy-on-write under concurrent re-puts and
+generation rewrites, a random sequence of flushes/merges/major compactions/deletions checked
+against the reader-visible view and the on-disk disjointness invariant after every step,
+size-tiered bucketing, a merge waiting for the checkpoint, the three crash windows reopened
+(old checkpoint, new checkpoint before the rename, replay), capture-time pinning, stopping at
+close, and the bloom filter. `TestGraphResidentTierLongRun` (not `-short`) runs a million commits
+or more (`KDB_GRAPH_LONGRUN`) with the heap sampled.
+
+- **The flush's lock holds.** The first A/B (below) showed throughput unchanged but write p99.9 at
+  32 workers doubled and max tripled: a 50,000-commit flush held the DAG's write lock ~8 ms to note
+  what it takes and ~14 ms to attach the segment. Now the snapshot walks the frozen slots 1,024 at
+  a time, releasing the lock between batches (a frozen record never changes, so a slot whose index
+  entry no longer names it was freed or copied above the freeze), and the attach rebuilds the
+  resident tier from what stays - held-back commits and those admitted since the freeze, all above
+  it (the free list is not reused while frozen, so nothing lands below) - instead of deleting every
+  flushed commit; the flushed commits' transaction-index entries go afterwards, a batch per lock
+  hold. The longest a writer waits for the lock during a 50,000-commit flush: ~14 ms -> 1.2 ms
+  (`TestGraphFlushWriterStall`). The 1.2 ms was the flusher winning the lock straight back
+  between batches (`sync.Mutex` favours the running goroutine until a waiter has waited 1 ms), so
+  a commit waited up to a millisecond at each of its lock acquisitions for the ~15 ms a snapshot
+  took. Sleeping between batches as long as the last one held the lock: 0.25 ms. A GOGC=150 run
+  ruled out the other suspect - more frequent GC (204 cycles over the matrix against 150, the
+  333 MiB of pointer-free records having been ballast) - its tails were no better.
+- **Merges are throttled to 64 MiB/s** - Cassandra's `compaction_throughput` default, for the same
+  reason. Every A/B showed insert max latencies of 30-90 ms against base's 15-20: the insert
+  cells run last, where the run's biggest size-tiered merge lands (four 200k-record segments into
+  one, ~93 MB, nearly a second of a core in one burst on a 4-CPU container). 64 MiB/s is ~8x what
+  merging needs on average at 25k commits/s (2.7 records of ~116 B a commit); flushes, which bound
+  memory, and an operator's `CompactGraphFile` are not throttled.
+- **Two latent defects, found by the server's deepen tests under `KDB_GRAPH_REBUILD_COMMITS=3`**
+  (base passes them only because it never flushed in time; a maintenance flush between a
+  snapshot bootstrap and a deepen hits both in production):
+  - Generation recompute covered only the resident tier, on the premise that nothing arrives
+    below a segment commit. A deepen does exactly that: the history under a snapshot root that
+    was already flushed kept the root's stale generation, and pruned `IsAncestor` answered false.
+    Segments now keep the set of parents they name outside themselves (their EXT sections);
+    storing one of those, or `Unshallow` / `InvalidateGenerations`, makes the next recompute
+    include the segments - O(history), on those rare paths only - writing overrides.
+  - A checkpoint naming segments left unlogged commits out of its resident list only. One
+    flushed between `MarkLogged` and a failed log write's `MarkUnlogged` came back on the next
+    open with no operations to read. Such commits now go in the checkpoint's hidden list (the
+    existing `GraphHidden`; no format change).
+
+### M1 - measured
+
+Final: this branch's head (d2c26fd4, main merged in) against main at 0cd84dc5 (#345-#354, E2
+included). rwcompare matrix at 100k documents, `ab.sh`, two alternating passes per binary, run
+from a frozen worktree's harness under the benchmark lock; reads are the control.
+
+**Memory, after the full matrix sequence** (load + read/update/mixed50/insert at 1/8/32, ~820k
+commits, fast durability, 3 GB container; peaks sampled every 2 s during the run):
+
+| | main | M1 |
+|---|--:|--:|
+| `docker stats`, end / peak | 1,292 / 1,291 MiB | 906 / 913 MiB |
+| cgroup anon (Go heap + runtime) | 1,205 MiB | 851 MiB |
+| Go heap (`kdb_go_heap_alloc_bytes`) | 1,006 MiB | 733 MiB |
+| VmHWM (peak RSS) | 1,374 MiB | 1,184 MiB |
+| commit graph, end / peak | 333 / 333 MiB | 3.5 / 19.8 MiB |
+| GC cycles over the run | 155 | 183 |
+
+The container drops ~385 MiB (and ~425 MiB in the earlier rounds against 305dbb9a: 1,289 -> 861),
+more than the ~300 the M1 measurement predicted - the tier's index and transaction-index entries
+went with it. Every other structure is the same size or smaller. KDB at this workload is now at
+~0.9 GB against MongoDB 7's 0.6-0.7 GB.
+
+**Throughput** (m1/main; c = 1 / 8 / 32):
+
+| cell | fast | durable |
+|---|--:|--:|
+| read | 1.22 / 1.07 / 0.96 | 1.02 / 0.99 / 0.99 |
+| update | 0.99 / 0.99 / 0.98 | 0.94 / 0.93 / 0.96 |
+| mixed50 | 0.98 / 1.00 / 0.98 | 1.06 / 1.04 / 0.98 |
+| insert | 0.96 / 1.00 / 1.00 | 1.05 / 1.06 / 0.99 |
+
+Write cells' geometric mean: fast 0.987, durable 1.000. Write throughput: unchanged. (The first
+durable run of this pair was discarded: another job's disk traffic swung the control reads 50%
+between passes; the rerun above had load 5-6 and reads within 2%.) One cell to watch: durable
+update@8 averaged 0.955 over the four clean durable rounds (0.98, 0.93, 0.98, 0.93) while durable
+inserts averaged 1.016 - plausibly the graph's own syncs (~280 B a commit, a sync every MiB)
+sharing the device with the commit log's `fdatasync`. The follow-up, if it proves real: sync a
+segment only when a checkpoint is about to name it (one sync per checkpoint for everything flushed
+since), which a torn unsynced segment already tolerates - it fails its checksum and is rewritten.
+Tails at 32 workers (fast, write p99.9 per pass): update 7.7 / 7.8 ms against main's 7.7 / 7.2,
+insert 11.6 / 13.6 against 13.4 / 16.6, mixed50 9.5 / 14.3 against 7.9 / 8.7; p99 unchanged.
+
+**How the tails got there** (earlier rounds, each against 305dbb9a, two passes each):
+
+| build | update@32 fast p99.9 / max (ms) | what changed |
+|---|---|---|
+| base | 8.0-9.1 / 13-23 | |
+| first cut | 16.8, 14.8 / 36, 41 | a 50k flush held the DAG lock ~8 ms, then ~14 ms |
+| batched snapshot, attach O(survivors) | 12.9, 14.3 / 31, 29 | longest writer wait 14 -> 1.2 ms |
+| + sleep between batches | 9.1, 9.5 / 34, 19 | 1.2 -> 0.25 ms; fast inserts still 0.93-0.94x, insert max 30-90 ms |
+| + merges throttled to 64 MiB/s (final) | 7.7, 7.8 / 17, 16 (vs main) | inserts 1.00x |
+
+Write-cell geomeans of those rounds (fast / durable): 0.982 / 0.990, 0.986 / 0.976, 0.990 /
+1.020. What it was not: GC. M1 runs 18-36% more GC cycles over the matrix - the 333 MiB of
+pointer-free records were ballast under GOGC's trigger - but M1 with `GOGC=150`, which brings the
+cadence back, had no better tails (update@32 p99.9 13.5 / 13.1 ms against M1's 11.1 / 10.2).
+
+**Long run** (`KDB_GRAPH_LONGRUN=2000000 go test ./kdb/dag -run TestGraphResidentTierLongRun`,
+the default 50,000-commit threshold, heap sampled every 20 ms): 2,000,000 commits; the resident
+tier between 49,490 and 50,000 commits at every sample, the commit graph's heap 19-24 MiB at the
+samples and 31-34 MiB at its peak, heap in use 22-98 MiB with no doubling at a flush; 2.40 records
+written per commit with merges throttled (2.68 without); 4-8 segments, 216 MiB on disk. Before M1
+the same run would have held all 2,000,000 resident (~800 MB).
+
 ## Not done yet - the plan
 
 | # | item | Cassandra mechanism | expected | status |
@@ -400,7 +633,7 @@ Expected: resident graph memory bounded at a few tens of MiB whatever the write 
 | W8 | **Several writes per commit**: the only way past the per-namespace commit rate (~22-25k/s) | commit-log group sync + applying a batch of mutations as one update | concurrent writes towards MongoDB's 46-60k/s | **design below; needs the user's decisions before any code** |
 | E2 | Embedded cache default: fixed 64 MiB vs machine-sized | caches sized from the heap | embedded reads with hot data > 64 MiB | **decided: option 3, built (below)** |
 | W9 | **Stale premerges** (from the W7 profile): a zipfian-hot document is often written again between an Upsert's premerge and its turn at the gate, so the gate re-merged it - 18% of writes, 11% of gate time at update@32 | `AtomicBTreePartition` retries its CAS before taking the lock (the retry); building on the Upsert queued ahead has no Cassandra counterpart | up to ~10% of gate time on hot keys | **done (below): stale 17.7% -> 0.9%, gate CPU per commit -25%** |
-| M1 | Bound the commit graph's resident tier: flush by size, merge graph segments size-tiered, stream the flush | memtable flush on heap space; SizeTieredCompactionStrategy | ~300 MiB less at this workload, no 2x flush peak, bounded at any write rate | measured and diagnosed (M1 above); needs a design pass on the graph file (#159) |
+| M1 | Bound the commit graph's resident tier: flush by size, merge graph segments size-tiered, stream the flush | memtable flush on heap space; SizeTieredCompactionStrategy; per-SSTable bloom filters; trickle_fsync | ~300 MiB less at this workload, no 2x flush peak, bounded at any write rate | **done** (#356): 1,292 -> 906 MiB, graph 333 -> 20 MiB, writes unchanged; see [M1 - measured](#m1---measured) |
 
 ### W8 - several writes per commit (design; not implemented)
 

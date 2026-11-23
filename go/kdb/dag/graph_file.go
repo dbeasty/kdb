@@ -1,15 +1,12 @@
 package dag
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
-	"io"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,18 +21,20 @@ import (
 // A namespace's graph on disk is a set of segment files in one directory, each a sorted run of
 // commits, mapped rather than read, so a million-commit history costs page cache the kernel can
 // evict instead of heap the collector has to trace. The scheme is an LSM's, the way Cassandra
-// does it:
+// does it (graph_attach.go has the policy):
 //
-//   - a flush writes the resident tier, and only it, as a new small segment - O(new commits);
+//   - a flush writes the resident tier, and only it, as a new small segment - O(new commits) -
+//     when the tier reaches its size bound;
+//   - a merge rewrites segments of similar size as one, size-tiered, dropping records for commits
+//     that have since been deleted;
 //   - a full rewrite merges every segment and the resident tier into one segment marked full,
-//     which supersedes every segment with a lower sequence number - the major compaction. It is
-//     what drops records for commits that have since been deleted, and what keeps the number of
-//     segments a lookup has to search small.
+//     which supersedes every segment with a lower sequence number - the major compaction.
 //
-// Segments never share a commit: a flush writes only commits no segment holds, and a full
-// segment replaces the ones below it. The one window where two could - a crash after a full
-// rewrite's rename and before the old segments are deleted - is closed at the next open, which
-// ignores (and, when writable, deletes) anything a full segment supersedes.
+// Segments never share a commit: a flush writes only commits no segment holds, and a merge's
+// output takes its final name only once no input is left on disk (graph_attach.go, mergeOnce). The
+// one window where two could - a crash after a full rewrite's rename and before the old segments
+// are deleted - is closed at the next open, which ignores (and, when writable, deletes) anything a
+// full segment supersedes.
 //
 // Every segment is a cache and never an authority: derived from the DAG, checked end to end on
 // mapping, and anything wrong with it means the DAG keeps holding those commits itself.
@@ -81,8 +80,10 @@ import (
 // step an array index within a segment instead of a hash search.
 //
 // Durability: the writer syncs the file and its directory, but plainly, not with the store's
-// full-flush primitive. It does not need to - a segment torn by a crash fails its checksum and is
-// rebuilt - and a full flush of a file this size would stall every neighbouring writer on macOS.
+// full-flush primitive (graph_sync_*.go). It does not need to - a segment torn by a crash fails its
+// checksum and is rebuilt - and a full flush every few seconds would stall every neighbouring
+// writer on macOS. On Linux it syncs every megabyte as it writes (Cassandra's trickle_fsync), so
+// no single sync queues a whole segment ahead of the commit log's.
 
 const (
 	graphMagic   = "KDBGRAF4"
@@ -197,6 +198,18 @@ type graphBase struct {
 	fanout    [256]uint32
 	fileBytes int64
 	crc       uint32 // the footer checksum: the segment's identity in a checkpoint's reference
+	// bloom answers "certainly not here" for commit hashes and transaction ids (graph_bloom.go).
+	bloom graphBloom
+
+	// diskPath is where the file is now: path, or - for a merge output whose inputs a checkpoint
+	// still names - path+graphPendingSuffix until they are gone (see graph_attach.go). waitsOn is
+	// the sequence numbers of those inputs (and of any they waited on), which are still on disk
+	// and share records with this one.
+	diskPath string
+	waitsOn  []uint64
+	// hiddenRecs is how many of this segment's records the DAG no longer holds (nodeStore.hidden):
+	// what decides a tombstone rewrite. Guarded by the DAG's mu, like the overlay it counts.
+	hiddenRecs int
 }
 
 // openGraphBase maps path and checks it end to end. The returned base holds one reference on the
@@ -211,7 +224,7 @@ func openGraphBase(path, namespaceID string) (*graphBase, error) {
 		m.Close()
 		return nil, err
 	}
-	b := &graphBase{path: path, mapping: m, region: r, fileBytes: int64(m.Size())}
+	b := &graphBase{path: path, diskPath: path, mapping: m, region: r, fileBytes: int64(m.Size())}
 	if err := b.parse(namespaceID); err != nil {
 		b.close()
 		return nil, fmt.Errorf("%w: %s: %v", errGraphFile, path, err)
@@ -287,8 +300,28 @@ func (b *graphBase) parse(namespaceID string) error {
 	if int(b.fanout[255]) != b.count {
 		return errors.New("fanout disagrees with record count")
 	}
+	b.buildBloom()
 	return nil
 }
+
+// buildBloom fills the filter from the segment's own commit hashes and every record's
+// transaction id (a superset of the transaction index, which holds only the ids a record owns).
+// Sequential over OIDS and CDAT, just after the checksum pass read the same pages.
+func (b *graphBase) buildBloom() {
+	b.bloom = newGraphBloom(2 * b.count)
+	oids, cdat := b.sec[secOIDS], b.sec[secCDAT]
+	for pos := 0; pos < b.count; pos++ {
+		b.bloom.add(bloomKeyHashBytes(oids[pos*32:]))
+		r := cdat[pos*cdatSize:]
+		b.bloom.add(bloomKeyTx(codec.UUID{MSB: int64(le.Uint64(r[cdatTxMSB:])), LSB: int64(le.Uint64(r[cdatTxLSB:]))}))
+	}
+}
+
+// mayHold reports whether this segment can have a record for h; false is certain.
+func (b *graphBase) mayHold(h *codec.Hash) bool { return b.bloom.has(bloomKeyHash(h)) }
+
+// mayHoldTx reports whether a record here can have transaction id tx; false is certain.
+func (b *graphBase) mayHoldTx(tx codec.UUID) bool { return b.bloom.has(bloomKeyTx(tx)) }
 
 func (b *graphBase) close() {
 	if b.region != nil {
@@ -344,21 +377,27 @@ func (b *graphBase) resolveRef(ref uint32) codec.Hash {
 
 // forEachParent calls fn with each parent of the commit at pos, in order, until fn returns false.
 func (b *graphBase) forEachParent(pos int, fn func(codec.Hash) bool) {
+	b.forEachParentRef(pos, func(ref uint32) bool { return fn(b.resolveRef(ref)) })
+}
+
+// forEachParentRef calls fn with each parent reference of the commit at pos - a position here, or
+// refExternal and an index into EXT - in order, until fn returns false.
+func (b *graphBase) forEachParentRef(pos int, fn func(uint32) bool) {
 	r := b.cdat(pos)
 	n := int(le.Uint16(r[cdatNParents:]))
 	if n == 0 {
 		return
 	}
-	if !fn(b.resolveRef(le.Uint32(r[cdatParent0:]))) || n == 1 {
+	if !fn(le.Uint32(r[cdatParent0:])) || n == 1 {
 		return
 	}
 	if n == 2 {
-		fn(b.resolveRef(le.Uint32(r[cdatParent1:])))
+		fn(le.Uint32(r[cdatParent1:]))
 		return
 	}
 	edge := int(le.Uint32(r[cdatParent1:]))
 	for i := 0; i < n-1; i++ {
-		if !fn(b.resolveRef(le.Uint32(b.sec[secEdge][(edge+i)*4:]))) {
+		if !fn(le.Uint32(b.sec[secEdge][(edge+i)*4:])) {
 			return
 		}
 	}
@@ -515,276 +554,9 @@ type graphSource struct {
 
 func (s *graphSource) hash() []byte { return s.rec[grHash : grHash+32] }
 
-// graphTx is one transaction-index entry to write.
-type graphTx struct {
-	key  [16]byte
-	hash codec.Hash
-}
-
-// writeGraphSegment writes a segment from the stream open returns - records in ascending hash
-// order and transaction entries in ascending key order - as segment seq in dir, through a
-// temporary file renamed into place, so a reader only ever maps a complete segment. open is
-// called twice: once to learn every commit's position, once to write, so the merge is never
-// materialized whole. Returns the new segment's path.
-func writeGraphSegment(dir, namespaceID string, seq uint64, full bool, open func() (func() (graphSource, bool), func() (graphTx, bool))) (path string, err error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
-	}
-	// Pass 1: positions. 32 bytes a commit, for the length of the write.
-	var oids []codec.Hash
-	{
-		next, _ := open()
-		for {
-			src, ok := next()
-			if !ok {
-				break
-			}
-			var h codec.Hash
-			copy(h.Bytes[:], src.hash())
-			if n := len(oids); n > 0 && bytes.Compare(oids[n-1].Bytes[:], h.Bytes[:]) >= 0 {
-				return "", fmt.Errorf("dag: graph segment records out of order at %s", h.Hex())
-			}
-			oids = append(oids, h)
-		}
-	}
-	posOf := func(h codec.Hash) (int, bool) {
-		i := sort.Search(len(oids), func(i int) bool { return bytes.Compare(oids[i].Bytes[:], h.Bytes[:]) >= 0 })
-		return i, i < len(oids) && oids[i] == h
-	}
-
-	path = filepath.Join(dir, graphSegmentName(seq))
-	tmp, err := os.CreateTemp(dir, graphSegmentName(seq)+".tmp*")
-	if err != nil {
-		return "", err
-	}
-	defer func() {
-		if err != nil {
-			tmp.Close()
-			os.Remove(tmp.Name())
-		}
-	}()
-	crc := crc32.New(crcTable)
-	bw := bufio.NewWriterSize(io.MultiWriter(tmp, crc), 1<<20)
-	var off int64
-	write := func(p []byte) {
-		if err == nil {
-			_, err = bw.Write(p)
-			off += int64(len(p))
-		}
-	}
-	var secs [secCount][2]int64
-	begin := func(s int) { secs[s][0] = off }
-	end := func(s int) { secs[s][1] = off - secs[s][0] }
-
-	var hdr [graphHeaderFixed]byte
-	copy(hdr[:8], graphMagic)
-	le.PutUint32(hdr[8:], graphVersion)
-	if full {
-		le.PutUint32(hdr[12:], graphFlagFull)
-	}
-	le.PutUint64(hdr[16:], seq)
-	le.PutUint32(hdr[24:], uint32(len(namespaceID)))
-	write(hdr[:])
-	write([]byte(namespaceID))
-	if pad := (8 - off%8) % 8; pad > 0 {
-		write(make([]byte, pad))
-	}
-
-	begin(secOIDS)
-	var fanout [256]uint32
-	for _, h := range oids {
-		write(h.Bytes[:])
-		fanout[h.Bytes[0]]++
-	}
-	end(secOIDS)
-	for i := 1; i < 256; i++ {
-		fanout[i] += fanout[i-1]
-	}
-
-	// Pass 2: rows, with the tables they index built as they go.
-	var (
-		authors   []byte
-		authorIdx = map[codec.UUID]uint32{}
-		schemas   []byte
-		schemaIdx = map[codec.Hash]uint16{}
-		ext       []byte
-		extIdx    = map[codec.Hash]uint32{}
-		edges     []byte
-		xpos      []byte
-		msgi      []byte
-		msgs      bytes.Buffer
-		attr      []byte
-	)
-	ref := func(h codec.Hash) (uint32, bool) {
-		if p, ok := posOf(h); ok {
-			return uint32(p), false
-		}
-		i, ok := extIdx[h]
-		if !ok {
-			i = uint32(len(ext) / 32)
-			extIdx[h] = i
-			ext = append(ext, h.Bytes[:]...)
-		}
-		return refExternal | i, true
-	}
-	begin(secCDAT)
-	next, nextTx := open()
-	var row [cdatSize]byte
-	for pos := 0; ; pos++ {
-		src, ok := next()
-		if !ok {
-			break
-		}
-		if pos >= len(oids) || !bytes.Equal(src.hash(), oids[pos].Bytes[:]) {
-			return "", errors.New("dag: graph segment source changed between passes")
-		}
-		r := src.rec[:]
-		row = [cdatSize]byte{}
-		copy(row[cdatTree:], r[grTree:grTree+32])
-		copy(row[cdatTxMSB:], r[grTxMSB:grTxMSB+16])
-		le.PutUint32(row[cdatGen:], recGeneration(r))
-		le.PutUint64(row[cdatEpochMs:], le.Uint64(r[grEpochMs:]))
-		le.PutUint16(row[cdatMicro:], uint16(le.Uint64(r[grMicro:])))
-		author := codec.UUID{MSB: int64(le.Uint64(r[grAuthMSB:])), LSB: int64(le.Uint64(r[grAuthLSB:]))}
-		ai, ok := authorIdx[author]
-		if !ok {
-			ai = uint32(len(authors) / 16)
-			authorIdx[author] = ai
-			var a [16]byte
-			binary.BigEndian.PutUint64(a[:8], uint64(author.MSB))
-			binary.BigEndian.PutUint64(a[8:], uint64(author.LSB))
-			authors = append(authors, a[:]...)
-		}
-		le.PutUint32(row[cdatAuthor:], ai)
-		if le.Uint32(r[grFlags:])&grFlagSchema != 0 {
-			var sh codec.Hash
-			copy(sh.Bytes[:], r[grSchema:grSchema+32])
-			si, ok := schemaIdx[sh]
-			if !ok {
-				si = uint16(len(schemas)/32) + 1
-				schemaIdx[sh] = si
-				schemas = append(schemas, sh.Bytes[:]...)
-			}
-			le.PutUint16(row[cdatSchema:], si)
-		}
-		if recHasOps(r) {
-			le.PutUint16(row[cdatFlags:], cdatFlagHasOps)
-		}
-		p0, p1, n := recParents01(r)
-		le.PutUint16(row[cdatNParents:], uint16(n))
-		le.PutUint32(row[cdatParent0:], refNone)
-		le.PutUint32(row[cdatParent1:], refNone)
-		external := false
-		if n > 0 {
-			rf, x := ref(p0)
-			external = external || x
-			le.PutUint32(row[cdatParent0:], rf)
-		}
-		switch {
-		case n == 2:
-			rf, x := ref(p1)
-			external = external || x
-			le.PutUint32(row[cdatParent1:], rf)
-		case n > 2:
-			le.PutUint32(row[cdatParent1:], uint32(len(edges)/4))
-			for _, p := range append([]codec.Hash{p1}, src.extra...) {
-				rf, x := ref(p)
-				external = external || x
-				edges = le.AppendUint32(edges, rf)
-			}
-		}
-		if external {
-			xpos = le.AppendUint32(xpos, uint32(pos))
-		}
-		if src.attach != nil {
-			attr = le.AppendUint32(attr, uint32(pos))
-			attr = append(attr, src.attach.Bytes[:]...)
-		}
-		if src.msg != "" {
-			msgi = le.AppendUint32(msgi, uint32(pos))
-			msgi = le.AppendUint32(msgi, uint32(msgs.Len()))
-			msgi = le.AppendUint32(msgi, uint32(len(src.msg)))
-			msgs.WriteString(src.msg)
-		}
-		write(row[:])
-	}
-	end(secCDAT)
-
-	begin(secTIDX)
-	txCount := 0
-	var prevKey [16]byte
-	for {
-		t, ok := nextTx()
-		if !ok {
-			break
-		}
-		if txCount > 0 && bytes.Compare(prevKey[:], t.key[:]) >= 0 {
-			continue // first writer wins, matching txIndex
-		}
-		pos, ok := posOf(t.hash)
-		if !ok {
-			continue // its commit is not in this segment
-		}
-		prevKey = t.key
-		var e [4]byte
-		le.PutUint32(e[:], uint32(pos))
-		write(e[:])
-		txCount++
-	}
-	end(secTIDX)
-
-	begin(secFanout)
-	var fb [4]byte
-	for _, v := range fanout {
-		le.PutUint32(fb[:], v)
-		write(fb[:])
-	}
-	end(secFanout)
-	for _, s := range []struct {
-		id   int
-		data []byte
-	}{{secAuth, authors}, {secSchm, schemas}, {secExt, ext}, {secEdge, edges}, {secXPos, xpos}, {secMsgI, msgi}, {secMsgs, msgs.Bytes()}, {secAttr, attr}} {
-		begin(s.id)
-		write(s.data)
-		end(s.id)
-	}
-
-	var foot [graphFooterSize]byte
-	for i := 0; i < secCount; i++ {
-		le.PutUint64(foot[i*20:], uint64(secs[i][0]))
-		le.PutUint64(foot[i*20+8:], uint64(secs[i][1]))
-		le.PutUint32(foot[i*20+16:], sectionCodecPlain)
-	}
-	le.PutUint64(foot[secCount*20:], uint64(len(oids)))
-	le.PutUint64(foot[secCount*20+8:], uint64(txCount))
-	write(foot[:graphFooterSize-8])
-	if err != nil {
-		return "", err
-	}
-	if err = bw.Flush(); err != nil {
-		return "", err
-	}
-	le.PutUint32(foot[graphFooterSize-8:], crc.Sum32())
-	le.PutUint32(foot[graphFooterSize-4:], graphFooterMagic)
-	if _, err = tmp.Write(foot[graphFooterSize-8:]); err != nil {
-		return "", err
-	}
-	if err = tmp.Sync(); err != nil {
-		return "", err
-	}
-	if err = tmp.Close(); err != nil {
-		return "", err
-	}
-	if err = os.Rename(tmp.Name(), path); err != nil {
-		return "", err
-	}
-	syncGraphDir(dir)
-	return path, nil
-}
-
 func syncGraphDir(dir string) {
 	if d, err := os.Open(dir); err == nil {
-		d.Sync()
+		syncGraphFile(d) // plainly, as the files themselves - see graph_sync_darwin.go
 		d.Close()
 	}
 }
