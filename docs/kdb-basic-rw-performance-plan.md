@@ -14,7 +14,7 @@ lower than before D2 and below MongoDB's; concurrent writes under fast durabilit
 commit) gets past. M1 found what holds KDB's memory - the commit graph's
 resident tier, unbounded between maintenance passes - and is now fixed (branch
 `perf/rw-m1-graph-memory`, [M1 - measured](#m1---measured)): the commit graph flushes by size and
-merges size-tiered, the container at this workload drops from 1.29 GB to 0.86 GB (MongoDB 7:
+merges size-tiered, the container at this workload drops from 1.29 GB to 0.9 GB (MongoDB 7:
 0.6-0.7 GB), write throughput unchanged.
 **Waiting on the user:** W8 (design below, with the decisions it needs). E2 is decided (option 3,
 built; below).
@@ -560,65 +560,68 @@ or more (`KDB_GRAPH_LONGRUN`) with the heap sampled.
 
 ### M1 - measured
 
-Base: `perf/rw-docs-results` (305dbb9a, now on main as #353). rwcompare matrix at 100k documents,
-`ab.sh`, two alternating passes per binary, the frozen base worktree's harness; this Mac's load
-was 8-13 throughout (another project's `llama-server` held 3-4 cores), the same for both binaries.
+Final: this branch's head (d2c26fd4, main merged in) against main at 0cd84dc5 (#345-#354, E2
+included). rwcompare matrix at 100k documents, `ab.sh`, two alternating passes per binary, run
+from a frozen worktree's harness under the benchmark lock; reads are the control.
 
-**Memory, after the full matrix sequence** (`mem.sh`-style: load + read/update/mixed50/insert at
-1/8/32, ~820k commits, fast durability; peaks sampled every 2 s during the run):
+**Memory, after the full matrix sequence** (load + read/update/mixed50/insert at 1/8/32, ~820k
+commits, fast durability, 3 GB container; peaks sampled every 2 s during the run):
 
-| | base | M1 |
+| | main | M1 |
 |---|--:|--:|
-| `docker stats` at the end | 1,289 MiB | 861-864 MiB |
-| cgroup anon (Go heap + runtime) | 1,264 MiB | 807 MiB |
-| Go heap in use (`kdb_go_heap_alloc_bytes`) | 1,085 MiB | 698 MiB |
-| VmHWM (peak RSS) | 1,365 MiB | 1,129 MiB |
-| commit graph, at the end | 333 MiB | 21 MiB |
-| commit graph, peak during the run | 333 MiB | 21 MiB |
-| GC cycles over the run | 150 | 204 |
+| `docker stats`, end / peak | 1,292 / 1,291 MiB | 906 / 913 MiB |
+| cgroup anon (Go heap + runtime) | 1,205 MiB | 851 MiB |
+| Go heap (`kdb_go_heap_alloc_bytes`) | 1,006 MiB | 733 MiB |
+| VmHWM (peak RSS) | 1,374 MiB | 1,184 MiB |
+| commit graph, end / peak | 333 / 333 MiB | 3.5 / 19.8 MiB |
+| GC cycles over the run | 155 | 183 |
 
-The container drops ~425 MiB, more than the 300 the M1 measurement predicted: the tier's index
-and transaction-index entries went with it. Every other structure is the same size or smaller
-(the live tree 75 -> 65 MiB).
-KDB at this workload now sits at ~0.86 GB against MongoDB 7's 0.6-0.7 GB.
+The container drops ~385 MiB (and ~425 MiB in the earlier rounds against 305dbb9a: 1,289 -> 861),
+more than the ~300 the M1 measurement predicted - the tier's index and transaction-index entries
+went with it. Every other structure is the same size or smaller. KDB at this workload is now at
+~0.9 GB against MongoDB 7's 0.6-0.7 GB.
 
-**Throughput, final binary** (ops/s means; per-pass values in parentheses; reads are the control):
+**Throughput** (m1/main; c = 1 / 8 / 32):
 
-| cell | c | fast m1/base | durable m1/base |
-|---|--:|--:|--:|
-| read | 1 / 8 / 32 | 1.09 / 1.03 / 0.98 | 0.96 / 1.00 / 1.01 |
-| update | 1 / 8 / 32 | 1.01 / 1.02 / 1.00 | 0.96 / 0.93 / 0.98 |
-| mixed50 | 1 / 8 / 32 | 1.01 / 0.99 / 0.98 | 0.94 / 0.96 / 0.99 |
-| insert | 1 / 8 / 32 | 0.93 / 0.97 / 0.97 | 1.01 / 1.03 / 0.99 |
-| load | 32 | 1.08 | 1.02 |
+| cell | fast | durable |
+|---|--:|--:|
+| read | 1.22 / 1.07 / 0.96 | 1.02 / 0.99 / 0.99 |
+| update | 0.99 / 0.99 / 0.98 | 0.94 / 0.93 / 0.96 |
+| mixed50 | 0.98 / 1.00 / 0.98 | 1.06 / 1.04 / 0.98 |
+| insert | 0.96 / 1.00 / 1.00 | 1.05 / 1.06 / 0.99 |
 
-Write cells' geometric mean: 0.986 (fast) and 0.976 (durable) in this A/B, 0.982 and 0.990 in the
-first (the binary before the lock-hold fix); reads' 1.032 and 0.990, then 0.960 and 0.969. No cell
-moved the same way by more than 5% in both A/Bs except insert@1 fast (0.94, 0.93), whose base
-passes themselves spread 8%. Write throughput: unchanged.
+Write cells' geometric mean: fast 0.987, durable 1.000. Write throughput: unchanged. (The first
+durable run of this pair was discarded: another job's disk traffic swung the control reads 50%
+between passes; the rerun above had load 5-6 and reads within 2%.) One cell to watch: durable
+update@8 averaged 0.955 over the four clean durable rounds (0.98, 0.93, 0.98, 0.93) while durable
+inserts averaged 1.016 - plausibly the graph's own syncs (~280 B a commit, a sync every MiB)
+sharing the device with the commit log's `fdatasync`. The follow-up, if it proves real: sync a
+segment only when a checkpoint is about to name it (one sync per checkpoint for everything flushed
+since), which a torn unsynced segment already tolerates - it fails its checksum and is rewritten.
+Tails at 32 workers (fast, write p99.9 per pass): update 7.7 / 7.8 ms against main's 7.7 / 7.2,
+insert 11.6 / 13.6 against 13.4 / 16.6, mixed50 9.5 / 14.3 against 7.9 / 8.7; p99 unchanged.
 
-**Tails at 32 workers** (write p99.9 / max, ms, the two passes):
+**How the tails got there** (earlier rounds, each against 305dbb9a, two passes each):
 
-| cell | base | M1 before the lock fix | M1 |
-|---|---|---|---|
-| update fast | 9.1/23, 8.7/19 (first A/B: 8.0/13, 7.9/13) | 16.8/36, 14.8/41 | 12.9/31, 14.3/29 |
-| mixed50 fast | 10.5/36, 9.1/44 | 16.9/51, 22.7/80 | 16.7/41, 17.7/42 |
-| update durable | 8.5/15, 7.6/22 | 16.7/36, 14.7/39 | 12.3/20, 13.0/31 |
+| build | update@32 fast p99.9 / max (ms) | what changed |
+|---|---|---|
+| base | 8.0-9.1 / 13-23 | |
+| first cut | 16.8, 14.8 / 36, 41 | a 50k flush held the DAG lock ~8 ms, then ~14 ms |
+| batched snapshot, attach O(survivors) | 12.9, 14.3 / 31, 29 | longest writer wait 14 -> 1.2 ms |
+| + sleep between batches | 9.1, 9.5 / 34, 19 | 1.2 -> 0.25 ms; fast inserts still 0.93-0.94x, insert max 30-90 ms |
+| + merges throttled to 64 MiB/s (final) | 7.7, 7.8 / 17, 16 (vs main) | inserts 1.00x |
 
-p99 is unchanged (4-5 ms either way); p99.9 is still ~1.5x base after the lock fix.
-What it was not: GC. M1 runs 36% more GC cycles over the matrix (204 against 150) - the 333 MiB
-of pointer-free records it removed were ballast that raised GOGC's trigger - but M1 with
-`GOGC=150`, which brings the cadence back, had no better tails (c=32 only, two passes, load 5-7:
-update p99.9 13.5/13.1 ms against M1's 11.1/10.2 and base's 8.0/8.9). What was left is the flush's
-batched snapshot letting the flusher win the lock back between batches; see the yield above, and
-the final A/B below.
+Write-cell geomeans of those rounds (fast / durable): 0.982 / 0.990, 0.986 / 0.976, 0.990 /
+1.020. What it was not: GC. M1 runs 18-36% more GC cycles over the matrix - the 333 MiB of
+pointer-free records were ballast under GOGC's trigger - but M1 with `GOGC=150`, which brings the
+cadence back, had no better tails (update@32 p99.9 13.5 / 13.1 ms against M1's 11.1 / 10.2).
 
 **Long run** (`KDB_GRAPH_LONGRUN=2000000 go test ./kdb/dag -run TestGraphResidentTierLongRun`,
-the default 50,000-commit threshold, heap sampled every 20 ms): 2,000,000 commits in 3.3 s; the
-resident tier between 49,490 and 50,000 commits at every sample, the commit graph's heap 19-24
-MiB at the samples and 31 MiB at its peak, heap in use 22-90 MiB with no doubling at a flush;
-2.68 records written per commit; 6-8 segments, 216 MiB on disk. Before M1 the same run would have
-held all 2,000,000 resident (~800 MB).
+the default 50,000-commit threshold, heap sampled every 20 ms): 2,000,000 commits; the resident
+tier between 49,490 and 50,000 commits at every sample, the commit graph's heap 19-24 MiB at the
+samples and 31-34 MiB at its peak, heap in use 22-98 MiB with no doubling at a flush; 2.40 records
+written per commit with merges throttled (2.68 without); 4-8 segments, 216 MiB on disk. Before M1
+the same run would have held all 2,000,000 resident (~800 MB).
 
 ## Not done yet - the plan
 
@@ -627,7 +630,7 @@ held all 2,000,000 resident (~800 MB).
 | W8 | **Several writes per commit**: the only way past the per-namespace commit rate (~22-25k/s) | commit-log group sync + applying a batch of mutations as one update | concurrent writes towards MongoDB's 46-60k/s | **design below; needs the user's decisions before any code** |
 | E2 | Embedded cache default: fixed 64 MiB vs machine-sized | caches sized from the heap | embedded reads with hot data > 64 MiB | **decided: option 3, built (below)** |
 | W9 | **Stale premerges** (new, from the W7 profile): a zipfian-hot document is often written again between an Upsert's premerge and its turn at the gate, so the gate re-merges it - 11% of gate time at update@32. Merge faster at the gate: one parse of the stored body instead of several - the merge is of top-level keys only | `AtomicBTreePartition` retries its CAS before taking the lock | up to ~10% of gate time on hot keys | low (faster merge) |
-| M1 | Bound the commit graph's resident tier: flush by size, merge graph segments size-tiered, stream the flush | memtable flush on heap space; SizeTieredCompactionStrategy; per-SSTable bloom filters; trickle_fsync | ~300 MiB less at this workload, no 2x flush peak, bounded at any write rate | **done** on `perf/rw-m1-graph-memory`: 1,289 -> 861 MiB, graph 333 -> 21 MiB, writes 0.98x (noise); see [M1 - measured](#m1---measured) |
+| M1 | Bound the commit graph's resident tier: flush by size, merge graph segments size-tiered, stream the flush | memtable flush on heap space; SizeTieredCompactionStrategy; per-SSTable bloom filters; trickle_fsync | ~300 MiB less at this workload, no 2x flush peak, bounded at any write rate | **done** (#356): 1,292 -> 906 MiB, graph 333 -> 20 MiB, writes unchanged; see [M1 - measured](#m1---measured) |
 
 ### W8 - several writes per commit (design; not implemented)
 
