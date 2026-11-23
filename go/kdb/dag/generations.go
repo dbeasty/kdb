@@ -23,6 +23,12 @@ func (d *InMemoryCommitDag) storeCommitLocked(c document.Commit) {
 	if c.AttachmentTreeHash != nil {
 		d.sawAttachments = true
 	}
+	if d.nodes.isExternalParent(c.Hash) {
+		// A segment already holds a child of this commit: history arriving below what was
+		// flushed. Those children's generations were derived without it.
+		d.genStale = true
+		d.genStaleSegments = true
+	}
 	gen := uint32(0)
 	if d.graph.AncestryPruning {
 		gen = d.deriveGenerationLocked(c)
@@ -127,16 +133,28 @@ func (d *InMemoryCommitDag) recomputeGenerationsLocked() {
 		active    = 1
 		done      = 2
 	)
-	// Only the resident tier is recomputed. Graph segments are written after
-	// ensureGenerationsLocked and nothing below them can arrive late, so their
-	// generations are sound and a walk that reaches one stops there - which is
-	// what keeps this proportional to the resident tier rather than to all of
-	// history once the graph is on disk.
-	state := make(map[codec.Hash]uint8, d.nodes.residentLen())
-	gen := make(map[codec.Hash]uint32, d.nodes.residentLen())
+	// Normally only the resident tier is recomputed. Graph segments are written
+	// after ensureGenerationsLocked, so their generations are sound and a walk
+	// that reaches one stops there - which is what keeps this proportional to
+	// the resident tier rather than to all of history once the graph is on disk.
+	// The exception is history arriving below a segment commit (genStaleSegments:
+	// a deepen fetching what lies under a snapshot root that was flushed, or a
+	// parent stored after its child was): then every commit is recomputed and a
+	// segment commit whose generation moves keeps the new one as an override.
+	all := d.genStaleSegments
+	size := d.nodes.residentLen()
+	if all {
+		size = d.nodes.len()
+	}
+	state := make(map[codec.Hash]uint8, size)
+	gen := make(map[codec.Hash]uint32, size)
 
-	roots := make([]codec.Hash, 0, d.nodes.residentLen())
-	d.nodes.forEachResident(func(h codec.Hash) { roots = append(roots, h) })
+	roots := make([]codec.Hash, 0, size)
+	if all {
+		d.nodes.forEach(func(h codec.Hash) { roots = append(roots, h) })
+	} else {
+		d.nodes.forEachResident(func(h codec.Hash) { roots = append(roots, h) })
+	}
 	for _, root := range roots {
 		if state[root] != unvisited {
 			continue
@@ -162,7 +180,7 @@ func (d *InMemoryCommitDag) recomputeGenerationsLocked() {
 				stack = stack[:len(stack)-1]
 				continue
 			}
-			if !d.nodes.isResident(h) && d.nodes.has(h) {
+			if !all && !d.nodes.isResident(h) && d.nodes.has(h) {
 				// In a segment: its generation is settled.
 				gen[h] = d.nodes.generation(h)
 				state[h] = done
@@ -191,9 +209,12 @@ func (d *InMemoryCommitDag) recomputeGenerationsLocked() {
 	}
 
 	for h, g := range gen {
-		d.nodes.setGeneration(h, g)
+		if g != d.nodes.generation(h) {
+			d.nodes.setGeneration(h, g)
+		}
 	}
 	d.genStale = false
+	d.genStaleSegments = false
 }
 
 // generationLocked returns hash's generation, or 0 for a hash that is not

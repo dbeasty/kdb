@@ -161,6 +161,11 @@ type InMemoryCommitDag struct {
 	// generation(parent) < generation(child) and must be rebuilt before
 	// anything prunes with them. See storeCommitLocked.
 	genStale bool
+	// genStaleSegments says the next recompute must include the graph segments too: history
+	// arrived below commits already written to one (a deepen, an unshallow, a parent stored after
+	// a flushed child), so their generations were derived without it. Rare, and O(history) when
+	// it happens; see recomputeGenerationsLocked.
+	genStaleSegments bool
 	// mergeBaseSteps counts the commits the merge-base walks have stepped through (see
 	// MergeBaseSteps). Only those walks touch it, and they hold mu exclusively.
 	mergeBaseSteps uint64
@@ -660,6 +665,7 @@ func (d *InMemoryCommitDag) Unshallow(hash codec.Hash) error {
 	}
 	delete(d.shallow, hash)
 	d.genStale = true
+	d.genStaleSegments = true // the root or its descendants may be in a segment
 	d.ancestryVersion++
 	d.ancestryEpoch++
 	return nil
@@ -671,6 +677,7 @@ func (d *InMemoryCommitDag) InvalidateGenerations() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.genStale = true
+	d.genStaleSegments = true
 	d.ancestryVersion++
 	d.ancestryEpoch++
 }

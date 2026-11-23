@@ -362,6 +362,17 @@ func (d *InMemoryCommitDag) graphIncludeLocked() (func(codec.Hash, []byte) bool,
 // flush of 50,000 commits taken in one hold stalled every writer for ~8 ms.
 const graphSnapshotBatch = 1024
 
+// yieldGraphLock pauses a background writer between two holds of the DAG's lock for as long as
+// the last one lasted (at least graphYieldMin), so writers parked on the lock take it rather than
+// the background goroutine - still running, it would win the lock straight back (sync.Mutex
+// favours the running goroutine until a waiter has waited a millisecond). Caps a flush at half
+// the lock while it notes what it takes; the flush is not in a hurry, the commits are.
+func yieldGraphLock(held time.Duration) {
+	time.Sleep(max(held, graphYieldMin))
+}
+
+const graphYieldMin = 50 * time.Microsecond
+
 // flushResident writes the resident tier as a new segment when it holds at least
 // graph.rebuildCommits commits (or force), streaming the records from where they are. The first
 // segment a namespace writes is marked full: it is the whole graph.
@@ -396,8 +407,10 @@ func (d *InMemoryCommitDag) flushResident(force bool) (bool, error) {
 	}
 	for lo := uint32(0); lo < limit; lo += graphSnapshotBatch {
 		d.mu.Lock()
+		held := time.Now()
 		d.nodes.snapshotSlots(in, lo, min(lo+graphSnapshotBatch, limit), include, flags, false)
 		d.mu.Unlock()
+		yieldGraphLock(time.Since(held))
 		if d.graphStop.Load() {
 			return abort(errGraphWriteStopped)
 		}
@@ -449,6 +462,9 @@ func (d *InMemoryCommitDag) flushResident(force bool) (bool, error) {
 // answers the segment would: the commit each names is in the DAG, in nb.
 func (d *InMemoryCommitDag) dropFlushedIndexEntries(nb *graphBase, entries []residentEntry) {
 	for lo := 0; lo < len(entries); lo += graphSnapshotBatch {
+		if lo > 0 {
+			yieldGraphLock(graphYieldMin)
+		}
 		d.mu.Lock()
 		for pos := lo; pos < min(lo+graphSnapshotBatch, len(entries)); pos++ {
 			h := entries[pos].hash

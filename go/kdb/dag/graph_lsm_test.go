@@ -690,7 +690,8 @@ func TestGraphResidentTierConvergesUnderBurst(t *testing.T) {
 
 // How long a flush of a full tier keeps writers waiting for the DAG's lock - measured, not pinned
 // (it is wall time). Before the snapshot was taken in batches and the attach rebuilt only what
-// stays resident, a 50,000-commit flush held the lock ~8 ms and then ~14 ms.
+// stays resident, a 50,000-commit flush held the lock ~8 ms and then ~14 ms; batched, 1.2 ms,
+// since the flusher won the lock back between batches; yielding between them, ~0.25 ms.
 func TestGraphFlushWriterStall(t *testing.T) {
 	if testing.Short() {
 		t.Skip("timing")
@@ -726,4 +727,115 @@ func TestGraphFlushWriterStall(t *testing.T) {
 	took := time.Since(s)
 	close(stop)
 	t.Logf("flush of 50,000 commits took %v; the longest a writer waited for the lock: %v", took, <-worst)
+}
+
+// buildChain builds n commits on parent without storing them.
+func buildChain(t *testing.T, parent codec.Hash, n int, seed int64) []document.Commit {
+	t.Helper()
+	var out []document.Commit
+	for i := 0; i < n; i++ {
+		tx, _ := codec.RandomUUID()
+		var parents []codec.Hash
+		if parent != (codec.Hash{}) {
+			parents = []codec.Hash{parent}
+		}
+		c, err := document.BuildCommit(parents, "ns", tx, codec.Timestamp{EpochMillis: seed*1e6 + int64(i)}, codec.UUID{MSB: 1}, nil, codec.Hash{}, nil, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, c)
+		parent = c.Hash
+	}
+	return out
+}
+
+// History that arrives below a commit already flushed to a segment - a deepen under a snapshot root
+// - must still leave every parent's generation below its child's, or the pruned ancestry walks
+// answer wrongly. Recomputing only the resident tier missed the segment commits (found when
+// size-triggered flushes put a snapshot root on disk before the deepen).
+func TestGraphHistoryArrivingBelowASegment(t *testing.T) {
+	d, _ := lsmDag(t, 1<<30, 0)
+	history := buildChain(t, codec.Hash{}, 20, 1)
+	root := buildChain(t, history[len(history)-1].Hash, 1, 2)[0]
+	if err := d.PutShallowCommit(root); err != nil {
+		t.Fatal(err)
+	}
+	tip, above := chain(t, d, root.Hash, 30, 3)
+	if err := d.CompactGraphFile(); err != nil { // the root and what is above it, on disk
+		t.Fatal(err)
+	}
+	for _, c := range history {
+		if err := d.PutCommit(c, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := d.Unshallow(root.Hash); err != nil {
+		t.Fatal(err)
+	}
+	if !d.IsAncestor(history[0].Hash, root.Hash) || !d.IsAncestor(history[0].Hash, tip) || !d.IsAncestor(history[5].Hash, above[10]) {
+		t.Fatal("history below a flushed root is not its ancestor")
+	}
+	d.mu.Lock()
+	d.ensureGenerationsLocked()
+	d.nodes.forEach(func(h codec.Hash) {
+		g := d.nodes.generation(h)
+		d.nodes.forEachParent(h, func(p codec.Hash) bool {
+			if d.nodes.has(p) && d.nodes.generation(p) >= g {
+				t.Errorf("parent %s generation %d >= child %s generation %d", p.Hex()[:8], d.nodes.generation(p), h.Hex()[:8], g)
+			}
+			return true
+		})
+	})
+	d.mu.Unlock()
+}
+
+// The same with no shallow mark at all: a parent stored after its child was flushed.
+func TestGraphParentStoredAfterItsChildWasFlushed(t *testing.T) {
+	d, _ := lsmDag(t, 1<<30, 0)
+	commits := buildChain(t, codec.Hash{}, 10, 1)
+	for _, c := range commits[5:] {
+		if err := d.PutCommit(c, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := d.CompactGraphFile(); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range commits[:5] {
+		if err := d.PutCommit(c, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !d.IsAncestor(commits[0].Hash, commits[9].Hash) {
+		t.Fatal("a parent stored after its flushed child is not its ancestor")
+	}
+}
+
+// A commit in a segment that becomes unlogged again (its log write failed after a flush took it)
+// is hidden by a checkpoint that names the segment, so the next open does not bring it back with
+// no operations to read.
+func TestGraphCheckpointHidesUnloggedSegmentCommits(t *testing.T) {
+	d, _ := lsmDag(t, 1<<30, 0)
+	head, _ := d.Head()
+	_, hashes := chain(t, d, head, 10, 1)
+	if err := d.CompactGraphFile(); err != nil {
+		t.Fatal(err)
+	}
+	victim := hashes[len(hashes)-1] // the tip: nothing logged is built on it
+	d.MarkUnlogged(victim)
+	// main names the tip; move it back so the checkpoint is allowed at all.
+	if err := d.SetHead(mainBranch, hashes[len(hashes)-2]); err != nil {
+		t.Fatal(err)
+	}
+	_, refs, hidden, err := d.CheckpointSnapshotWithGraph(nil)
+	if err != nil || len(refs) == 0 {
+		t.Fatalf("refs %v err %v", refs, err)
+	}
+	found := false
+	for _, h := range hidden {
+		found = found || h == victim
+	}
+	if !found {
+		t.Fatal("the checkpoint names the segment holding an unlogged commit without hiding it")
+	}
 }

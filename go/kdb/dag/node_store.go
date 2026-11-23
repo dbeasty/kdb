@@ -68,6 +68,11 @@ type nodeStore struct {
 	genOverride map[codec.Hash]uint32
 	// segRecords is the total record count across segs.
 	segRecords int
+	// extParents is every parent a segment names outside itself (the segments' EXT sections): a
+	// commit stored later under one of these hashes is history arriving below a segment commit
+	// (InMemoryCommitDag.genStaleSegments). Pointer-free; small, since a flush's only outside
+	// parent is usually the one commit before it.
+	extParents map[codec.Hash]struct{}
 
 	// goMode holds commits the way the DAG always used to (GraphMemoryGo): a Go map of whole
 	// document.Commit values, traced by the collector on every cycle. Kept selectable at startup
@@ -516,6 +521,29 @@ func (s *nodeStore) hide(b *graphBase, h codec.Hash) {
 	}
 }
 
+// isExternalParent reports whether some segment names h as a parent it does not hold.
+func (s *nodeStore) isExternalParent(h codec.Hash) bool {
+	_, ok := s.extParents[h]
+	return ok
+}
+
+// rebuildExtParents recomputes extParents from the segments attached now.
+func (s *nodeStore) rebuildExtParents() {
+	var m map[codec.Hash]struct{}
+	for _, b := range s.segs {
+		ext := b.sec[secExt]
+		for i := 0; i+32 <= len(ext); i += 32 {
+			if m == nil {
+				m = make(map[codec.Hash]struct{})
+			}
+			var h codec.Hash
+			copy(h.Bytes[:], ext[i:i+32])
+			m[h] = struct{}{}
+		}
+	}
+	s.extParents = m
+}
+
 // recountHidden recomputes every segment's hidden-record count from the overlay.
 func (s *nodeStore) recountHidden() {
 	for _, b := range s.segs {
@@ -852,6 +880,7 @@ func (s *nodeStore) attachFlushed(nb *graphBase, in *graphWriteInput) bool {
 		}
 		keep(h, i)
 	}
+	s.rebuildExtParents()
 	return true
 }
 
@@ -928,6 +957,7 @@ func (s *nodeStore) attachMerged(nb *graphBase, replaced []*graphBase, epoch uin
 	for _, b := range replaced {
 		b.close()
 	}
+	s.rebuildExtParents()
 	return true
 }
 
@@ -1039,6 +1069,7 @@ func (s *nodeStore) attach(nb *graphBase, replaced []*graphBase) {
 		b.close()
 	}
 	s.recountHidden()
+	s.rebuildExtParents()
 	s.compactSlab()
 	// A Go map never gives back its buckets, so an index that held a million commits before the
 	// attach moved them out would keep costing what it cost then. Copying is O(what is left).
@@ -1122,6 +1153,7 @@ func (s *nodeStore) attachTrusted(segs []*graphBase, hidden []codec.Hash) {
 		}
 	}
 	s.recountHidden()
+	s.rebuildExtParents()
 }
 
 // detach drops every segment, putting nothing back: for a DAG that is closing.
@@ -1129,5 +1161,5 @@ func (s *nodeStore) detach() {
 	for _, b := range s.segs {
 		b.close()
 	}
-	s.segs, s.hidden, s.genOverride, s.segRecords = nil, nil, nil, 0
+	s.segs, s.hidden, s.genOverride, s.segRecords, s.extParents = nil, nil, nil, 0, nil
 }

@@ -69,6 +69,15 @@ func (d *InMemoryCommitDag) CheckpointSnapshotWithGraph(keep func(document.Commi
 	for h := range d.nodes.hidden {
 		hidden = append(hidden, h)
 	}
+	// A commit the checkpoint leaves out for want of a log frame - unlogged, or built on one - may
+	// already be in a segment it names: flushed before it was marked again after a failed log
+	// write, or before history arrived beneath it unlogged. Hidden, the next open does not have
+	// it, exactly as after a crash; the next sync fetches it again.
+	for h := range d.unloggedClosureLocked() {
+		if _, hid := d.nodes.hidden[h]; !hid && !d.nodes.isResident(h) && d.nodes.inAnySegment(h) {
+			hidden = append(hidden, h)
+		}
+	}
 	return state, refs, hidden, nil
 }
 
