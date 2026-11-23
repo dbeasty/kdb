@@ -144,6 +144,27 @@ class WalCodecCorruptionTest {
             assertEquals(1L, summary.recordsSkippedCorrupt, "the one corrupt record must be counted, not silently reported as zero")
         }
 
+    /**
+     * A record whose length field is damaged to a value near Int.MAX_VALUE: `offset + 12 + len`
+     * overflowed to a negative record end, which passed the "past the end" check and then indexed
+     * the array at a negative offset - an ArrayIndexOutOfBoundsException out of recovery instead of
+     * the record being treated like any other that runs past the end of the segment.
+     */
+    @Test
+    fun lengthFieldNearIntMaxDoesNotOverflowIntoANegativeIndex() {
+        val ts = KdbTimestamp.fromEpochMicros(1L)
+        val good = WalCodec.encodeRecord(WalRecord(1, ts, WalRecordKind.PutBlob, byteArrayOf(1)))
+        val bad = WalCodec.encodeRecord(WalRecord(2, ts, WalRecordKind.PutBlob, byteArrayOf(2)))
+        bad[4] = 0x7F
+        bad[5] = 0xFF.toByte()
+        bad[6] = 0xFF.toByte()
+        bad[7] = 0xFF.toByte()
+        for (skip in listOf(false, true)) {
+            val decoded = WalCodec.decodeRecords(good + bad, "ns", "seg", skipCorrupt = skip)
+            assertEquals(listOf(1L), decoded.records.map { it.sequence }, "skipCorrupt=$skip")
+        }
+    }
+
     // U11: with no factory override the cap comes from the engine config; an override wins, as in
     // Go's wal.DefaultFactory.
     @Test

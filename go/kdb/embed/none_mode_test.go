@@ -173,7 +173,7 @@ func TestATruncatedNamespaceWithNoCheckpointRefusesToOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res.Removed == 0 {
-		t.Skip("nothing was truncated, so there is no truncated namespace to test")
+		t.Fatal("maintenance reclaimed nothing under a zero retention window, so the property under test was never exercised")
 	}
 	rt.Close()
 
@@ -322,7 +322,7 @@ func TestAStaleCheckpointOverATruncatedLogRefusesToOpen(t *testing.T) {
 	}
 	rt.Close()
 	if res.Removed == 0 {
-		t.Skip("nothing was truncated, so there is no state to test")
+		t.Fatal("maintenance reclaimed nothing under a zero retention window, so the property under test was never exercised")
 	}
 
 	writeCheckpointFiles(t, stale)
@@ -356,7 +356,7 @@ func TestDisablingCheckpointsOnATruncatedNamespaceRefusesToOpen(t *testing.T) {
 	}
 	rt.Close()
 	if res.Removed == 0 {
-		t.Skip("nothing was truncated, so there is no state to test")
+		t.Fatal("maintenance reclaimed nothing under a zero retention window, so the property under test was never exercised")
 	}
 
 	opts := embed.FileRuntimeOptions{}

@@ -90,7 +90,8 @@ func (t *defaultTransport) ConnectWithOptions(uri string, options core.Transport
 		}
 	}
 	addr := netJoin(parsed.Host, parsed.Port)
-	rawConn, err := net.DialTimeout("tcp", addr, timeoutFromMs(options.ConnectTimeoutMs))
+	connectTimeout := timeoutFromMs(options.ConnectTimeoutMs)
+	rawConn, err := net.DialTimeout("tcp", addr, connectTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -99,12 +100,20 @@ func (t *defaultTransport) ConnectWithOptions(uri string, options core.Transport
 	}
 	var handshakeConn net.Conn = rawConn
 	if parsed.Secure {
-		tlsConn, err := tlsClientHandshake(rawConn, tlsCfg)
+		tlsConn, err := tlsClientHandshake(rawConn, tlsCfg, connectTimeout)
 		if err != nil {
 			_ = rawConn.Close()
 			return nil, err
 		}
 		handshakeConn = tlsConn
+	}
+	// The dial timeout ends once TCP is up; without a deadline of its own the upgrade exchange
+	// waited forever on a peer that accepted and never answered (a client's Connect ctx never
+	// reaches this far). performClientHandshake clears it once the 101 has been read, before it
+	// starts readLoop.
+	if err := handshakeConn.SetDeadline(time.Now().Add(connectTimeout)); err != nil {
+		_ = handshakeConn.Close()
+		return nil, err
 	}
 	conn, err := performClientHandshake(handshakeConn, parsed.Host, parsed.Port, parsed.Path, options)
 	if err != nil {
@@ -118,9 +127,11 @@ func (t *defaultTransport) ConnectWithOptions(uri string, options core.Transport
 // for wss://. Explicitly calling HandshakeContext (rather than letting the first Read/Write
 // trigger it lazily inside performClientHandshake) fails fast on a bad cert/CA, before any HTTP
 // upgrade bytes are sent.
-func tlsClientHandshake(rawConn net.Conn, cfg *tls.Config) (net.Conn, error) {
+func tlsClientHandshake(rawConn net.Conn, cfg *tls.Config, timeout time.Duration) (net.Conn, error) {
 	tlsConn := tls.Client(rawConn, cfg)
-	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		return nil, fmt.Errorf("tls handshake: %w", err)
 	}
 	return tlsConn, nil
@@ -453,6 +464,11 @@ func performClientHandshake(conn net.Conn, host string, port int, path string, o
 	if accept := headers["sec-websocket-accept"]; accept != websocketAccept(key) {
 		return nil, fmt.Errorf("invalid Sec-WebSocket-Accept")
 	}
+	// The connection is now long-lived; drop the caller's handshake deadline before readLoop
+	// starts, or every established connection would fail its first read past it.
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		return nil, err
+	}
 
 	maxFrameBytes := options.MaxFrameBytes
 	if maxFrameBytes == 0 {
@@ -482,13 +498,14 @@ func websocketAccept(key string) string {
 // same minimal parsing WebSocketFraming.readHttpHeaders does on the Kotlin side (no continuation
 // lines, no body).
 func readHTTPHeaders(r *bufio.Reader) (statusLine string, headers map[string]string, err error) {
-	statusLine, err = readCRLFLine(r)
+	budget := maxHandshakeHeaderBytes
+	statusLine, err = readCRLFLine(r, &budget)
 	if err != nil {
 		return "", nil, err
 	}
 	headers = make(map[string]string)
 	for {
-		line, err := readCRLFLine(r)
+		line, err := readCRLFLine(r, &budget)
 		if err != nil {
 			return "", nil, err
 		}
@@ -505,12 +522,33 @@ func readHTTPHeaders(r *bufio.Reader) (statusLine string, headers map[string]str
 	return statusLine, headers, nil
 }
 
-func readCRLFLine(r *bufio.Reader) (string, error) {
-	line, err := r.ReadString('\n')
-	if err != nil {
-		return "", err
+// maxHandshakeHeaderBytes caps the whole upgrade request or response head. Without a cap a peer
+// that never sent a newline (or sent headers forever) grew the line buffer and header map without
+// bound for the full handshake timeout - gigabytes per connection on a fast link. 64 KiB is well
+// past any real browser's request head (net/http's own default is 1 MiB, Nginx's 8-32 KiB).
+const maxHandshakeHeaderBytes = 64 << 10
+
+var errHandshakeHeadersTooLarge = fmt.Errorf("websocket handshake headers exceed %d bytes", maxHandshakeHeaderBytes)
+
+// readCRLFLine reads one line, charging its bytes against *budget and failing once the budget is
+// spent.
+func readCRLFLine(r *bufio.Reader, budget *int) (string, error) {
+	var line []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if len(chunk) > *budget {
+			return "", errHandshakeHeadersTooLarge
+		}
+		*budget -= len(chunk)
+		line = append(line, chunk...)
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimRight(string(line), "\r\n"), nil
 	}
-	return strings.TrimRight(line, "\r\n"), nil
 }
 
 type wsConnection struct {
@@ -635,6 +673,11 @@ func (c *wsConnection) readFrame() ([]byte, error) {
 			for _, b := range ext {
 				length = (length << 8) | int64(b)
 			}
+		}
+		// A 64-bit length with its top bit set is negative here (RFC 6455 §5.2 requires the
+		// most significant bit to be 0); without this check it reached make() and panicked.
+		if length < 0 {
+			return nil, fmt.Errorf("websocket frame length is negative")
 		}
 		if c.maxFrameBytes > 0 && length > int64(c.maxFrameBytes) {
 			return nil, fmt.Errorf("websocket frame too large: %d bytes", length)

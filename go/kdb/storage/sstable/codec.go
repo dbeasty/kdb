@@ -230,6 +230,11 @@ func parseFooter(footer []byte) (map[codec.Hash]BlockHandle, error) {
 		return map[codec.Hash]BlockHandle{}, nil
 	}
 	indexLen := readInt(footer, 4)
+	// The trailer's copy of indexLen sized the read; this inner copy is a second, unchecked
+	// number, and one that runs past the footer is damage, not a reason to slice out of range.
+	if indexLen > len(footer)-40 {
+		return nil, fmt.Errorf("%w: footer declares a %d-byte index in a %d-byte footer", ErrCorruptTable, indexLen, len(footer))
+	}
 	indexStr := string(footer[8 : 8+indexLen])
 	if indexStr == "" {
 		return map[codec.Hash]BlockHandle{}, nil
@@ -704,6 +709,11 @@ func unfinishedTable(shim storage.PlatformIOShim, h Handle) (bool, error) {
 func (r *DefaultReader) ReadBlockAt(bh BlockHandle) ([]byte, error) {
 	if bh.Deleted {
 		return nil, fmt.Errorf("sstable: a tombstone has no block to read")
+	}
+	// The footer index is text with no checksum of its own, and its numbers parse signed: a
+	// damaged one can read negative, which would size a buffer or a read below zero.
+	if bh.Offset < 0 || bh.CompressedSize < 0 {
+		return nil, fmt.Errorf("%w: %s: block handle at offset %d of size %d", ErrCorruptTable, r.handle.SegmentName, bh.Offset, bh.CompressedSize)
 	}
 	size := bh.CompressedSize + blockHeaderSize
 	if into, ok := r.io.(storage.SegmentIntoReader); ok && size <= bufpool.MaxPooled {

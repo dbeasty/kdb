@@ -40,8 +40,13 @@ type attachmentUpload struct {
 	principal string
 	up        *attachstore.Upload
 	received  int64
-	last      time.Time
-	done      *attachstore.Info
+	// last is guarded by attachmentUploads.mu, not by mu: the sweep reads it under the map's
+	// lock, and a chunk refreshes it there too, at lookup. It used to be written under mu only,
+	// after the map lock was released - a data race with the sweep, and a window in which a
+	// request for another upload could find this one idle and Abort it while its chunk was
+	// being written.
+	last time.Time
+	done *attachstore.Info
 }
 
 // attachmentUploads is a runtime's in-flight uploads.
@@ -53,9 +58,18 @@ type attachmentUploads struct {
 func (u *attachmentUploads) sweepLocked(now time.Time) {
 	for id, up := range u.m {
 		if now.Sub(up.last) > attachmentUploadIdle {
+			// Every chunk refreshes last at lookup, so an idle upload's mu is free. TryLock, not
+			// Lock: dropUpload takes this map's lock while holding up.mu, and a held mu means
+			// the upload is in use anyway. Holding it keeps the Abort from overlapping a Write,
+			// and a request that looked this upload up just before then sees up.up == nil.
+			if !up.mu.TryLock() {
+				continue
+			}
 			if up.up != nil {
 				up.up.Abort()
+				up.up = nil
 			}
+			up.mu.Unlock()
 			delete(u.m, id)
 		}
 	}
@@ -185,6 +199,8 @@ func (h *sqlWireConnHandler) handleAttachmentUpload(msg wire.AttachmentUploadMes
 	} else if up = ups.m[id]; up == nil {
 		ups.mu.Unlock()
 		return reply(nil, id, fmt.Errorf("%w: upload %s (expired or never started)", embed.ErrNoAttachment, id))
+	} else {
+		up.last = now
 	}
 	ups.mu.Unlock()
 
@@ -193,9 +209,14 @@ func (h *sqlWireConnHandler) handleAttachmentUpload(msg wire.AttachmentUploadMes
 	if up.ns != ns || up.principal != h.principalID() {
 		return reply(nil, id, &AuthorizationError{Cause: errors.New("upload belongs to another namespace or principal")})
 	}
-	up.last = now
 	if up.done != nil {
 		return reply(up, id, nil) // a retried final chunk: already finished
+	}
+	if up.up == nil {
+		// Dropped (a failed write or Finish, or the idle sweep) while this request waited for
+		// up.mu: it was looked up before the drop removed it from the map. Writing on would
+		// dereference the nil upload.
+		return reply(nil, id, fmt.Errorf("%w: upload %s (expired or never started)", embed.ErrNoAttachment, id))
 	}
 	if msg.Offset != up.received {
 		return reply(up, id, fmt.Errorf("chunk at offset %d does not follow the %d bytes received: resume from there", msg.Offset, up.received))

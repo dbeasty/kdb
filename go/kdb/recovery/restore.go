@@ -41,6 +41,10 @@ type Result struct {
 	MissingHashes []string // non-empty only if the union could not resolve every parent
 }
 
+// restoreMaxSegmentBytes is the size the restored log's segments are sealed at; 0 is the delta
+// writer's default. A variable so a test can restore into several segments without a large log.
+var restoreMaxSegmentBytes int64
+
 // HybridRestore unions every source's CRC-verified commits by hash (see
 // integrity.ScanVerifiedCommits - only frames that pass L1 verification
 // ever contribute, per kdb-spec-layer15 P4/P5: an unverified byte is
@@ -79,7 +83,9 @@ func HybridRestore(sources []Source, namespaceID string, comp storage.Compressio
 	}
 	ordered, missing := topologicalOrder(union, genesis)
 
-	writer, err := (delta.Factory{Config: storage.StorageEngineConfig{CompressionCodec: comp, IOShim: out}}).OpenWriter(namespaceID)
+	writer, err := (delta.Factory{Config: storage.StorageEngineConfig{
+		CompressionCodec: comp, IOShim: out, DeltaMaxSegmentBytes: restoreMaxSegmentBytes,
+	}}).OpenWriter(namespaceID)
 	if err != nil {
 		return nil, fmt.Errorf("opening restore output segment: %w", err)
 	}
@@ -94,6 +100,12 @@ func HybridRestore(sources []Source, namespaceID string, comp storage.Compressio
 			CommitPayload: payload,
 		}); err != nil {
 			return nil, fmt.Errorf("appending commit %s to restored log: %w", c.Hash.Hex(), err)
+		}
+		// Seal and start the next segment at the ordinary cap, as the live writer does. One
+		// segment for the whole log grew past what a reader scans of a segment (256 MiB,
+		// delta.maxScannedSegmentBytes), so a large restored namespace read back truncated.
+		if _, err := writer.RotateIfNeeded(); err != nil {
+			return nil, fmt.Errorf("rotating restored log: %w", err)
 		}
 	}
 	if err := writer.Flush(); err != nil {

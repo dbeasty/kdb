@@ -204,3 +204,53 @@ func hasHash(m map[string]document.Commit, h codec.Hash) bool {
 	_, ok := m[h.Hex()]
 	return ok
 }
+
+// A restored log is cut into segments at the cap, like a live one: written as one segment, a
+// large namespace's restored log outgrew what a reader scans of a segment.
+func TestHybridRestoreRotatesSegments(t *testing.T) {
+	const ns = "ns1"
+	src := newDirShim(t)
+	var frames [][]byte
+	var parent *codec.Hash
+	for i := 0; i < 10; i++ {
+		c := buildCommit(t, ns, parent)
+		h := c.Hash
+		parent = &h
+		frames = append(frames, rawFrame(t, c))
+	}
+	appendSegment(t, src, ns, 0, frames...)
+
+	old := restoreMaxSegmentBytes
+	restoreMaxSegmentBytes = int64(len(frames[0])) * 3
+	defer func() { restoreMaxSegmentBytes = old }()
+
+	out := newDirShim(t)
+	res, err := HybridRestore([]Source{{Label: "backup", Shim: src}}, ns, storage.CompressionNone, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.AppliedCount != 10 || len(res.MissingHashes) != 0 {
+		t.Fatalf("restore: %+v", res)
+	}
+	seqs, err := integrity.ListSequencedSegments(out, ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seqs) < 3 {
+		t.Fatalf("restored log is %d segment(s) %v, want it cut at the cap", len(seqs), seqs)
+	}
+	report, err := integrity.Verify(out, ns, integrity.Options{Level: integrity.L2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Clean() {
+		t.Fatalf("restored log: %+v", report.Findings)
+	}
+	got, err := integrity.ScanVerifiedCommits(out, ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 10 {
+		t.Fatalf("restored log holds %d commits, want 10", len(got))
+	}
+}

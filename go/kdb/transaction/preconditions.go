@@ -28,7 +28,7 @@ func evaluatePreconditions(
 	namespaceID string,
 	store storage.Adapter,
 	targetTreeHash codec.Hash,
-) ([]OperationConflict, []OperationViolation) {
+) ([]OperationConflict, []OperationViolation, error) {
 	byIndex, err := document.PreconditionsByOpIndex(tx.Preconditions, len(tx.Operations))
 	if err != nil {
 		// A malformed precondition set (out-of-range or contradictory) is the client's error,
@@ -39,10 +39,10 @@ func evaluatePreconditions(
 				ViolationType: kdberr.CustomConstraint,
 				Detail:        err.Error(),
 			}},
-		}}
+		}}, nil
 	}
 	if len(byIndex) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	var failures []OperationConflict
@@ -65,10 +65,15 @@ func evaluatePreconditions(
 					ViolationType: kdberr.CustomConstraint,
 					Detail:        "precondition declared on an operation that names no document",
 				}},
-			}}
+			}}, nil
 		}
 
-		existing, _ := store.GetDocument(namespaceID, docID, targetTreeHash)
+		// A failed read must not evaluate as "absent": ExpectAbsent would pass and an
+		// insert-if-absent would overwrite a document that is there.
+		existing, err := store.GetDocument(namespaceID, docID, targetTreeHash)
+		if err != nil {
+			return nil, nil, err
+		}
 		satisfied, actual := preconditionHolds(pre, existing)
 		if satisfied {
 			continue
@@ -84,7 +89,7 @@ func evaluatePreconditions(
 			ActualContentHash: actual,
 		})
 	}
-	return failures, nil
+	return failures, nil, nil
 }
 
 // preconditionHolds evaluates one assertion against the document currently at the id, returning

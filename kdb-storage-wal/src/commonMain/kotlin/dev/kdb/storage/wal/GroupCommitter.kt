@@ -1,8 +1,10 @@
 package dev.kdb.storage.wal
 
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /**
  * Coalesces concurrent fsync requests into as few physical sync calls as
@@ -40,7 +42,12 @@ public class GroupCommitter {
             }
         }
         if (isLeader) {
-            runRounds(doSync)
+            // The rounds sync every waiter queued behind this caller, not just its own write, so
+            // the leader being cancelled must not abort them (Go runs them on a background
+            // goroutine no caller can cancel). Otherwise a cancelled doSync's
+            // CancellationException became every other waiter's "sync error", and a cancelled
+            // mutex.lock could leave inFlight stuck true with waiters nobody would ever drain.
+            withContext(NonCancellable) { runRounds(doSync) }
         }
         result.await()?.let { throw it }
     }

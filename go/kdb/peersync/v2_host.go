@@ -141,7 +141,7 @@ func (h *V2Host) fetchPage(env IngestEnv, m wire.FetchRequestMessage) ([]documen
 		if cur == nil {
 			cur = newMissingCursor(env.DAG, m.Wants, m.Haves)
 		}
-		commits, payloads, stubs, done, err := cur.pagePayloads(env.DAG, m.MaxBytes)
+		commits, payloads, stubs, done, err := cur.pagePayloads(env.DAG, servedPageBytes(m.MaxBytes))
 		if errors.Is(err, errCursorStale) && attempt == 0 {
 			cur = nil
 			continue
@@ -300,7 +300,7 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 				return nil, err
 			}
 		}
-		page, err := snapshotPage(env, at, m.After, m.MaxBytes)
+		page, err := snapshotPage(env, at, m.After, servedPageBytes(m.MaxBytes))
 		if err != nil {
 			return nil, err
 		}
@@ -871,7 +871,7 @@ func (h *V2Host) projectFetch(m wire.ProjectFetchMessage) (wire.Message, error) 
 		return h.auth.Authorizer().Authorize(context.Background(), principal,
 			auth.DocumentReadAction{Namespace: m.Namespace, DocID: id.String()}) == nil
 	}
-	page, err := projectPage(env, filter, canRead, m.FromHex, m.AtHex, m.After, m.MaxBytes)
+	page, err := projectPage(env, filter, canRead, m.FromHex, m.AtHex, m.After, servedPageBytes(m.MaxBytes))
 	if err != nil {
 		return nil, err
 	}

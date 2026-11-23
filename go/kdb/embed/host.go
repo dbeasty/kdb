@@ -51,6 +51,41 @@ type Host struct {
 	mu     sync.Mutex
 	nss    map[string]*namespaceEntry
 	closed bool
+	// busy holds the namespaces with an open or a close in flight, each with a channel closed
+	// when it finishes. Opening and closing one namespace run outside mu (they replay, flush and
+	// seal), so without this an open could start over a namespace's files while its previous
+	// engine was still sealing them, and Close could release the directory lock under either.
+	busy map[string]chan struct{}
+}
+
+// waitIdleLocked returns once no open or close of namespaceID is in flight. Called and returns
+// with h.mu held.
+func (h *Host) waitIdleLocked(namespaceID string) {
+	for {
+		ch, ok := h.busy[namespaceID]
+		if !ok {
+			return
+		}
+		h.mu.Unlock()
+		<-ch
+		h.mu.Lock()
+	}
+}
+
+// markBusyLocked records an open or close of namespaceID in flight, returning the func that ends
+// it. Called with h.mu held; the returned func takes h.mu itself.
+func (h *Host) markBusyLocked(namespaceID string) func() {
+	if h.busy == nil {
+		h.busy = make(map[string]chan struct{})
+	}
+	ch := make(chan struct{})
+	h.busy[namespaceID] = ch
+	return func() {
+		h.mu.Lock()
+		delete(h.busy, namespaceID)
+		h.mu.Unlock()
+		close(ch)
+	}
 }
 
 // namespaceEntry is everything the host holds on behalf of one open namespace.
@@ -247,6 +282,7 @@ func (h *Host) Namespace(catalog, namespaceID string, sch schema.KdbSchema) (*Em
 // is not something this can do behind its callers' backs.
 func (h *Host) NamespaceWithOptions(catalog, namespaceID string, sch schema.KdbSchema, sopts StorageOptions) (*EmbeddedKdbRuntime, error) {
 	h.mu.Lock()
+	h.waitIdleLocked(namespaceID)
 	if h.closed {
 		h.mu.Unlock()
 		return nil, fmt.Errorf("kdb: host for %s is closed", h.dataRoot)
@@ -255,6 +291,7 @@ func (h *Host) NamespaceWithOptions(catalog, namespaceID string, sch schema.KdbS
 		h.mu.Unlock()
 		return e.rt, nil
 	}
+	defer h.markBusyLocked(namespaceID)()
 	opts := h.opts
 	opts.Storage = sopts
 	// The host settled these two; a per-namespace override of either would mean a namespace
@@ -331,8 +368,12 @@ func (h *Host) Namespaces() []string {
 // this is safe to call more than once.
 func (h *Host) CloseNamespace(namespaceID string) error {
 	h.mu.Lock()
+	h.waitIdleLocked(namespaceID)
 	entry, ok := h.nss[namespaceID]
 	delete(h.nss, namespaceID)
+	if ok {
+		defer h.markBusyLocked(namespaceID)()
+	}
 	h.mu.Unlock()
 	// Unrouted before anything is torn down: a call naming this namespace must fail with
 	// ErrUnknownNamespace rather than reach an engine that is being closed underneath it.
@@ -369,6 +410,19 @@ func (h *Host) Close() error {
 		return nil
 	}
 	h.closed = true
+	// Let every in-flight open and close finish first: an open that completes now finds the host
+	// closed and closes what it opened, and neither may still be touching files once the
+	// directory lock below is released.
+	for len(h.busy) > 0 {
+		var ch chan struct{}
+		for _, c := range h.busy {
+			ch = c
+			break
+		}
+		h.mu.Unlock()
+		<-ch
+		h.mu.Lock()
+	}
 	ids := make([]string, 0, len(h.nss))
 	for id := range h.nss {
 		ids = append(ids, id)

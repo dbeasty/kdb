@@ -9,6 +9,7 @@ import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFails
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -157,4 +158,62 @@ class SsTableCodecTest {
         // The original, unmodified block must still decode cleanly.
         SsTableCodec.decodeBlock(block)
     }
+
+    private fun footerWithIndex(index: ByteArray, declaredLen: Int): ByteArray {
+        val footer = ByteArray(8 + index.size + 32)
+        footer[4] = (declaredLen ushr 24).toByte()
+        footer[5] = (declaredLen ushr 16).toByte()
+        footer[6] = (declaredLen ushr 8).toByte()
+        footer[7] = declaredLen.toByte()
+        index.copyInto(footer, 8)
+        return footer
+    }
+
+    /**
+     * The footer carries indexLen twice; the inner copy was never checked against the footer, so
+     * a damaged one sliced out of range - an IndexOutOfBoundsException rather than the
+     * IllegalArgumentException a table that will not parse is documented to throw. Mirrors Go's
+     * TestFooterInnerIndexLenPastFooterIsCorrupt.
+     */
+    @Test
+    fun parseFooterRejectsInnerIndexLenPastTheFooter() {
+        val index = "${randomKey().toHex()}:0:11".encodeToByteArray()
+        assertFailsWith<IllegalArgumentException> { SsTableCodec.parseFooter(footerWithIndex(index, index.size + 1000)) }
+        assertFailsWith<IllegalArgumentException> { SsTableCodec.parseFooter(footerWithIndex(index, -1)) }
+    }
+
+    /**
+     * The footer index is text with no checksum of its own and its numbers parse signed: a
+     * negative offset or size must be rejected as a corrupt table, not used to size or position a
+     * read (Go's ReadBlockAt now refuses the same handles).
+     */
+    @Test
+    fun parseFooterRejectsNegativeBlockHandles() {
+        val key = randomKey().toHex()
+        for (line in listOf("$key:-12:11", "$key:0:-5")) {
+            val index = line.encodeToByteArray()
+            assertFailsWith<IllegalArgumentException>(line) { SsTableCodec.parseFooter(footerWithIndex(index, index.size)) }
+        }
+    }
+
+    /** A trailer indexLen longer than the file locates no footer; the lookup must say the table is corrupt. */
+    @Test
+    fun lookupRejectsTrailerIndexLenLongerThanTheFile() =
+        runTest {
+            val io = shim()
+            val writer = DefaultSsTableWriter(io, "ns", 0)
+            val key = randomKey()
+            writer.put(key, "v".encodeToByteArray())
+            val handle = writer.finish()
+            val data = io.readFromSegment(handle.segmentName, 0, Int.MAX_VALUE)
+            val n = data.size
+            data[n - 4] = 0x1B
+            data[n - 3] = 0x2C
+            data[n - 2] = 0x3D
+            data[n - 1] = 0x4E
+            val damaged = handle.copy(segmentName = handle.segmentName + "x")
+            io.appendToSegment(damaged.segmentName, data)
+            assertFailsWith<IllegalArgumentException> { DefaultSsTableReader(io, damaged).lookup(key) }
+            assertFailsWith<IllegalArgumentException> { readSsTableValues(io, damaged.segmentName, setOf(key)) }
+        }
 }

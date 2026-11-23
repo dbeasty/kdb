@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -480,7 +481,15 @@ func (c *Client) nextCorrelation() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	id := c.correlation
-	c.correlation++
+	// The wire carries a correlation id as an int32, so a reply decodes with int(int32(id)). Past
+	// MaxInt32 the id sent and the id echoed back stopped being equal, the reply matched no pending
+	// request, and every call from then on hung until its context expired - after 2^31 requests,
+	// a couple of days for a busy long-lived connection. Wrap back to 1 instead (0 is left unused).
+	if c.correlation >= math.MaxInt32 {
+		c.correlation = 1
+	} else {
+		c.correlation++
+	}
 	return id
 }
 

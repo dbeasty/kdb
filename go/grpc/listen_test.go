@@ -242,3 +242,22 @@ func TestSecureSchemeRequiresTLS(t *testing.T) {
 		t.Fatal("grpcs:// was served without TLS settings")
 	}
 }
+
+// Every KDB connection over gRPC is one long-lived stream, which GracefulStop waits for - and a
+// client only ends it when it disconnects. Close used to be GracefulStop alone, so with any
+// client connected it never returned: kdb-service's deferred close hung its SIGTERM shutdown
+// until the supervisor killed it.
+func TestCloseReturnsWithAClientStreamOpen(t *testing.T) {
+	ln, cc := listen(t)
+	_ = open(t, cc)
+	closed := make(chan struct{})
+	go func() {
+		ln.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(15 * time.Second): // under open()'s 20s stream context, which would end the stream itself
+		t.Fatal("Listener.Close still blocked 15s after being called with one client stream open")
+	}
+}

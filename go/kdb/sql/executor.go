@@ -283,6 +283,11 @@ func (e *Executor) executePage(query SelectQuery, plan PhysicalPlan, residual Ex
 			return res, nil
 		}
 	}
+	// page.Offset comes from an unsigned continuation token, so it can be anything: a sum past
+	// MaxInt wrapped negative and panicked slicing the result. No result has that many rows.
+	if page.Offset > math.MaxInt-query.Offset {
+		return QueryResult{Columns: columnsFor(query, ctx.Schema), Rows: []QueryRow{}}, nil
+	}
 	q.Offset = query.Offset + page.Offset
 	res, err := e.ExecuteSelect(q, plan, residual, ctx)
 	if err != nil {

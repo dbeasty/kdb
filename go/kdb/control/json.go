@@ -3,6 +3,7 @@ package control
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -79,6 +80,21 @@ func intParam(r *http.Request, name string, def, min, max int) (int, error) {
 // maxSkip bounds how far a caller may page back in one request. Paging is a traversal, so a deep
 // skip costs the walk it skips; this keeps a single request bounded.
 const maxSkip = 20_000
+
+// skipParam reads a paging skip, refusing one past maxSkip. intParam clamps a too-large value,
+// which is right for a limit (fewer rows than asked for, and the response shows how many) but
+// wrong for a skip: skip=25000 answered with the page at 20000 is a different page, and a client
+// following nextSkip past the cap was handed that same page - with hasMore - forever.
+func skipParam(r *http.Request) (int, error) {
+	n, err := intParam(r, "skip", 0, 0, math.MaxInt)
+	if err != nil {
+		return 0, err
+	}
+	if n > maxSkip {
+		return 0, errors.New("skip must be at most " + strconv.Itoa(maxSkip))
+	}
+	return n, nil
+}
 
 // shortHash is the display form of a commit hash - the same 8 hex digits the CLI's log uses, and
 // the minimum LookupHashPrefix accepts.

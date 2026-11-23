@@ -508,6 +508,7 @@ func attachmentTreeNodesPage(env IngestEnv, m wire.TreeNodesMessage) (wire.TreeN
 	if limit <= 0 {
 		limit = DefaultTreeEntryLimit
 	}
+	limit = min(limit, MaxTreeEntryLimit)
 	out := wire.TreeNodesResultMessage{Namespace: env.NamespaceID, Nodes: make([]wire.TreeNodeInfo, len(m.Prefixes))}
 	if root := table.Root(); root != nil {
 		out.TreeHex = root.Hex()

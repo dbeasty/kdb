@@ -126,4 +126,19 @@ class MalformedInputTest {
             )
         }
     }
+
+    /**
+     * A string length of 2^32 + 3 must be rejected, as Go's decoder rejects it ("length exceeds
+     * remaining input"). Truncating it with `toInt()` read it as 3 and returned "abc".
+     */
+    @Test
+    fun decodeRejectsStringLengthThatTruncatesToAPlausibleInt() {
+        val reg = KdbTypeRegistry.builtin()
+        val type = KdbType.Primitive(PhysicalKind.STRING)
+        // LEB128 of 0x1_0000_0003: 0x83 0x80 0x80 0x80 0x10.
+        val bytes = byteArrayOf(0x83.toByte(), 0x80.toByte(), 0x80.toByte(), 0x80.toByte(), 0x10, 'a'.code.toByte(), 'b'.code.toByte(), 'c'.code.toByte())
+        assertFailsWith<KdbDecodeException> {
+            KdbValue.decodeFromBytes(bytes, type, reg)
+        }
+    }
 }

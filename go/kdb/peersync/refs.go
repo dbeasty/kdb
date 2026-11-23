@@ -182,6 +182,21 @@ func localRefHeads(d *dag.InMemoryCommitDag) []codec.Hash {
 // DefaultPageBytes caps one v2 page's estimated commit bytes when the requester names no cap.
 const DefaultPageBytes = 4 << 20
 
+// maxServedPageBytes is the most a host puts in one page (FETCH, SNAPSHOT_FETCH, PROJECT_FETCH),
+// whatever the requester asks for. A page is built whole in memory before it is encoded, so a
+// peer naming a huge MaxBytes had the host hold its namespace's whole history - or every document
+// body - at once, for a frame it could not send anyway (DefaultMaxFrameBytes). Paging carries on
+// from a smaller page as from any other. A variable so a test can lower it.
+var maxServedPageBytes = 16 << 20
+
+// servedPageBytes is the page budget a host serves a request naming asked.
+func servedPageBytes(asked int) int {
+	if asked <= 0 {
+		return DefaultPageBytes
+	}
+	return min(asked, maxServedPageBytes)
+}
+
 // commitSize estimates a commit's encoded size: its operations' bodies plus a fixed allowance
 // for hashes, ids and framing. An estimate is enough - it only has to keep a page near its cap,
 // not at it - and encoding every commit twice to measure it exactly would double the cost of

@@ -108,3 +108,37 @@ func TestAccessTokenFixedVector(t *testing.T) {
 		t.Fatalf("fixed token: %v %v", p, err)
 	}
 }
+
+// A token names its user only by id. Deleting the user must kill its tokens; otherwise a user
+// later created under the same id inherits them, and whoever held the old token authenticates as
+// the new user with the new user's roles.
+func TestDeletingUserRevokesItsTokens(t *testing.T) {
+	s := newTestRegistryAuthStore(t)
+	if err := s.CreateUser("alice", "pw", []string{"reader"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateUser("bob", "pw", []string{"reader"}); err != nil {
+		t.Fatal(err)
+	}
+	tok, _, err := s.CreateToken("alice", "laptop", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobTok, _, err := s.CreateToken("bob", "laptop", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteUser("alice"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateUser("alice", "other", []string{"admin"}); err != nil {
+		t.Fatal(err)
+	}
+	authn := registryAuthenticator{store: s}
+	if p, err := authn.Authenticate(context.Background(), Credentials{Token: &tok}); err == nil {
+		t.Fatalf("a deleted user's token authenticated as the recreated user: %v", p)
+	}
+	if _, err := authn.Authenticate(context.Background(), Credentials{Token: &bobTok}); err != nil {
+		t.Fatalf("deleting alice revoked bob's token: %v", err)
+	}
+}

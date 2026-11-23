@@ -125,6 +125,13 @@ internal object SsTableCodec {
     fun parseFooter(footer: ByteArray): Map<KdbHash, BlockHandle> {
         if (footer.size < 40) return emptyMap()
         val indexLen = readInt(footer, 4)
+        // The trailer's copy of indexLen sized the read; this inner copy is a second, unchecked
+        // number, and one that runs past the footer is damage - not a reason to slice out of range
+        // (an IndexOutOfBoundsException, outside this reader's documented failure types). Go's
+        // parseFooter returns ErrCorruptTable for the same footer.
+        require(indexLen in 0..(footer.size - 40)) {
+            "sstable footer declares a $indexLen-byte index in a ${footer.size}-byte footer: the table is corrupt"
+        }
         val indexStr = footer.copyOfRange(8, 8 + indexLen).decodeToString()
         if (indexStr.isEmpty()) return emptyMap()
         return indexStr.lineSequence().associate { line ->
@@ -133,6 +140,10 @@ internal object SsTableCodec {
             val off = parts[1].toLong()
             val cs = parts[2].toInt()
             val deleted = parts.size > 3 && parts[3] == TOMBSTONE_FLAG
+            // The index is text with no checksum of its own and its numbers parse signed: a damaged
+            // one can read negative and would position or size a read below zero (Go's
+            // ReadBlockAt refuses the same handles with ErrCorruptTable).
+            require(off >= 0 && cs >= 0) { "sstable footer: block handle at offset $off of size $cs: the table is corrupt" }
             hash to BlockHandle(off, cs, 0, deleted)
         }
     }
@@ -249,6 +260,10 @@ public class DefaultSsTableReader(
         // is magic(4) + indexLen(4) + indexBytes(indexLen) + fileHash(32) = 40+indexLen bytes,
         // sitting immediately before the FOOTER_TRAILER_SIZE-byte trailer at the true end of the
         // file.
+        // A trailer longer than the file locates no footer: corrupt, not a read at a negative offset.
+        require(indexLen >= 0 && indexLen <= size - 40 - SsTableCodec.FOOTER_TRAILER_SIZE) {
+            "sstable ${handle.segmentName}: footer declares a $indexLen-byte index in a $size-byte file: the table is corrupt"
+        }
         val bodyLen = 40 + indexLen
         val footerStart = size - bodyLen - SsTableCodec.FOOTER_TRAILER_SIZE
         val footer = ioShim.readFromSegment(handle.segmentName, footerStart, bodyLen)
@@ -310,10 +325,10 @@ public suspend fun readSsTableValues(
     for (k in keys) {
         val bh = index[k] ?: continue
         if (bh.deleted) continue
+        // In Long: an offset past Int.MAX_VALUE truncated by toInt() could land inside the file.
+        require(bh.offset >= 0 && bh.offset + SsTableCodec.BLOCK_HEADER_SIZE + bh.compressedSize <= footerStart) { "sstable $segmentName: block for ${k.toHex()} overruns the file" }
         val start = bh.offset.toInt()
-        val end = start + SsTableCodec.BLOCK_HEADER_SIZE + bh.compressedSize
-        require(bh.offset >= 0 && end <= footerStart) { "sstable $segmentName: block for ${k.toHex()} overruns the file" }
-        out[k] = SsTableCodec.decodeBlock(raw.copyOfRange(start, end))
+        out[k] = SsTableCodec.decodeBlock(raw.copyOfRange(start, start + SsTableCodec.BLOCK_HEADER_SIZE + bh.compressedSize))
     }
     return out
 }

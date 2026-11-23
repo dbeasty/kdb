@@ -48,7 +48,7 @@ func (s *Server) handleDocumentHistory(w http.ResponseWriter, r *http.Request, _
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	skip, err := intParam(r, "skip", 0, 0, maxSkip)
+	skip, err := skipParam(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return

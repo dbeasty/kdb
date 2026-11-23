@@ -1,8 +1,11 @@
 package dev.kdb.storage.wal
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -81,5 +84,35 @@ class GroupCommitterTest {
                     }
                 jobs.forEach { it.await() }
             }
+        }
+
+    /**
+     * The leader runs the fsync for every waiter queued behind it, so cancelling the leader (a
+     * client hung up mid-commit) must not abort that shared work. It used to: the leader's
+     * cancelled doSync threw CancellationException, which was handed to every other waiter in
+     * the batch as its "sync error", and the leader then ran the next round's doSync in its
+     * cancelled coroutine, failing those waiters too - a CancellationException out of syncTo for
+     * a caller that was never cancelled and whose write was never made durable.
+     */
+    @Test
+    fun cancellingTheLeaderDoesNotFailOtherWaiters() =
+        runTest {
+            val g = GroupCommitter()
+            val gate = CompletableDeferred<Unit>()
+            var syncCalls = 0
+            val doSync: suspend () -> Unit = {
+                syncCalls++
+                gate.await()
+            }
+            val leader = launch { g.syncTo(1, doSync) }
+            runCurrent() // leader is now inside doSync, waiting on the gate
+            val follower = async { g.syncTo(2, doSync) }
+            runCurrent() // follower is queued for the next round
+            leader.cancel()
+            runCurrent()
+            gate.complete(Unit)
+            follower.await() // must not throw
+            assertTrue(g.syncedSeqValue() >= 2, "follower's write must be synced, syncedSeq=${g.syncedSeqValue()}")
+            assertTrue(syncCalls >= 2, "the follower's round must have run doSync")
         }
 }

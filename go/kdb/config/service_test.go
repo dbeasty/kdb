@@ -123,6 +123,30 @@ func TestLoadServiceFileRejectsUnknownFields(t *testing.T) {
 	}
 }
 
+// A second object (or a stray brace) after the first used to be ignored: Decode reads one value,
+// so {"rbac": true} followed by anything parsed as if the rest were not there.
+func TestLoadServiceFileRejectsTrailingContent(t *testing.T) {
+	for _, body := range []string{
+		`{"namespace": "a/b"} {"rbac": true}`,
+		`{"namespace": "a/b"}}`,
+	} {
+		path := filepath.Join(t.TempDir(), "kdb-service.json")
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadServiceFile(path); err == nil {
+			t.Errorf("config file %q with trailing content was accepted", body)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "kdb-service.json")
+	if err := os.WriteFile(path, []byte("{\"namespace\": \"a/b\"}\n\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadServiceFile(path); err != nil {
+		t.Errorf("trailing whitespace must stay accepted: %v", err)
+	}
+}
+
 func TestLoadServiceFileRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "kdb-service.json")
 	body := `{

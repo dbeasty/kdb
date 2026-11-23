@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -273,6 +274,12 @@ func LoadServiceFile(path string) (*ServiceFile, error) {
 	var f ServiceFile
 	if err := dec.Decode(&f); err != nil {
 		return nil, fmt.Errorf("config file %s: %w", path, err)
+	}
+	// Decode stops after the first JSON value. Anything after it - a stray brace, a second
+	// object pasted below the first - would otherwise be ignored without a word, and the
+	// settings in it silently not applied.
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, fmt.Errorf("config file %s: unexpected content after the top-level object", path)
 	}
 	return &f, nil
 }

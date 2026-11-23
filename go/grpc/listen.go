@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/server"
 	"github.com/limidus/kdb/go/kdb/wire"
@@ -53,9 +54,29 @@ type Listener struct {
 // Addr is the bound local address, useful when the listen URI's port was 0.
 func (l *Listener) Addr() net.Addr { return l.ln.Addr() }
 
-// Close stops accepting, lets in-flight streams finish, and waits for the serve loop to exit.
+// closeGrace is how long Close lets streams end on their own before cutting them off.
+const closeGrace = 5 * time.Second
+
+// Close stops accepting, gives open streams closeGrace to end, then ends the rest, and waits for
+// the serve loop to exit.
+//
+// GracefulStop alone is not enough: it waits for every RPC to finish, and here an RPC is a whole
+// client connection, which ends only when the client hangs up. With one client connected Close
+// never returned, so kdb-service hung on shutdown. Stop ends the remaining streams; each
+// connection's Connect then waits for its in-flight frames and releases its sessions and locks
+// as it does when a client disconnects.
 func (l *Listener) Close() error {
-	l.srv.GracefulStop()
+	graceful := make(chan struct{})
+	go func() {
+		l.srv.GracefulStop()
+		close(graceful)
+	}()
+	select {
+	case <-graceful:
+	case <-time.After(closeGrace):
+		l.srv.Stop()
+		<-graceful
+	}
 	<-l.done
 	return nil
 }

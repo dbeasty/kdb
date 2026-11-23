@@ -168,3 +168,24 @@ func TestDecodeRejectsEmptyInput(t *testing.T) {
 		}
 	}
 }
+
+// A string/bytes/record length of 2^63-1 used to wrap c.pos+n negative in rawN, slip past the
+// bounds check, and reach make([]byte, n) - a "len out of range" panic instead of an error.
+func TestDecodeRejectsLengthPrefixThatOverflowsPosition(t *testing.T) {
+	reg := schema.BuiltinRegistry()
+	for _, typ := range []schema.Type{
+		schema.Prim(schema.PhysicalString),
+		schema.Prim(schema.PhysicalBytes),
+	} {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("%v: decode panicked: %v", typ, r)
+				}
+			}()
+			if _, err := DecodeBytes(hugeLeb, typ, reg); err == nil {
+				t.Fatalf("%v: expected an error for an impossible length prefix", typ)
+			}
+		}()
+	}
+}

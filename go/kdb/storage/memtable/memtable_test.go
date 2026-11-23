@@ -392,3 +392,41 @@ func TestManagerDeleteShadowsPendingFlush(t *testing.T) {
 		t.Fatalf("delete did not shadow the pending-flush value: got %q, want nil", got)
 	}
 }
+
+// TestFlushAfterAFailedFlushKeepsTheFailedGeneration: a retry after a failed flush must write
+// the failed generation out, not replace it. Before the fix a retry with nothing new written
+// returned a zero Handle, and one with new writes persisted only those; either way the failed
+// generation's writes ended up in neither the memtable nor the blob store.
+func TestFlushAfterAFailedFlushKeepsTheFailedGeneration(t *testing.T) {
+	for _, newWrite := range []bool{false, true} {
+		shim := &sealFailingShim{PlatformIOShim: io.NewInMemoryPlatformIO()}
+		mgr := newManager(shim)
+		lost := testKey(t, "failed-gen")
+		mgr.Put(lost, []byte("from the failed flush"))
+
+		shim.failNextSeal = true
+		if _, err := mgr.Flush(0); err == nil {
+			t.Fatal("expected Flush to fail when SealSegment fails")
+		}
+		fresh := testKey(t, "after-failure")
+		if newWrite {
+			mgr.Put(fresh, []byte("new"))
+		}
+		handle, err := mgr.Flush(0)
+		if err != nil {
+			t.Fatalf("retry Flush: %v", err)
+		}
+		if handle == (sstable.Handle{}) {
+			t.Fatalf("newWrite=%v: retry wrote nothing, dropping the failed generation", newWrite)
+		}
+		// Nothing is left in memory: only the blob store can answer now.
+		if got := mgr.blobStore.Get(lost); string(got) != "from the failed flush" {
+			t.Fatalf("newWrite=%v: failed generation not persisted by the retry: got %q", newWrite, got)
+		}
+		if newWrite {
+			if got := mgr.blobStore.Get(fresh); string(got) != "new" {
+				t.Fatalf("new write not persisted: got %q", got)
+			}
+		}
+	}
+}

@@ -180,6 +180,56 @@ class KdbLayer0CodecTest {
         assertContentEquals(b, tail)
         assertEquals(KdbValue.fromJson("""{"n":999}""", t, reg), KdbValue.decodeFromBytes(tail, t, reg))
     }
+
+    /**
+     * A reader whose schema lacks a field must skip it and still read the fields after it - the
+     * forward-compatibility rule Go's decodeRecord implements (skipTagged with the tag it already
+     * read). The Kotlin decoder used to consume the tag and then hand the value bytes to a skipper
+     * that reads its own tag, so the first value byte was taken as a tag and the record misparsed.
+     */
+    @Test
+    fun record_decode_skips_unknown_fields() {
+        val writer = KdbTypeRegistry.create()
+        writer.registerRecord(
+            RecordSchema(
+                name = "R",
+                namespace = "t",
+                fields =
+                    listOf(
+                        FieldSchema(1, "a", P.INT32),
+                        FieldSchema(2, "extraInt", P.INT32),
+                        FieldSchema(3, "extraStr", P.STR),
+                        FieldSchema(4, "b", P.STR),
+                    ),
+            ),
+        )
+        writer.freeze()
+        val reader = KdbTypeRegistry.create()
+        reader.registerRecord(
+            RecordSchema(
+                name = "R",
+                namespace = "t",
+                fields = listOf(FieldSchema(1, "a", P.INT32), FieldSchema(4, "b", P.STR)),
+            ),
+        )
+        reader.freeze()
+        val t = KdbType.Ref("t.R")
+        val written =
+            KdbValue.RecordVal(
+                mapOf(
+                    1 to KdbValue.Int32Val(7),
+                    // 0x00 first byte: read as a tag it is not a valid physical kind for this value.
+                    2 to KdbValue.Int32Val(0x0B0A0900),
+                    3 to KdbValue.StringVal("skipped"),
+                    4 to KdbValue.StringVal("kept"),
+                ),
+            )
+        val blob = written.encodeToBytes(t, writer)
+        assertEquals(
+            KdbValue.RecordVal(mapOf(1 to KdbValue.Int32Val(7), 4 to KdbValue.StringVal("kept"))),
+            KdbValue.decodeFromBytes(blob, t, reader),
+        )
+    }
 }
 
 private object P {

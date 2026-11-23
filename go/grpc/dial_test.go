@@ -2,6 +2,7 @@ package kdbgrpc_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -96,4 +97,51 @@ func contains(haystack, needle string) bool {
 		}
 		return false
 	})()
+}
+
+// client.Client sends from whichever goroutine makes a request, relying on the transport's Send
+// being safe for concurrent use (the TCP and WebSocket ones lock around the write). A gRPC
+// stream is not: concurrent SendMsg calls race (go test -race reports it) and can interleave
+// messages on the wire.
+func TestTransportConcurrentRequests(t *testing.T) {
+	rt, err := embed.OpenMemoryRuntime("demo", testNamespace, schema.None())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(rt.Close)
+	ln, err := kdbgrpc.Listen("grpc://127.0.0.1:0", server.NewKdbServerRuntime(rt), kdbgrpc.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	c, err := client.ConnectWithOptions(ctx, ln.Addr().String(), "", client.ConnectOptions{Transport: kdbgrpc.NewTransport()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	const docID = "33333333-3333-4333-8333-333333333333"
+	if _, err := c.Upsert(ctx, testNamespace, docID, []byte(`{"name":"x"}`)); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 16)
+	for g := 0; g < 16; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 20; i++ {
+				if _, _, err := c.GetJSON(ctx, testNamespace, docID); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent GetJSON: %v", err)
+	}
 }

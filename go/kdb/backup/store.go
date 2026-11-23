@@ -2,6 +2,7 @@ package backup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -33,11 +34,23 @@ func (d *DirStore) Put(_ context.Context, key string, data []byte) error {
 	}
 	// Write-then-rename so a torn write never leaves a half object under the real key - the
 	// manifest-written-last invariant only helps if the objects it names are themselves whole.
+	// Synced before the rename and the directory after it: unsynced, a power cut after a backup
+	// finished could keep the manifest's rename and lose the bytes of the objects it names.
 	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
 		return err
 	}
-	return fsx.Rename(tmp, p)
+	_, werr := f.Write(data)
+	serr := f.Sync()
+	if err := errors.Join(werr, serr, f.Close()); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := fsx.Rename(tmp, p); err != nil {
+		return err
+	}
+	return fsx.SyncDir(filepath.Dir(p))
 }
 
 func (d *DirStore) Get(_ context.Context, key string) ([]byte, error) {

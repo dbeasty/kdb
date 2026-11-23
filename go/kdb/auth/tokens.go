@@ -118,6 +118,30 @@ func (s *RegistryAuthStore) RevokeToken(id string) error {
 func (s *RegistryAuthStore) ListTokens() ([]TokenRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.listTokensLocked()
+}
+
+// revokeTokensOfLocked revokes every live token issued for user. DeleteUser calls it: a token
+// names its user only by id, so a token outliving its user would authenticate as - and carry
+// the roles of - whoever is later created under the same id.
+func (s *RegistryAuthStore) revokeTokensOfLocked(user string) error {
+	tokens, err := s.listTokensLocked()
+	if err != nil {
+		return err
+	}
+	for _, rec := range tokens {
+		if rec.User != user || rec.Revoked {
+			continue
+		}
+		rec.Revoked = true
+		if err := s.writeToken(rec); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *RegistryAuthStore) listTokensLocked() ([]TokenRecord, error) {
 	treeHash, ok, err := s.currentTreeHash(s.userDag)
 	if err != nil || !ok {
 		return nil, err
