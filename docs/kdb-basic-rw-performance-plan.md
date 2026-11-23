@@ -456,8 +456,7 @@ rule should a client-supplied id ever reach these paths.
 
 ### E2 - embedded cache default (decided: option 3)
 
-**Decided (2026-11-22): option 3, still configurable.** Built in
-`perf/rw-e2-embed-cache`:
+**Decided (2026-11-22): option 3, still configurable.** Built in dbeasty/kdb#354:
 
 - `StorageOptions.MemoryBudgetBytes` set: unchanged. The figure is that runtime's (or that host's)
   own.
