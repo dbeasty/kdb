@@ -1,7 +1,8 @@
 # rwcompare: KDB vs MongoDB, basic reads and writes
 
 YCSB-shaped cells (1 KB documents of ten 100-byte fields; zipfian point reads, single-field
-updates, 50/50 and 95/5 mixes, inserts) at fixed operation counts, against a kdb-service, KDB
+updates, 50/50 and 95/5 mixes, inserts; `-dist uniform` or `-dist hot:N` - every read and update on
+N documents - change the key choice) at fixed operation counts, against a kdb-service, KDB
 embedded in the benchmark process, or a mongod. Its own module, so the MongoDB driver never becomes
 a dependency of KDB itself.
 

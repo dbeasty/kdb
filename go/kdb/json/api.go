@@ -99,6 +99,13 @@ func Merge(jsonText, patchJSON string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return MergeValues(base, patch)
+}
+
+// MergeValues is Merge on values already parsed: patch's root keys replace base's, keys base does
+// not have follow base's in patch's order (as Kotlin's merge orders them), and the result is the
+// canonical text of the merged object.
+func MergeValues(base, patch Value) (string, error) {
 	bo, ok := base.(ObjectValue)
 	if !ok {
 		return "", kdberr.NewJsonPathError("left must be JSON object", "$", nil)
@@ -108,17 +115,16 @@ func Merge(jsonText, patchJSON string) (string, error) {
 		return "", kdberr.NewJsonPathError("patch must be JSON object", "$", nil)
 	}
 	out := make(map[string]Value, len(bo.Fields)+len(po.Fields))
-	keys := append([]string(nil), bo.Keys...)
+	keys := make([]string, len(bo.Keys), len(bo.Keys)+len(po.Keys))
+	copy(keys, bo.Keys)
 	for k, v := range bo.Fields {
 		out[k] = v
 	}
-	for k, v := range po.Fields {
-		if _, exists := out[k]; exists {
-			out[k] = v
-			continue
+	for _, k := range po.Keys {
+		if _, exists := out[k]; !exists {
+			keys = append(keys, k)
 		}
-		out[k] = v
-		keys = append(keys, k)
+		out[k] = po.Fields[k]
 	}
 	return ToJSONString(newObject(out, keys)), nil
 }

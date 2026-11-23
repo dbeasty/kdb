@@ -210,6 +210,21 @@ func (a *AdminServer) writeNamespaceMetrics(b *strings.Builder) {
 	for _, s := range stats {
 		fmt.Fprintf(b, "kdb_namespace_commits{namespace=%q} %d\n", s.name, s.commits)
 	}
+	b.WriteString("# HELP kdb_upsert_premerge_total Upserts by what became of the merge worked out before the write gate: current (installed as built), retried (stale, redone off the gate), merged_at_gate (stale with no retry left), none (none could be built).\n# TYPE kdb_upsert_premerge_total counter\n")
+	set := a.runtime.namespaceSet().Runtimes()
+	for _, s := range stats {
+		rt, ok := set[s.name]
+		if !ok {
+			continue
+		}
+		o := rt.PremergeOutcomes()
+		for _, r := range [...]struct {
+			outcome string
+			n       int64
+		}{{"current", o.Current}, {"retried", o.Retried}, {"merged_at_gate", o.MergedAtGate}, {"none", o.None}} {
+			fmt.Fprintf(b, "kdb_upsert_premerge_total{namespace=%q,outcome=%q} %d\n", s.name, r.outcome, r.n)
+		}
+	}
 }
 
 // memoryReporter is a storage adapter that can say what it holds in memory, by structure

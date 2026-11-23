@@ -160,9 +160,10 @@ type ServerEngine struct {
 	flushing atomic.Bool
 	flushes  sync.WaitGroup
 	// prepared holds versions a writer hashed before it reached whatever serializes CommitTree
-	// (PrepareVersion), keyed by document.
+	// (PrepareVersion), keyed by document: up to maxPreparedPerDocument each, since a hot
+	// document has several writers between their prepare and their commit at once.
 	preparedMu       sync.Mutex
-	prepared         map[codec.UUID]preparedVersion
+	prepared         map[codec.UUID][]preparedVersion
 	enlistmentStates map[codec.UUID]storage.EnlistmentEvictionState
 
 	// treeMu guards tree, a running DocumentTree updated incrementally
@@ -574,6 +575,12 @@ type preparedVersion struct {
 // took the gate's own path) is otherwise only replaced by the document's next prepare.
 const maxPreparedVersions = 4096
 
+// maxPreparedPerDocument is how many versions of one document prepared can hold. One was not
+// enough: two writers to a hot document prepare one after the other before either commits, and
+// with one slot the second replaced the first, so the first's commit hashed its version again
+// under the gate - and, taking the slot, left the second to do the same.
+const maxPreparedPerDocument = 4
+
 // PrepareVersion is storage.VersionPreparer: hash doc - its content hash and its leaf folded to
 // every depth of the trie - now, so the CommitTree that stores it only looks the hashes up. Both
 // are functions of the version alone; CommitTree uses them only for exactly this body.
@@ -585,9 +592,14 @@ func (e *ServerEngine) PrepareVersion(namespaceID string, doc document.Document)
 	pv := preparedVersion{json: doc.JSON, hash: h, spine: document.NewLeafSpine(doc.ID, h)}
 	e.preparedMu.Lock()
 	if e.prepared == nil || len(e.prepared) >= maxPreparedVersions {
-		e.prepared = make(map[codec.UUID]preparedVersion)
+		e.prepared = make(map[codec.UUID][]preparedVersion)
 	}
-	e.prepared[doc.ID] = pv
+	pvs := e.prepared[doc.ID]
+	if len(pvs) == maxPreparedPerDocument {
+		// The oldest is the likeliest never to commit: a writer whose premerge went stale.
+		pvs = append(pvs[:0], pvs[1:]...)
+	}
+	e.prepared[doc.ID] = append(pvs, pv)
 	e.preparedMu.Unlock()
 }
 
@@ -595,14 +607,21 @@ func (e *ServerEngine) PrepareVersion(namespaceID string, doc document.Document)
 // body, its leaf spine; otherwise the hash is computed here and the trie folds the leaf itself.
 func (e *ServerEngine) versionHashes(doc document.Document) (codec.Hash, *document.LeafSpine, error) {
 	e.preparedMu.Lock()
-	pv, ok := e.prepared[doc.ID]
-	if ok {
-		delete(e.prepared, doc.ID)
-	}
-	e.preparedMu.Unlock()
-	if ok && pv.json == doc.JSON {
+	pvs := e.prepared[doc.ID]
+	for i := range pvs {
+		if pvs[i].json != doc.JSON {
+			continue
+		}
+		pv := pvs[i]
+		if len(pvs) == 1 {
+			delete(e.prepared, doc.ID)
+		} else {
+			e.prepared[doc.ID] = append(pvs[:i], pvs[i+1:]...)
+		}
+		e.preparedMu.Unlock()
 		return pv.hash, pv.spine, nil
 	}
+	e.preparedMu.Unlock()
 	h, err := doc.ContentHash()
 	return h, nil, err
 }

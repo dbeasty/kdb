@@ -27,13 +27,17 @@ func (d Document) ContentHash() (codec.Hash, error) {
 
 // Merge applies a shallow root-level JSON object patch.
 func (d Document) Merge(patchJSON string) (Document, error) {
-	if _, err := kdbjson.ParseValue(d.JSON); err != nil {
+	// Each side is parsed once; parsing them again to merge was a third of the cost of a merge,
+	// which a stale premerge pays under the write gate.
+	base, err := kdbjson.ParseValue(d.JSON)
+	if err != nil {
 		return Document{}, NewDecodeError("invalid document json", &d.ID, err)
 	}
-	if _, err := kdbjson.ParseValue(patchJSON); err != nil {
+	patch, err := kdbjson.ParseValue(patchJSON)
+	if err != nil {
 		return Document{}, NewDecodeError("invalid patch json", &d.ID, err)
 	}
-	out, err := kdbjson.Merge(d.JSON, patchJSON)
+	out, err := kdbjson.MergeValues(base, patch)
 	if err != nil {
 		return Document{}, NewDecodeError("merge failed", &d.ID, err)
 	}

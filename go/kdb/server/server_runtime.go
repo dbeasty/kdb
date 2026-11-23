@@ -276,6 +276,16 @@ type KdbServerRuntime struct {
 	// ShareGovernanceWith), which then owns stopping the guard.
 	sharedGovernance bool
 
+	// premerges counts what became of Upsert premerges at the gate front (upsert_premerge.go).
+	premerges premergeStats
+	// inFlight is each document's newest premerge whose Upsert has not finished, which the next
+	// Upsert of the document builds on (upsert_premerge.go).
+	inFlight inFlightPremerges
+	// premergeRetries, when set by a test, replaces DefaultPremergeRetries.
+	premergeRetries atomic.Pointer[int32]
+	// afterPremerge, when set by a test, runs between an Upsert's premerge and its queueing.
+	afterPremerge atomic.Pointer[func(attempt int)]
+
 	// hookMu guards beforeSqlExec, which a test may set while the listener is already running.
 	hookMu sync.RWMutex
 	// beforeSqlExec, when set by a test, runs at the top of every SqlExec dispatch - the way a
@@ -698,6 +708,16 @@ func (s *KdbServerRuntime) Commit(namespaceID string, tx document.Transaction, s
 // the gate front), else redo it under the lock. Reading the stored body, parsing both sides,
 // re-encoding and validating were over half of what each write held the gate for; at the front
 // only a hash lookup in the live tree remains when nothing else wrote the document meanwhile.
+//
+// On a document written often, merging onto head made the premerge stale whenever another
+// Upsert of it was queued ahead - 18% of writes at update@32 on zipfian keys, each then merged
+// again under the gate. So the premerge builds on the result of the Upsert of the same document
+// queued ahead of it, when there is one (premerge, inFlight): current at the gate whenever that
+// write commits as built. A premerge that is stale anyway is redone off the gate up to
+// DefaultPremergeRetries times - the gate front hands the gate back (errStalePremerge) and the
+// merge is rebuilt, then queued again: AtomicBTreePartition's retry. Only after that does the
+// gate merge the patch itself, so a document no premerge keeps up with still keeps every field.
+// All attempts share one deadline.
 func (s *KdbServerRuntime) Upsert(namespaceID string, docID codec.UUID, jsonBody string, principal auth.Principal) (document.Commit, error) {
 	txID, err := codec.RandomUUID()
 	if err != nil {
@@ -708,32 +728,85 @@ func (s *KdbServerRuntime) Upsert(namespaceID string, docID codec.UUID, jsonBody
 		Operations: []document.Op{document.WriteOp{DocID: docID, Patch: jsonBody}},
 		Timestamp:  codec.TimestampNow(),
 	})
-	pre, havePre := s.premerge(namespaceID, docID, jsonBody)
+	opts := txOptions{atHead: true, deadline: time.Now().Add(s.writeTimeout())}
 	if s.coalescing() {
-		w := &batchedWrite{tx: tx, docID: docID, bytes: len(jsonBody), op: func(headOK bool, headTree codec.Hash) document.Op {
-			if havePre && headOK && pre.stillCurrent(s, namespaceID, docID, headTree) {
-				return document.WriteOp{DocID: docID, Patch: pre.body, Replace: true, Prevalidated: true}
-			}
-			return document.WriteOp{DocID: docID, Patch: jsonBody}
-		}}
-		if c, err, alone := s.commitCoalesced(w, principal); !alone {
+		if c, err, alone := s.upsertCoalesced(namespaceID, docID, jsonBody, tx, principal); !alone {
 			return c, err
 		}
 	}
 	return s.clientWrite(tx, func() (document.Commit, error) {
-		return s.runTransaction(tx, principal, txOptions{atHead: true}, func() (transactionResult, error) {
-			live := tx
-			head, commit, ok, err := s.Runtime.DAG.HeadCommit()
-			if err != nil {
-				return nil, err
+		for attempt := 0; ; attempt++ {
+			c, err := s.upsertAttempt(namespaceID, docID, jsonBody, tx, principal, opts, attempt)
+			if err != errStalePremerge {
+				return c, err
 			}
-			live.BaseVersion = head
-			if havePre && ok && pre.stillCurrent(s, namespaceID, docID, commit.DocumentTreeHash) {
-				live.Operations = []document.Op{document.WriteOp{DocID: docID, Patch: pre.body, Replace: true, Prevalidated: true}}
-			}
-			return s.UpsertEngine.Commit(live, s.dag, s.Runtime.Storage, s.Schema(), nil, s.clientMessage(live))
-		})
+		}
 	})
+}
+
+// upsertCoalesced is an Upsert's trip through a batch of writes committed together (W8),
+// premerged and recorded in flight like any attempt. A premerge stale at the gate front is merged
+// there, as shared work in the batch's one commit, rather than sent back. alone: the batch was
+// rejected, and the caller commits the write by itself (upsertAttempt, which may retry).
+func (s *KdbServerRuntime) upsertCoalesced(namespaceID string, docID codec.UUID, jsonBody string, tx document.Transaction, principal auth.Principal) (document.Commit, error, bool) {
+	pre, flight, havePre := s.premerge(namespaceID, docID, jsonBody)
+	committed := false
+	if havePre {
+		defer func() { s.inFlight.done(docID, flight, committed) }()
+	}
+	s.runAfterPremergeHook(0)
+	w := &batchedWrite{tx: tx, docID: docID, bytes: len(jsonBody), op: func(headOK bool, headTree codec.Hash) document.Op {
+		switch {
+		case !havePre || !headOK:
+			s.premerges.none.Add(1)
+		case pre.stillCurrent(s, namespaceID, docID, headTree):
+			s.premerges.current.Add(1)
+			return document.WriteOp{DocID: docID, Patch: pre.body, Replace: true, Prevalidated: true}
+		default:
+			s.premerges.mergedAtGate.Add(1)
+		}
+		return document.WriteOp{DocID: docID, Patch: jsonBody}
+	}}
+	c, err, alone := s.commitCoalesced(w, principal)
+	committed = !alone && err == nil
+	return c, err, alone
+}
+
+// upsertAttempt is one trip of an Upsert through the write gate: the premerge, the queue, and at
+// the front either the premerge installed, the patch merged under the gate, or - while retries
+// remain - the gate handed back with errStalePremerge. The premerge leaves inFlight however the
+// attempt ends, so a document's later Upserts never build on a write that is gone.
+func (s *KdbServerRuntime) upsertAttempt(namespaceID string, docID codec.UUID, jsonBody string, tx document.Transaction, principal auth.Principal, opts txOptions, attempt int) (document.Commit, error) {
+	pre, flight, havePre := s.premerge(namespaceID, docID, jsonBody)
+	committed := false
+	if havePre {
+		defer func() { s.inFlight.done(docID, flight, committed) }()
+	}
+	s.runAfterPremergeHook(attempt)
+	mayRetry := attempt < s.premergeRetryLimit()
+	c, err := s.runTransaction(tx, principal, opts, func() (transactionResult, error) {
+		live := tx
+		head, commit, ok, err := s.Runtime.DAG.HeadCommit()
+		if err != nil {
+			return nil, err
+		}
+		live.BaseVersion = head
+		switch {
+		case !havePre || !ok:
+			s.premerges.none.Add(1)
+		case pre.stillCurrent(s, namespaceID, docID, commit.DocumentTreeHash):
+			s.premerges.current.Add(1)
+			live.Operations = []document.Op{document.WriteOp{DocID: docID, Patch: pre.body, Replace: true, Prevalidated: true}}
+		case mayRetry:
+			s.premerges.retried.Add(1)
+			return nil, errStalePremerge
+		default:
+			s.premerges.mergedAtGate.Add(1)
+		}
+		return s.UpsertEngine.Commit(live, s.dag, s.Runtime.Storage, s.Schema(), nil, s.clientMessage(live))
+	})
+	committed = err == nil
+	return c, err
 }
 
 // Replace writes jsonBody as the whole of docID in namespaceID - whatever was stored before - at the
@@ -794,39 +867,61 @@ type premergedUpsert struct {
 	absent bool
 }
 
-// premerge resolves an Upsert against the live head before the gate. ok is false when the gate
-// should do the work as it always has: no DAG, a body that does not merge (the gate reports the
-// error), or storage that cannot say which version a tree holds. The schema is still checked at
-// the gate, against the schema as it is then; only the JSON-object check is not repeated.
-func (s *KdbServerRuntime) premerge(namespaceID string, docID codec.UUID, patch string) (premergedUpsert, bool) {
+// premerge resolves an Upsert before the gate and records it in inFlight, which the caller leaves
+// with inFlight.done. ok is false when the gate should do the work as it always has: no DAG, a body
+// that does not merge (the gate reports the error), or storage that cannot say which version a
+// tree holds. The schema is still checked at the gate, against the schema as it is then; only the
+// JSON-object check is not repeated.
+//
+// The merge is onto the version the document will have when this write reaches the gate, as far
+// as can be told now: the result of the newest Upsert of it still in flight, if there is one -
+// it is queued ahead of this one - else the version at head. On a document written often, every
+// writer merging onto head while the writers ahead of it were still queued found its merge stale
+// at the gate; built on the write ahead, it is current there whenever that write commits as built.
+// Whether it is current is still decided at the gate front, by content hash, so building on a
+// write that then fails or is redone only costs this one a retry.
+func (s *KdbServerRuntime) premerge(namespaceID string, docID codec.UUID, patch string) (*premergedUpsert, *inFlightPremerge, bool) {
 	hasher, isHasher := s.Runtime.Storage.(storage.DocumentHasher)
 	if s.dag == nil || !isHasher {
-		return premergedUpsert{}, false
+		return nil, nil, false
 	}
 	_, commit, ok, err := s.Runtime.DAG.HeadCommit()
 	if err != nil || !ok {
-		return premergedUpsert{}, false
+		return nil, nil, false
 	}
 	tree := commit.DocumentTreeHash
 	source, found, resolved := hasher.DocumentHash(namespaceID, docID, tree)
 	if !resolved {
-		return premergedUpsert{}, false
+		return nil, nil, false
 	}
-	pre := premergedUpsert{body: patch, absent: !found}
-	if !found {
-		if _, err := document.FromJSONWithID(docID, patch); err != nil {
-			return premergedUpsert{}, false
+	pre := &premergedUpsert{body: patch}
+	var base *document.Document
+	ahead := s.inFlight.newest(docID)
+	if ahead != nil {
+		h, err := (document.Document{ID: docID, JSON: ahead.pre.body}).ContentHash()
+		if err != nil {
+			return nil, nil, false
 		}
-	} else {
+		base, pre.source = &document.Document{ID: docID, JSON: ahead.pre.body}, h
+	} else if found {
 		stored, err := s.Runtime.Storage.GetDocument(namespaceID, docID, tree)
 		if err != nil || stored == nil {
-			return premergedUpsert{}, false
+			return nil, nil, false
 		}
-		merged, err := stored.Merge(patch)
+		base, pre.source = stored, source
+	} else {
+		pre.absent = true
+	}
+	if base == nil {
+		if _, err := document.FromJSONWithID(docID, patch); err != nil {
+			return nil, nil, false
+		}
+	} else {
+		merged, err := base.Merge(patch)
 		if err != nil {
-			return premergedUpsert{}, false
+			return nil, nil, false
 		}
-		pre.body, pre.source = merged.JSON, source
+		pre.body = merged.JSON
 	}
 	// The version's hashing too: its content hash and Merkle leaf depend on nothing the gate
 	// decides. (Cassandra keeps Merkle trees off the write path altogether and builds them at
@@ -835,11 +930,11 @@ func (s *KdbServerRuntime) premerge(namespaceID string, docID codec.UUID, patch 
 	if preparer, ok := s.Runtime.Storage.(storage.VersionPreparer); ok {
 		preparer.PrepareVersion(namespaceID, document.Document{ID: docID, JSON: pre.body})
 	}
-	return pre, true
+	return pre, s.inFlight.push(docID, pre, ahead), true
 }
 
 // stillCurrent reports whether the document the merge was built from is still the one tree holds.
-func (p premergedUpsert) stillCurrent(s *KdbServerRuntime, namespaceID string, docID codec.UUID, tree codec.Hash) bool {
+func (p *premergedUpsert) stillCurrent(s *KdbServerRuntime, namespaceID string, docID codec.UUID, tree codec.Hash) bool {
 	hasher, ok := s.Runtime.Storage.(storage.DocumentHasher)
 	if !ok {
 		return false
@@ -969,6 +1064,17 @@ type txOptions struct {
 	// atHead marks a transaction that takes its base version at the front of the write gate
 	// (Upsert): there is no earlier base for the queue wait to pin.
 	atHead bool
+	// deadline, when set, is when the caller stops waiting for the gate, in place of WriteTimeout
+	// from now: an Upsert that queues again after a stale premerge keeps its first deadline.
+	deadline time.Time
+}
+
+// writeTimeout is how long a writer may wait for the write gate.
+func (s *KdbServerRuntime) writeTimeout() time.Duration {
+	if s.WriteTimeout > 0 {
+		return s.WriteTimeout
+	}
+	return DefaultWriteTimeout
 }
 
 // runTransaction holds every cross-cutting concern Commit/Upsert/Replay share (draining,
@@ -1007,11 +1113,11 @@ func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal aut
 	if !opts.atHead {
 		defer s.pinBaseTree(tx.BaseVersion)()
 	}
-	timeout := s.WriteTimeout
-	if timeout <= 0 {
-		timeout = DefaultWriteTimeout
+	deadline := opts.deadline
+	if deadline.IsZero() {
+		deadline = time.Now().Add(s.writeTimeout())
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 
 	// Reserve the memory this commit is estimated to hold, for as long as it holds it. Held

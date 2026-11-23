@@ -19,6 +19,9 @@ commit graph's resident tier, unbounded between maintenance passes - and is now 
 container at this workload drops from 1.29 GB to 0.9 GB (MongoDB 7: 0.6-0.7 GB), write throughput
 unchanged. Nothing waits on the user: E2 is decided (option 3, built; below), and W8 is built, off
 by default - whether to turn it on by default is open.
+**W9 (stale premerges) done:** an Upsert's premerge builds on the Upsert of the same document
+queued ahead of it - stale premerges at update@32 17.7% -> 0.9%, gate CPU per commit -25%,
+concurrent updates +17-19% under fast durability (below).
 
 ## Goal and constraints
 
@@ -631,7 +634,7 @@ the same run would have held all 2,000,000 resident (~800 MB).
 |---|---|---|---|---|
 | W8 | **Several writes per commit**: the only way past the per-namespace commit rate (~22-25k/s) | group commit, taken from one shared sync to one shared update | concurrent writes towards MongoDB's 46-60k/s | **built, off by default (below)**: 1.8-2.2x writes at 32 workers, -9 to -14% cold point reads; whether to turn it on by default is open |
 | E2 | Embedded cache default: fixed 64 MiB vs machine-sized | caches sized from the heap | embedded reads with hot data > 64 MiB | **decided: option 3, built (below)** |
-| W9 | **Stale premerges** (new, from the W7 profile): a zipfian-hot document is often written again between an Upsert's premerge and its turn at the gate, so the gate re-merges it - 11% of gate time at update@32. Merge faster at the gate: one parse of the stored body instead of several - the merge is of top-level keys only | `AtomicBTreePartition` retries its CAS before taking the lock | up to ~10% of gate time on hot keys | low (faster merge) |
+| W9 | **Stale premerges** (from the W7 profile): a zipfian-hot document is often written again between an Upsert's premerge and its turn at the gate, so the gate re-merged it - 18% of writes, 11% of gate time at update@32 | `AtomicBTreePartition` retries its CAS before taking the lock (the retry); building on the Upsert queued ahead has no Cassandra counterpart | up to ~10% of gate time on hot keys | **done (below): stale 17.7% -> 0.9%, gate CPU per commit -25%** |
 | M1 | Bound the commit graph's resident tier: flush by size, merge graph segments size-tiered, stream the flush | memtable flush on heap space; SizeTieredCompactionStrategy; per-SSTable bloom filters; trickle_fsync | ~300 MiB less at this workload, no 2x flush peak, bounded at any write rate | **done** (#356): 1,292 -> 906 MiB, graph 333 -> 20 MiB, writes unchanged; see [M1 - measured](#m1---measured) |
 
 ### W8 - several writes per commit (built, off by default)
@@ -893,6 +896,109 @@ Options:
 Recommendation: 1 or 3 - a library should not size itself like a server; the choice is the
 user's.
 
+### W9 - an Upsert builds on the Upsert queued ahead of it
+
+**What the profile showed.** W7's profile (update at 32 workers, fast) had the gate re-merging
+documents whose premerge went stale at 11% of its time. A counter added here,
+`kdb_upsert_premerge_total{outcome}`, measures it directly: at update@32, **17.7% of Upserts reached
+the gate front with a stale premerge** - which is what queueing predicts: YCSB's zipfian keys put
+8.7% of writes on the hottest document, and about 30 commits pass between an Upsert's premerge and
+its turn. Each stale one paid, under the gate, the merge (10-12% of gate CPU), its version's
+hashing and leaf fold (5-6%), and the patch path's checks.
+
+**What was tried**, each profiled at update@32 (fast, zipf, `prof.sh`, one 800k-op run; outcome
+counters from `/metrics`; the first five rows ran while another project's `llama-server` loaded the
+host, so only their shares and counts are comparable, not their speed):
+
+| variant | stale at the gate front | then merged under the gate | re-merge + fold + hash, share of gate CPU |
+|---|--:|--:|--:|
+| base | 17.7% | 17.7% | 16% |
+| retry once off the gate (AtomicBTreePartition's CAS retry) | 17.5% | 11.5% (66% of retries stale again) | 14% |
+| merge parses once, several prepared versions per document | 17.7% | 17.7% | 12% |
+| build on the Upsert queued ahead | 1.3% | 1.3% | 1.8% |
+| **build on the Upsert queued ahead + retry once (shipped)** | **0.9%** | **0.24%** (72% of retries current) | **~1%** |
+
+A retry alone hardly helps: it queues behind the same ~30 commits, and for a hot document another
+write lands in that window again. What helps is not merging onto head while another Upsert of the
+same document is queued ahead: a premerge now builds on the result of the newest unfinished Upsert
+of the document (`inFlightPremerges`), and is current at the gate whenever that write commits as
+built. The gate front still decides by content hash, so no update can be lost
+(`TestConcurrentUpsertsToOneDocumentKeepEveryField` and new tests for every way a chain breaks).
+A write that overtook the one it was built on, or that is built - however indirectly - on one that
+went stale or failed, is never built on, and a committed write never is (head is); with that,
+the retry is current 72% of the time and keeps what the gate still merges at a quarter of a
+percent. With writes committed in batches (W8, `--coalesce-writes`), an Upsert's premerge is
+built on the write ahead and released the same way; one stale at its batch's gate front is merged
+there, as shared work in the batch's one commit, not sent back. Cassandra has no counterpart for the chaining - its writes do not read before writing,
+mutations are merged into the partition cell by cell - the retry is AtomicBTreePartition's.
+
+The two smaller fixes are kept: `Document.Merge` parsed each side twice (a third of a merge), and
+the engine's prepared versions were one per document, so two writers to a hot document replaced
+each other's hashes and both hashed again under the gate. The merge also stopped ordering new
+keys by Go map iteration - a patch adding two or more keys could store different text, and a
+different content hash, each run; they now follow the patch, as Kotlin's merge orders them.
+
+**Gate CPU per commit** (profiles started at load < 8, alternated): base 41.5 and 38.8 us;
+shipped 29.0 and 31.9 us (no-retry variant 29.2-30.6 us). update@32 in those runs: base 18,691
+and 22,172 ops/s; shipped 25,642 and 23,942. On a few documents everyone writes (`-dist hot:16`,
+update@32): base 16,757 ops/s at 52.6 us of gate CPU per commit (re-merge 35%, fold 12%, hash
+5%); shipped 26,538 ops/s at 21.2 us, 0.5% merged under the gate.
+
+**A/B against main** (`ab.sh`, 0cd84dc5 - the follow-up stack and E2 - vs main + W9, two
+alternated passes, every run started at load < 8; reads are the control).
+
+fast:
+
+| cell | c | main | w9 | w9/main | write p99 / p99.9 / max ms |
+|---|--:|--:|--:|--:|---|
+| load | 32 | 24,798 (21,947 / 27,649) | 26,525 (27,241 / 25,809) | 1.07x | main: 2.9/11.2/247, 2.2/8.5/35; w9: 2.4/9.8/39, 2.5/10.6/42 |
+| read | 1 | 12,600 (12,227 / 12,973) | 12,484 (12,656 / 12,312) | 0.99x |  |
+| read | 8 | 94,465 (89,628 / 99,302) | 95,788 (95,000 / 96,577) | 1.01x |  |
+| read | 32 | 116,580 (110,911 / 122,248) | 114,758 (114,301 / 115,215) | 0.98x |  |
+| update | 1 | 7,604 (7,466 / 7,741) | 8,315 (8,324 / 8,305) | 1.09x | main: 0.2/0.4/14, 0.2/0.5/9; w9: 0.2/0.4/9, 0.2/0.4/10 |
+| update | 8 | 21,805 (21,822 / 21,788) | 25,517 (26,559 / 24,475) | 1.17x | main: 1.0/3.9/17, 1.0/4.2/13; w9: 0.9/4.0/13, 0.9/4.2/17 |
+| update | 32 | 20,345 (21,068 / 19,623) | 24,120 (25,470 / 22,771) | 1.19x | main: 3.7/8.1/24, 3.8/7.8/26; w9: 3.1/9.0/15, 3.2/10.2/13 |
+| mixed50 | 1 | 9,488 (9,273 / 9,703) | 9,733 (9,971 / 9,495) | 1.03x | main: 0.3/0.7/2, 0.2/0.4/7; w9: 0.2/0.5/8, 0.3/0.8/7 |
+| mixed50 | 8 | 42,674 (43,161 / 42,187) | 43,143 (43,554 / 42,733) | 1.01x | main: 0.7/4.2/6, 0.7/4.9/6; w9: 0.8/5.2/7, 0.7/5.2/8 |
+| mixed50 | 32 | 42,061 (42,239 / 41,883) | 47,121 (48,294 / 45,948) | 1.12x | main: 3.6/9.0/28, 3.3/9.1/15; w9: 3.3/9.8/46, 3.2/11.6/18 |
+| insert | 1 | 8,492 (8,469 / 8,516) | 8,461 (8,636 / 8,285) | 1.00x | main: 0.2/0.4/4, 0.2/0.5/3; w9: 0.2/0.5/5, 0.2/0.5/8 |
+| insert | 8 | 23,277 (24,879 / 21,675) | 23,703 (24,785 / 22,621) | 1.02x | main: 0.7/3.8/12, 0.8/4.2/16; w9: 0.8/4.6/13, 0.8/4.1/18 |
+| insert | 32 | 22,053 (22,922 / 21,183) | 23,115 (24,388 / 21,842) | 1.05x | main: 2.4/13.7/17, 2.5/15.9/21; w9: 2.5/13.1/15, 2.7/17.0/20 |
+
+Concurrent updates gain 17-19% and mixed50@32 12%, with the read control within 2%. The
+single-writer update gains too (9%): a lone writer waits for its premerge, and the merge parses
+each side once now. Write p99 at 32 workers fell (3.7 -> 3.1 ms) and so did the worst write
+(25 -> 14 ms); p99.9 at update and mixed50 @32 came out 1-2 ms higher (8 -> 9-10 ms) - the same
+tail with and without the retry in the profiles, and within what p99.9 moves between passes of
+one binary.
+
+durable, three alternated passes, each run started only once the host's disk was quiet (under
+1,500 tps on `disk0` as well as load < 8; a first durable A/B ran while macOS `mediaanalysisd`
+and another project's test suite kept the disk at 8-17k tps - one W9 pass broke down, the read
+control fell to 0.91x at one worker, and mixed50@1 came out 0.71x; quiet, it is 1.02x):
+
+| cell | c | main | w9 | w9/main | write p99 / p99.9 / max ms |
+|---|--:|--:|--:|--:|---|
+| load | 32 | 26,748 (27,437 / 27,349 / 25,459) | 27,108 (27,313 / 28,169 / 25,841) | 1.01x | main: 3.3/9.5/50, 2.9/7.3/46, 3.2/9.4/49; w9: 3.1/9.6/48, 2.8/7.9/47, 3.1/9.7/48 |
+| read | 1 | 14,269 (14,134 / 14,721 / 13,953) | 14,129 (14,014 / 14,139 / 14,234) | 0.99x |  |
+| read | 8 | 101,992 (102,683 / 104,368 / 98,925) | 103,203 (105,604 / 103,846 / 100,159) | 1.01x |  |
+| read | 32 | 120,707 (121,945 / 124,065 / 116,110) | 121,466 (124,657 / 120,399 / 119,340) | 1.01x |  |
+| update | 1 | 4,435 (4,857 / 4,060 / 4,387) | 4,408 (4,054 / 4,280 / 4,890) | 0.99x | main: 0.3/0.5/10, 0.3/0.5/9, 0.3/0.6/10; w9: 0.4/0.7/13, 0.3/0.7/13, 0.3/0.7/10 |
+| update | 8 | 12,417 (13,748 / 12,172 / 11,331) | 12,606 (12,182 / 12,464 / 13,172) | 1.02x | main: 1.4/3.9/10, 1.5/3.9/10, 1.6/4.4/11; w9: 1.5/4.6/13, 1.5/4.4/10, 1.4/4.0/13 |
+| update | 32 | 23,253 (23,810 / 23,781 / 22,168) | 24,832 (25,057 / 24,939 / 24,498) | 1.07x | main: 4.6/8.5/13, 4.2/6.8/23, 4.4/7.7/14; w9: 3.9/8.4/20, 3.8/8.1/13, 3.8/9.3/13 |
+| mixed50 | 1 | 6,522 (7,492 / 6,055 / 6,021) | 6,624 (7,561 / 6,275 / 6,035) | 1.02x | main: 0.3/0.6/7, 0.3/0.9/7, 0.4/1.2/7; w9: 0.3/0.8/26, 0.3/1.7/7, 0.4/1.4/7 |
+| mixed50 | 8 | 21,798 (23,404 / 21,339 / 20,651) | 22,494 (25,130 / 21,780 / 20,574) | 1.03x | main: 1.5/5.3/7, 1.4/5.2/7, 1.4/4.7/7; w9: 1.3/4.7/7, 1.4/4.9/8, 1.4/5.3/8 |
+| mixed50 | 32 | 43,196 (44,936 / 43,598 / 41,055) | 45,022 (46,591 / 46,207 / 42,269) | 1.04x | main: 4.1/9.1/24, 4.3/8.1/20, 4.3/8.6/39; w9: 4.1/8.8/16, 3.9/8.6/16, 4.1/9.8/22 |
+| insert | 1 | 4,101 (4,116 / 4,137 / 4,050) | 4,371 (4,998 / 4,097 / 4,018) | 1.07x | main: 0.4/0.7/6, 0.3/0.9/6, 0.4/0.8/4; w9: 0.3/1.3/5, 0.3/0.9/6, 0.4/0.8/6 |
+| insert | 8 | 12,063 (12,559 / 11,645 / 11,984) | 12,837 (14,142 / 12,744 / 11,624) | 1.06x | main: 1.4/4.9/12, 1.4/4.7/19, 1.4/5.5/13; w9: 1.2/4.7/12, 1.3/3.6/11, 1.4/5.1/14 |
+| insert | 32 | 22,922 (23,965 / 21,750 / 23,050) | 24,517 (26,080 / 24,732 / 22,739) | 1.07x | main: 3.3/13.1/15, 3.6/14.8/17, 3.3/13.0/29; w9: 3.4/13.6/16, 3.4/12.4/16, 3.5/13.7/17 |
+
+Durable writes wait for their sync as well as the gate, so the gate's 25% shows as 7% at
+update@32 and 4% at mixed50@32, with write p99 at 32 workers lower (4.4 -> 3.8 ms); the read
+control is within 1%, single-writer cells within 2%. p99.9 at 32 workers is again up to ~1 ms
+higher in some cells: likely the same fixed-length background stalls (flushes, GC) now catching
+more writes per second, not the retry - the profiles' tails were equal with and without it.
+
 ## Results after the follow-up stack
 
 Final matrix, 2026-11-22, on the top of the stack (#352) with kdb-service's defaults (on Linux:
@@ -1115,6 +1221,13 @@ What it says:
   uncounted, and the 1.2 GB shown was Go heap (cgroup `anon`). Read `memory.stat` (a sidecar
   container with `--pid container:<kdb> --cgroupns host -v /sys/fs/cgroup:/sys/fs/cgroup:ro`)
   before blaming mapped files or the page cache.
+- **Count a rate rather than infer it from a profile, and know which numbers survive host load.**
+  W7's profile put stale premerges at 11% of gate time; a counter (`kdb_upsert_premerge_total`)
+  showed they were 18% of writes and cost about a quarter of the gate once everything they redid
+  under it was counted. While another project's `llama-server` took ~3 of the host's CPUs, the
+  counters and the shares of gate CPU held steady across runs; ops/s and absolute CPU per commit
+  did not (a guest's CPU time inflates under host contention). `uptime` alone did not name it:
+  `ps -Ao pcpu,comm -r` did.
 - **Read cells swing 5-9% between runs of the same code.** W7's read control came out 5% low in
   both passes of a short-cell A/B, then equal in one pass and 9% low in the other of a 1M-op rerun,
   for a change that runs nothing on the read path. Use 1M-op read cells, and more than two passes
