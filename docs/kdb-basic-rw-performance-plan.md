@@ -10,14 +10,15 @@ R2, W7 and E1 are implemented and measured in a stack of one PR each on top of i
 [Done in the follow-up stack](#done-in-the-follow-up-stack)). Final matrix: reads 1.3-1.9x
 MongoDB; durable writes 0.80-1.13x MongoDB `j:true` (v0.9.4: 0.43-0.69x) with worst cases 2-4x
 lower than before D2 and below MongoDB's; concurrent writes under fast durability still
-0.36-0.47x, bound by the per-namespace commit rate (~20-24k/s), which only W8 (several writes per
-commit) gets past. M1 found what holds KDB's memory - the commit graph's
-resident tier, unbounded between maintenance passes - and is now fixed (branch
-`perf/rw-m1-graph-memory`, [M1 - measured](#m1---measured)): the commit graph flushes by size and
-merges size-tiered, the container at this workload drops from 1.29 GB to 0.9 GB (MongoDB 7:
-0.6-0.7 GB), write throughput unchanged.
-**Waiting on the user:** W8 (design below, with the decisions it needs). E2 is decided (option 3,
-built; below).
+0.36-0.47x, bound by the per-namespace commit rate (~20-24k/s). **W8 (several writes per commit)
+is now built, off by default (`--coalesce-writes`):** it roughly doubles concurrent writes at 32
+workers (update 1.81x, insert 2.03x, fast) at the cost of 9-14% on cold point reads, see
+[W8](#w8---several-writes-per-commit-built-off-by-default). M1 found what holds KDB's memory - the
+commit graph's resident tier, unbounded between maintenance passes - and is now fixed (#356,
+[M1 - measured](#m1---measured)): the commit graph flushes by size and merges size-tiered, the
+container at this workload drops from 1.29 GB to 0.9 GB (MongoDB 7: 0.6-0.7 GB), write throughput
+unchanged. Nothing waits on the user: E2 is decided (option 3, built; below), and W8 is built, off
+by default - whether to turn it on by default is open.
 
 ## Goal and constraints
 
@@ -227,7 +228,8 @@ Measured, the branch with no flags against v0.9.4 with no flags, durable, two pa
 
 One PR per item, stacked on this branch in the order below, each measured against the one before
 it with `ab.sh` (binaries alternated over two passes; read cells are the control): D2 #346 ->
-W6 #347 -> W5 #348 -> R1 #349 -> R2 #350 -> W7 #351 -> E1 #352 -> this document's results.
+W6 #347 -> W5 #348 -> R1 #349 -> R2 #350 -> W7 #351 -> E1 #352 -> this document's results (#353)
+-> W8, several writes per commit (below, under the plan).
 
 At the matrix level only D2 moves anything measurable (durable tails). W6, W5, R1, R2 and W7 each
 land within +-5% of their predecessor: they remove real work, but not work that limits these
@@ -627,12 +629,12 @@ the same run would have held all 2,000,000 resident (~800 MB).
 
 | # | item | Cassandra mechanism | expected | status |
 |---|---|---|---|---|
-| W8 | **Several writes per commit**: the only way past the per-namespace commit rate (~22-25k/s) | commit-log group sync + applying a batch of mutations as one update | concurrent writes towards MongoDB's 46-60k/s | **design below; needs the user's decisions before any code** |
+| W8 | **Several writes per commit**: the only way past the per-namespace commit rate (~22-25k/s) | group commit, taken from one shared sync to one shared update | concurrent writes towards MongoDB's 46-60k/s | **built, off by default (below)**: 1.8-2.2x writes at 32 workers, -9 to -14% cold point reads; whether to turn it on by default is open |
 | E2 | Embedded cache default: fixed 64 MiB vs machine-sized | caches sized from the heap | embedded reads with hot data > 64 MiB | **decided: option 3, built (below)** |
 | W9 | **Stale premerges** (new, from the W7 profile): a zipfian-hot document is often written again between an Upsert's premerge and its turn at the gate, so the gate re-merges it - 11% of gate time at update@32. Merge faster at the gate: one parse of the stored body instead of several - the merge is of top-level keys only | `AtomicBTreePartition` retries its CAS before taking the lock | up to ~10% of gate time on hot keys | low (faster merge) |
 | M1 | Bound the commit graph's resident tier: flush by size, merge graph segments size-tiered, stream the flush | memtable flush on heap space; SizeTieredCompactionStrategy; per-SSTable bloom filters; trickle_fsync | ~300 MiB less at this workload, no 2x flush peak, bounded at any write rate | **done** (#356): 1,292 -> 906 MiB, graph 333 -> 20 MiB, writes unchanged; see [M1 - measured](#m1---measured) |
 
-### W8 - several writes per commit (design; not implemented)
+### W8 - several writes per commit (built, off by default)
 
 **Why:** every write is one commit, and a commit does serially, under the namespace's write gate,
 work whose cost does not depend on how much the commit changes: one Merkle path from leaf to root
@@ -644,23 +646,152 @@ reached one write per commit. Committing the writes that are waiting at the gate
 that fixed cost once per batch, and N documents' Merkle paths share their upper levels, so the
 trie work per write falls too.
 
-**Cassandra:** the commit log's group sync (`commitlog_sync: group`/`batch`) already shares one
-fsync across concurrent mutations, which KDB copies today; W8 goes one step further, like applying
-an unlogged batch of mutations to a partition as one update: the memtable (here, the trie) is
-updated once for all of them.
+Approved by the user ("Build W8") and built as designed: with `CoalesceWrites` on
+(`--coalesce-writes`, `KDB_COALESCE_WRITES`, `coalesceWrites` in the config file,
+`docdb.Options.CoalesceWrites`), the writer that reaches a namespace's write gate commits the
+last-write-wins single-document writes queued behind it together with its own
+(`go/kdb/server/write_batch.go`):
 
-**Mechanism (flat combining at the gate):** the write gate becomes a queue of requests instead of a
-semaphore. The writer that takes the gate drains the requests queued behind it - up to a cap (64
-writes or 1 MiB of bodies) - and commits their operations as one transaction: one `CommitTree`
-(one trie update over all the documents), one DAG append, one log record. Each waiting writer is
-handed the result for its own write and waits for that commit's durability, exactly as now. Off
-by default (`--coalesce-writes`, `coalesceWrites` in the config file, `StorageOptions` for
-embedders); with it off nothing changes.
+- A batchable write (`Upsert`, `Replace`, `Delete`; not under projection write-back) passes the
+  same checks before the gate as any write - admission, authorization, its memory grant - then
+  joins a queue and waits for the gate. If another writer takes it into a batch first, it stops
+  waiting for the gate (`writeGate.acquireUnlessServed`) and waits for that batch's commit
+  instead; if it gets the gate itself, it leads a batch.
+- The leader takes itself, then the queued writes in arrival order, up to 64 writes / 16 KiB of
+  bodies, stopping at the first write to a document already in the batch. It works out each
+  write's operation against the head it lands on (an Upsert's premerge if still current, else
+  the merge at the gate, exactly as alone) and commits them as one transaction through the same
+  path every write takes (`commitAtGateFront`: indexes, engine, log, sync, notifications).
+- Every writer in the batch is answered with the batch's commit once it is durable. A batch the
+  engine rejects before committing (one write's schema or index violation) is retried write by
+  write, so each gets the answer it would have had alone; an error after the commit (a failed
+  sync) is every member's, as it would be under group commit anyway.
 
-**What it is allowed to batch:** only last-write-wins writes at head - `Upsert`, `Replace`,
-`Delete` (the paths that today never conflict). Transactions with a base version (STRICT/conflict
-detection), schema migrations, cross-namespace groups and anything with attachments stay one per
-commit, so no conflict report ever has to be split across clients.
+*Cassandra:* group commit - the commit log's group/batch sync already lets concurrent mutations
+share one sync, and KDB copied that; W8 takes it from one shared sync to one shared update.
+
+**The open questions, answered:**
+
+1. *Does anything rely on one commit per client write?* No. Checked each consumer:
+   - the wire `Upsert` reply carries only the commit hash, and a batch's writers all get that
+     commit's hash, which names a state holding their write - as a multi-op transaction's does;
+   - transaction ids: `Upsert`, `Replace` and `Delete` mint theirs on the server and return
+     none, and the id index (`txIndex`, what a retry looks a write up by) is consulted only for
+     `Commit`/`Replay`, which are never batched;
+   - stream subscribers (Mode 1/2) are woken per commit and caught up by walking the DAG; the
+     control server's SSE feed publishes per commit with its operation count;
+   - peer sync ships commits as they are - multi-op commits are what transactions already make -
+     and resolves conflicts per document under either policy; the home/fence check is per
+     authoring node, and every batch is authored by this node;
+   - the Kotlin replica uses commit hashes only to fetch blobs at a synced commit;
+   - per-document history: unchanged, because a batch never holds two writes to one document -
+     every version still has its own commit and tree. Commit-level history (and
+     `kdb_namespace_commits`) shows fewer, larger commits.
+
+   Nothing here changes the format of a commit or what one means (operations applied atomically
+   onto one parent), so nothing peers or clients see changes meaning. The one behavioural change
+   is coupling inside a batch: its writes become visible together and durable together.
+2. *May a batch mix users?* Yes. A commit records no principal - its author is the node, its
+   message the node's home stamp - and authorization is decided for each write, against its own
+   principal, before it can join a batch. There is no per-commit audit record for a mixed batch
+   to blur. Should a commit ever carry a principal, batches would have to be formed per
+   principal - one more stopping rule in `writeBatcher.lead`.
+3. *Batch cap?* 64 writes or 16 KiB of bodies, whichever comes first; a write larger than that
+   commits alone. The first cut was 1 MiB, and it was measured to cost reads: a version is read
+   back through its commit's frame, a cold read decompresses the whole frame, and batches of ~31
+   1 KB documents made ~31 KB frames - zstd was 18% of kdb-service's CPU in point reads right
+   after a batched load, and reads ran 13-20% below base. 16 KiB is Cassandra's default
+   compressed chunk (`chunk_length_in_kb`), the bound on what one of its reads decompresses, and
+   the bound `engine/large_frame_bodies.go` already holds KDB's reads to. With ~1 KB documents
+   that is a batch of ~15, which keeps most of the gain: the fixed cost a batch shares is ~25 us,
+   so per-write gate time is ~15 + 25/15 us at 15 writes against ~15 + 25/31 us at 31. The count
+   cap only binds for documents under ~250 bytes.
+
+**Measured** - `--coalesce-writes` against the top of the stack without it (#352/#353), 100k
+documents, two passes in alternating order, every pass checked against the host's load (a pass
+whose 1-minute load passed 13 was rerun; this 16-core host idled at 6-8 that night). ops/s, mean
+(pass 1 / pass 2); write p99.9 / max ms per pass.
+
+Fast durability:
+
+| cell | c | base | w8 | w8 / base | write p99.9 / max ms (base, w8) |
+|---|--:|--:|--:|--:|---|
+| load | 32 | 23,951 (24,353 / 23,548) | 52,588 (51,337 / 53,840) | 2.20x | 9.0/62, 11.6/52 ; 8.6/16, 8.4/16 |
+| read | 1 | 13,995 (14,383 / 13,607) | 11,980 (12,399 / 11,562) | 0.86x |  |
+| read | 8 | 93,842 (97,672 / 90,012) | 85,197 (80,394 / 89,999) | 0.91x |  |
+| read | 32 | 118,674 (124,589 / 112,760) | 101,754 (94,445 / 109,064) | 0.86x |  |
+| update | 1 | 7,757 (7,607 / 7,907) | 7,805 (7,716 / 7,894) | 1.01x | 0.5/13, 0.4/12 ; 0.6/12, 0.4/11 |
+| update | 8 | 21,681 (22,209 / 21,154) | 28,652 (28,292 / 29,012) | 1.32x | 4.1/12, 4.4/20 ; 4.1/11, 4.5/11 |
+| update | 32 | 20,197 (20,275 / 20,120) | 36,562 (36,094 / 37,030) | 1.81x | 8.1/17, 8.3/15 ; 6.9/13, 6.9/13 |
+| mixed50 | 1 | 9,621 (9,407 / 9,836) | 10,213 (9,540 / 10,886) | 1.06x | 0.7/6, 0.6/41 ; 1.5/8, 0.5/4 |
+| mixed50 | 8 | 40,040 (40,910 / 39,170) | 48,025 (46,758 / 49,293) | 1.20x | 5.2/7, 5.1/7 ; 4.0/6, 4.6/7 |
+| mixed50 | 32 | 40,603 (41,345 / 39,862) | 64,825 (63,947 / 65,703) | 1.60x | 8.9/55, 10.4/36 ; 7.2/13, 6.2/13 |
+| insert | 1 | 8,553 (8,798 / 8,307) | 8,727 (8,565 / 8,889) | 1.02x | 0.8/7, 0.5/6 ; 0.5/3, 0.8/4 |
+| insert | 8 | 22,636 (23,701 / 21,571) | 28,579 (28,778 / 28,379) | 1.26x | 3.4/14, 4.1/16 ; 6.5/13, 5.5/11 |
+| insert | 32 | 20,605 (20,674 / 20,536) | 41,816 (41,851 / 41,781) | 2.03x | 16.5/24, 17.2/23 ; 11.3/17, 10.9/16 |
+
+Durable (`--durability sync`, kdb-service defaults; three passes - base, W8, W8, base, base, W8 -
+each under the shared bench lock, with other sessions' passes between them):
+
+| cell | c | base | w8 | w8 / base | write p99.9 / max ms (base, w8) |
+|---|--:|--:|--:|--:|---|
+| load | 32 | 25,495 (23,270 / 26,445 / 26,769) | 27,909 (25,418 / 28,334 / 29,976) | 1.09x | 8.3/75, 8.9/74, 7.0/49 ; 12.7/92, 8.1/91, 9.7/88 |
+| read | 1 | 12,921 (12,304 / 12,978 / 13,480) | 13,261 (14,894 / 12,377 / 12,513) | 1.03x |  |
+| read | 8 | 99,317 (94,656 / 97,403 / 105,892) | 92,818 (93,430 / 85,722 / 99,301) | 0.93x |  |
+| read | 32 | 121,600 (112,300 / 118,987 / 133,514) | 112,564 (111,091 / 104,710 / 121,890) | 0.93x |  |
+| update | 1 | 4,164 (4,188 / 4,596 / 3,706) | 3,962 (2,826 / 4,300 / 4,759) | 0.95x | 1.4/10, 0.6/8, 1.4/12 ; 6.3/14, 1.2/17, 1.3/9 |
+| update | 8 | 11,401 (10,403 / 13,143 / 10,658) | 12,752 (12,725 / 11,627 / 13,904) | 1.12x | 4.6/12, 4.5/34, 4.0/11 ; 4.5/14, 4.8/17, 4.3/15 |
+| update | 32 | 23,016 (21,254 / 24,248 / 23,548) | 22,000 (23,255 / 15,397 / 27,347) | 0.96x | 8.3/18, 6.9/16, 7.5/12 ; 10.4/43, 14.9/77, 6.7/16 |
+| mixed50 | 1 | 6,114 (5,836 / 6,610 / 5,896) | 6,207 (5,285 / 7,061 / 6,275) | 1.02x | 1.4/13, 2.8/27, 1.6/7 ; 1.2/15, 1.2/14, 1.7/14 |
+| mixed50 | 8 | 20,480 (18,943 / 22,349 / 20,148) | 19,830 (18,560 / 21,138 / 19,793) | 0.97x | 4.7/7, 5.5/11, 5.3/8 ; 5.8/8, 6.5/11, 6.4/12 |
+| mixed50 | 32 | 40,557 (36,453 / 42,784 / 42,434) | 46,926 (46,163 / 48,983 / 45,633) | 1.16x | 9.3/23, 7.9/38, 8.9/12 ; 8.0/28, 13.8/28, 8.1/21 |
+| insert | 1 | 4,001 (3,699 / 3,901 / 4,404) | 3,034 (3,935 / 1,224 / 3,942) | 0.76x | 1.0/4, 0.9/3, 0.7/4 ; 2.1/31, 7.3/12, 2.2/6 |
+| insert | 8 | 11,491 (11,306 / 11,171 / 11,997) | 11,003 (13,635 / 5,241 / 14,132) | 0.96x | 5.6/16, 5.7/13, 4.4/13 ; 6.4/12, 13.8/18, 6.4/10 |
+| insert | 32 | 22,473 (21,250 / 22,234 / 23,934) | 27,411 (26,335 / 27,862 / 28,037) | 1.22x | 16.1/21, 13.0/18, 13.9/18 ; 13.7/17, 13.4/16, 12.1/15 |
+
+The durable means are dragged by one bad pass: W8's second has cells a third of its others
+(insert at 1 worker 1,224 against 3,935 and 3,942), the shape of another session's disk work
+stalling syncs - the CPU-load check cannot see it - and base's own passes differ by 10-20%. Paired
+by time without that pass (passes 1 and 3), W8 is +9-27% at 32 workers (insert +24% / +17%,
+update +9% / +16%, mixed +27% / +8%), +18-30% for updates and inserts at 8, and within noise at 1;
+the read control is 0.93x. That W8 helps less under durable writes than under fast ones is
+expected: a durable writer spends most of its time waiting for its sync, not at the gate, so fewer
+writers are queued when a batch forms - group commit already shares the sync, and W8 only adds the
+shared update.
+
+- **Concurrent writes roughly double under fast durability** at 32 workers (update 1.81x, insert
+  2.03x, the load phase 2.20x; 50/50 mixes 1.60x) and gain 20-32% at 8; under durable writes the
+  gain is smaller (+9-27% at 32, +18-30% at 8 in the clean passes) because writers wait on the sync
+  rather than queue at the gate. Fast tails shrink with them (worst write at 32
+  workers 13-17 ms against 15-55 ms). One writer is unchanged - it forms batches of one.
+- **Reads pay for it when the cache is short.** Point reads right after a batched load ran 9-14%
+  below base. This store's live documents (~110 MB with overhead) sit right at the 115 MiB
+  document budget, so some reads are cold, and a cold read decompresses its version's whole commit
+  frame - up to 16 KiB of bodies for a batch against ~1 KB for a lone write. With the first cut's
+  1 MiB cap (frames of ~31 KB) reads ran 13-20% below base and zstd was 18% of server CPU in the
+  read cell, which is why the cap is 16 KiB. A store whose live set fits the cache does not pay
+  this; one that does not, and reads more than it writes, may want W8 off - which is the default.
+  Filing batched versions by value (a second copy, as large commits already do) would remove the
+  read cost at the price of the copy; not done.
+
+With the 1 MiB first cut, for reference (same method, fast; the durable half was not run):
+
+| cell | c | base | w8 | w8 / base | write p99.9 / max ms (base, w8) |
+|---|--:|--:|--:|--:|---|
+| load | 32 | 23,701 (24,603 / 22,799) | 51,559 (50,872 / 52,246) | 2.18x | 10.8/74, 9.0/66 ; 10.0/17, 8.2/13 |
+| read | 1 | 12,722 (13,171 / 12,273) | 11,130 (10,868 / 11,391) | 0.87x |  |
+| read | 8 | 94,572 (87,949 / 101,195) | 78,552 (79,854 / 77,250) | 0.83x |  |
+| read | 32 | 116,485 (112,579 / 120,392) | 93,046 (93,627 / 92,465) | 0.80x |  |
+| update | 1 | 7,221 (6,931 / 7,510) | 7,286 (7,232 / 7,340) | 1.01x | 1.7/13, 0.7/16 ; 0.5/11, 0.5/10 |
+| update | 8 | 21,651 (21,938 / 21,365) | 28,935 (29,046 / 28,824) | 1.34x | 3.9/13, 4.2/14 ; 4.2/16, 4.2/13 |
+| update | 32 | 19,234 (18,981 / 19,487) | 37,155 (37,548 / 36,762) | 1.93x | 12.4/20, 8.1/25 ; 6.9/16, 7.2/13 |
+| mixed50 | 1 | 9,889 (10,639 / 9,139) | 9,119 (9,108 / 9,131) | 0.92x | 1.2/7, 0.5/19 ; 0.5/3, 0.8/4 |
+| mixed50 | 8 | 39,071 (37,633 / 40,508) | 47,747 (48,198 / 47,296) | 1.22x | 5.0/7, 5.3/7 ; 4.8/7, 3.8/5 |
+| mixed50 | 32 | 40,412 (40,427 / 40,397) | 65,148 (66,737 / 63,560) | 1.61x | 9.2/28, 8.4/24 ; 6.9/19, 6.4/21 |
+| insert | 1 | 8,748 (9,268 / 8,228) | 8,192 (8,178 / 8,206) | 0.94x | 0.8/6, 0.6/6 ; 0.7/3, 0.4/4 |
+| insert | 8 | 21,160 (20,929 / 21,391) | 29,219 (29,742 / 28,696) | 1.38x | 7.1/17, 3.9/13 ; 6.1/40, 6.0/12 |
+| insert | 32 | 21,078 (21,453 / 20,703) | 41,278 (44,557 / 37,998) | 1.96x | 16.1/20, 15.8/20 ; 10.9/15, 11.2/19 |
+
 
 **Semantics, and what changes for users:**
 
@@ -674,18 +805,7 @@ commit, so no conflict report ever has to be split across clients.
 | peer sync | commits travel one per write | batches travel as ordinary multi-op commits - no wire or format change; LWW merge resolves per document as now | |
 | conflict reports (STRICT) | per commit | not affected: STRICT writes are never batched | |
 | durability / acknowledgement | each write waits for its commit | each waits for the batch commit; group sync is unchanged | |
-| audit / authorship | one author per commit | one author per batch commit | batch only writes from the same principal, or record the commit as the runtime's own (decision) |
-
-**Expected effect (estimate, to be measured):** at 32 writers a batch would hold up to 31 queued
-writes. If the ~40 us per commit splits into roughly 25 us that a batch pays once and 15 us per
-write (the re-merge, the leaf, the body store), update throughput at 32 workers would move from
-~22-24k/s towards ~50k/s, with the CPU spent before the gate (premerge, the wire) the next limit.
-Single-writer latency is unchanged: a lone writer forms a batch of one.
-
-**Open questions for the user:** whether "one commit = one client write" is a property any user or
-tool relies on (history UIs, `kdb inspect`, audit exports, peers counting commits); whether a
-batch may mix principals (or the batch commit is authored by the runtime); the cap; and the tx-id
-rule should a client-supplied id ever reach these paths.
+| audit / authorship | the commit's author is the node, its message the node's home stamp; no principal is recorded | unchanged | batches may mix principals (answer 2 above) |
 
 ### E2 - embedded cache default (decided: option 3)
 
@@ -850,8 +970,10 @@ What it says:
   0.94x, inserts at 8 and 32 workers 1.13x and 1.00x - against v0.9.4's 0.43-0.69x. And their tails
   are better than MongoDB's: worst update at 32 workers 12-13 ms against 74-181 ms.
 - **Fast writes are where they were (0.36-0.47x MongoDB from 8 workers):** the per-namespace commit
-  rate (~20-24k/s) is the limit, and nothing in this stack changes how many commits a namespace can
-  make. W8 is the item that does.
+  rate (~20-24k/s) is the limit, and nothing in this matrix's binary changes how many commits a
+  namespace can make. W8 (built after this matrix, off by default) puts several writes in each:
+  1.8-2.0x at 32 workers, which would take updates to ~0.75x and inserts to ~0.72x MongoDB
+  (W8's own A/B, not this matrix).
 - **Single-worker writes:** 0.73-0.88x MongoDB fast, 0.90-0.93x durable.
 
 ### The whole stack against its base

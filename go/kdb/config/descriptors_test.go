@@ -55,6 +55,7 @@ var fieldToKey = map[string]string{
 	"Compression":            "storage.compression",
 	"SyncMode":               "storage.syncMode",
 	"PreallocateSegments":    "storage.preallocateSegments",
+	"CoalesceWrites":         "storage.coalesceWrites",
 }
 
 func TestEverySettingIsDescribed(t *testing.T) {
@@ -110,7 +111,7 @@ func envProbeValue(key string) string {
 	switch key {
 	case "storage.memory", "auth.rbac", "tls.clientAuth", "control.write":
 		return "true"
-	case "control.settingsPersist", "control.promote", "storage.documentCopies":
+	case "control.settingsPersist", "control.promote", "storage.documentCopies", "storage.coalesceWrites":
 		return "true"
 	case "control.ui", "governance.attachmentDeltas":
 		// Defaults to on, so "true" would be indistinguishable from nothing happening.

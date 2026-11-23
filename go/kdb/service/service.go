@@ -135,6 +135,7 @@ func Main() {
 	fs.IntVar(&flagVals.AsyncSyncIntervalMS, "async-sync-interval-ms", flagVals.AsyncSyncIntervalMS, "background sync period under --durability=async; ignored otherwise")
 	fs.StringVar(&flagVals.Compression, "compression", flagVals.Compression, "codec for newly-written delta frames and SSTable blocks: zstd (default) or none. Each frame records its own codec, so changing this leaves already-written segments readable")
 	fs.StringVar(&flagVals.SyncMode, "sync-mode", flagVals.SyncMode, "physical sync primitive: full (fsync; F_FULLFSYNC on macOS) or fast (fdatasync on Linux - forces data through the drive cache like fsync, so it survives power loss, and with --preallocate-segments it commits no metadata; F_BARRIERFSYNC on macOS - survives process and OS crashes, but power loss can lose what the drive cache held). Default fast on Linux, full elsewhere")
+	fs.BoolVar(&flagVals.CoalesceWrites, "coalesce-writes", flagVals.CoalesceWrites, "commit the single-document last-write-wins writes (upsert, replace, delete) waiting at a namespace's write gate together, several per commit - the way past one commit per write under concurrent writers. A commit never holds two writes to one document. Off by default")
 	fs.BoolVar(&flagVals.PreallocateSegments, "preallocate-segments", flagVals.PreallocateSegments, "create each new delta segment at its full size (zeroed), so appends never grow the file and a durable commit's sync has no size metadata to commit - with --sync-mode fast on Linux, about 2x the durable writes on one connection. Costs one segment of disk (64 MiB by default) per open namespace up front. Default on on Linux, off elsewhere; =false to turn off")
 	fs.BoolVar(&showVersion, "version", false, "print version and exit")
 	_ = fs.Parse(os.Args[1:])
@@ -319,6 +320,7 @@ func Main() {
 
 	srv := server.NewKdbServerRuntime(rt)
 	srv.SetMaxResultRows(cfg.MaxResultRows)
+	srv.CoalesceWrites = cfg.CoalesceWrites
 
 	switch peerConflictPolicy {
 	case "", "strict":
@@ -499,6 +501,7 @@ func Main() {
 			sec := server.NewKdbServerRuntime(nsRT)
 			sec.AuthEngine = srv.AuthEngine
 			sec.WriteTimeout = srv.WriteTimeout
+			sec.CoalesceWrites = srv.CoalesceWrites
 			// Commit notification, retention floor, projection configuration and the stored
 			// definitions.
 			node.Prepare(sec)
