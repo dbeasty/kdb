@@ -39,6 +39,11 @@ func (d *InMemoryCommitDag) storeCommitLocked(c document.Commit) {
 		}
 	}
 	d.nodes.put(c, gen)
+	if d.graphAuto {
+		// The resident tier is bounded by size, not by the maintenance timer: past
+		// graph.rebuildCommits this starts the flusher (graph_attach.go).
+		d.kickGraphFlushLocked()
+	}
 }
 
 // replaceCommitLocked swaps the commit stored under its own hash while

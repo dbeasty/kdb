@@ -2,6 +2,7 @@ package dag
 
 import (
 	"bytes"
+	"slices"
 	"sort"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -24,8 +25,8 @@ import (
 // A commit lives in exactly one place. Attach moves commits out of the resident tier; put never
 // adds a commit a segment shows; segments never share a commit. A segment record can be hidden -
 // deleted from the DAG since the segment was written, or never in this DAG at all - and hidden is
-// what keeps the files from ever being an authority. A full rewrite drops hidden records for good,
-// the way a Cassandra compaction drops tombstoned rows.
+// what keeps the files from ever being an authority. A merge drops hidden records for good, the
+// way a Cassandra compaction drops tombstoned rows.
 //
 // Variable-length data lives beside the records: messages and extra parents of resident commits
 // in side maps (a segment carries its own), and operations (bounded by the DAG's operations
@@ -75,6 +76,17 @@ type nodeStore struct {
 	// resident tier and every other field above is unused; segments are never attached.
 	goMode  bool
 	goNodes map[codec.Hash]goNode
+
+	// frozen is how many slots a segment write is reading in place (freeze): until it ends
+	// (unfreeze), no slot below it changes. A write to a frozen slot goes to a fresh slot instead
+	// (copy-on-write), and a frozen slot let go of waits in frozenFreed. Zero when no write is
+	// reading resident records. This is what lets a flush stream the resident tier without the
+	// DAG's lock and without copying it - Cassandra's switched-out memtable.
+	frozen      uint32
+	frozenFreed []uint32
+	// genEpoch counts generation changes to segment records, so a merge can tell whether any
+	// happened while it ran (attachMerged).
+	genEpoch uint64
 
 	// recent is the last commit put, held whole, so the lookups that follow every append - the
 	// head snapshot, the next transaction reading its parent, the causal timestamp - get back
@@ -193,7 +205,8 @@ func newNodeStore() nodeStore {
 	return nodeStore{index: make(map[codec.Hash]uint32)}
 }
 
-// segPos is where the segment tier shows h, if it does.
+// segPos is where the segment tier shows h, if it does. Each segment's bloom filter turns a
+// miss - the common case: a write looks up its own new commit - into one cache line per segment.
 func (s *nodeStore) segPos(h codec.Hash) (*graphBase, int, bool) {
 	if len(s.segs) == 0 {
 		return nil, 0, false
@@ -201,7 +214,16 @@ func (s *nodeStore) segPos(h codec.Hash) (*graphBase, int, bool) {
 	if _, gone := s.hidden[h]; gone {
 		return nil, 0, false
 	}
+	return s.recordOf(h)
+}
+
+// recordOf is the segment with a record for h, hidden or not, and its position there.
+func (s *nodeStore) recordOf(h codec.Hash) (*graphBase, int, bool) {
+	key := bloomKeyHash(&h)
 	for _, b := range s.segs {
+		if !b.bloom.has(key) {
+			continue
+		}
 		if pos, ok := b.find(h); ok {
 			return b, pos, true
 		}
@@ -211,12 +233,8 @@ func (s *nodeStore) segPos(h codec.Hash) (*graphBase, int, bool) {
 
 // inAnySegment reports whether any segment has a record for h, hidden or not.
 func (s *nodeStore) inAnySegment(h codec.Hash) bool {
-	for _, b := range s.segs {
-		if _, ok := b.find(h); ok {
-			return true
-		}
-	}
-	return false
+	_, _, ok := s.recordOf(h)
+	return ok
 }
 
 // residentLen is how many commits the resident tier holds - what the flush threshold counts.
@@ -269,7 +287,7 @@ func (s *nodeStore) setGeneration(h codec.Hash, gen uint32) {
 		return
 	}
 	if i, ok := s.index[h]; ok {
-		setRecGeneration(s.at(i), gen)
+		setRecGeneration(s.at(s.writable(h, i)), gen)
 		return
 	}
 	if b, pos, ok := s.segPos(h); ok {
@@ -278,6 +296,7 @@ func (s *nodeStore) setGeneration(h codec.Hash, gen uint32) {
 }
 
 func (s *nodeStore) setSegGeneration(h codec.Hash, recorded, gen uint32) {
+	s.genEpoch++
 	if recorded == gen {
 		delete(s.genOverride, h)
 		return
@@ -345,15 +364,12 @@ func (s *nodeStore) put(c document.Commit, gen uint32) {
 		}
 	}
 	i, ok := s.index[c.Hash]
+	if ok && i < s.frozen {
+		s.frozenFreed = append(s.frozenFreed, i) // a segment write is reading it; re-put elsewhere
+		ok = false
+	}
 	if !ok {
-		if n := len(s.free); n > 0 {
-			i = s.free[n-1]
-			s.free = s.free[:n-1]
-		} else {
-			i = s.used
-			s.used++
-			s.ensureSlot(i)
-		}
+		i = s.newSlot()
 		s.index[c.Hash] = i
 	}
 	encodeRecord(s.at(i), c, gen, s.internNamespace(c.NamespaceID))
@@ -408,10 +424,63 @@ func (s *nodeStore) replace(c document.Commit) bool {
 	return false
 }
 
+// newSlot hands out an empty slot. A free slot is never one a segment write is reading: slots let
+// go of while frozen wait in frozenFreed.
+func (s *nodeStore) newSlot() uint32 {
+	if n := len(s.free); n > 0 {
+		i := s.free[n-1]
+		s.free = s.free[:n-1]
+		return i
+	}
+	i := s.used
+	s.used++
+	s.ensureSlot(i)
+	return i
+}
+
+// writable returns the slot h's record may be changed in: i itself, or - when a segment write is
+// reading i - a fresh copy that the index now names.
+func (s *nodeStore) writable(h codec.Hash, i uint32) uint32 {
+	if i >= s.frozen {
+		return i
+	}
+	j := s.newSlot() // may regrow the first chunk, so copy only after
+	copy(s.at(j), s.at(i))
+	s.index[h] = j
+	s.frozenFreed = append(s.frozenFreed, i)
+	return j
+}
+
 func (s *nodeStore) freeSlot(h codec.Hash, i uint32) {
 	delete(s.index, h)
+	if i < s.frozen {
+		s.frozenFreed = append(s.frozenFreed, i)
+		return
+	}
 	clear(s.at(i))
 	s.free = append(s.free, i)
+}
+
+// freeze marks every slot handed out so far as being read by a segment write, and returns the
+// chunks as they stand: the write reads its records from these, with no lock held. Nothing below
+// the mark changes until unfreeze.
+func (s *nodeStore) freeze() ([][]byte, uint32) {
+	s.frozen = s.used
+	return append([][]byte(nil), s.chunks...), s.slotsPerChunk()
+}
+
+// unfreeze ends a segment write's hold on the resident slots and frees the ones let go of
+// meanwhile.
+func (s *nodeStore) unfreeze() {
+	if s.frozen == 0 && len(s.frozenFreed) == 0 {
+		return
+	}
+	s.frozen = 0
+	for _, i := range s.frozenFreed {
+		clear(s.at(i))
+		s.free = append(s.free, i)
+	}
+	s.frozenFreed = nil
 }
 
 func (s *nodeStore) delete(h codec.Hash) {
@@ -425,11 +494,8 @@ func (s *nodeStore) delete(h codec.Hash) {
 	if i, ok := s.index[h]; ok {
 		s.freeSlot(h, i)
 	}
-	if s.inAnySegment(h) {
-		if s.hidden == nil {
-			s.hidden = make(map[codec.Hash]struct{})
-		}
-		s.hidden[h] = struct{}{}
+	if b, _, ok := s.recordOf(h); ok {
+		s.hide(b, h)
 	}
 	delete(s.messages, h)
 	delete(s.ops, h)
@@ -438,12 +504,37 @@ func (s *nodeStore) delete(h codec.Hash) {
 	delete(s.genOverride, h)
 }
 
+// hide marks b's record for h as one the DAG no longer holds.
+func (s *nodeStore) hide(b *graphBase, h codec.Hash) {
+	if s.hidden == nil {
+		s.hidden = make(map[codec.Hash]struct{})
+	}
+	if _, already := s.hidden[h]; !already {
+		s.hidden[h] = struct{}{}
+		b.hiddenRecs++
+	}
+}
+
+// recountHidden recomputes every segment's hidden-record count from the overlay.
+func (s *nodeStore) recountHidden() {
+	for _, b := range s.segs {
+		b.hiddenRecs = 0
+	}
+	for h := range s.hidden {
+		if b, _, ok := s.recordOf(h); ok {
+			b.hiddenRecs++
+		}
+	}
+}
+
 // attachRoot is h's attachment root when the resident tier holds one, else nil.
 func (s *nodeStore) attachRoot(h codec.Hash) *codec.Hash {
-	if r, ok := s.attachRoots[h]; ok {
-		return &r
+	r, ok := s.attachRoots[h]
+	if !ok {
+		return nil // before the copy below, which escapes: a miss must not allocate
 	}
-	return nil
+	out := r
+	return &out
 }
 
 // commit rebuilds the document.Commit for h. It allocates the parent slice, so a path that only
@@ -581,196 +672,194 @@ func (s *nodeStore) forEachHorizonCandidate(stubbed func(codec.Hash) bool, fn fu
 	}
 }
 
-// graphSnapshot is what a write needs to produce a segment without holding the DAG's lock: the
-// resident commits destined for it, sorted, and - for a full rewrite - the segments as they
-// stood, each kept alive by the snapshot's own reference on its mapping.
-type graphSnapshot struct {
-	resident    []graphSource
-	residentTx  []graphTx
-	segs        []*graphBase // oldest first; nil for a flush
-	releases    []func()
-	hidden      map[codec.Hash]struct{}
-	genOverride map[codec.Hash]uint32
-}
-
-// snapshotForSegment captures the resident commits include accepts. A full snapshot also takes a
-// reference on every segment and copies the overlay that says which of their records still count.
-// txOf names the transaction-index entry a commit owns (first writer wins), if it owns one.
-func (s *nodeStore) snapshotForSegment(full bool, include func(codec.Hash, []byte) bool, txOf func(codec.Hash, codec.UUID) bool, hasOps func(codec.Hash) bool) graphSnapshot {
-	var snap graphSnapshot
+// residentForWrite notes the resident commits include accepts - unsorted - and freezes the
+// resident slots so the write can read their records in place. flags says what the record alone
+// cannot (entryHasOps, entryOwnsTx). Unless shadowed, a commit some segment still has a (hidden)
+// record for is left out - two segments must never share a commit - and waits for the merge that
+// drops that record; for a resident commit, having such a record is exactly being in hidden.
+func (s *nodeStore) residentForWrite(in *graphWriteInput, include func(codec.Hash, []byte) bool, flags func(codec.Hash, []byte) uint32, shadowed bool) {
+	// Sized up front: appending would grow it 1.25x at a time and allocate five times its size.
+	in.resident = make([]residentEntry, 0, len(s.index))
 	for h, i := range s.index {
 		r := s.at(i)
-		// A flush may only write commits no segment has a record for - hidden ones included - or
-		// two segments would share a commit. Those wait for the next full rewrite.
-		if !include(h, r) || (!full && s.inAnySegment(h)) {
+		if !include(h, r) {
 			continue
 		}
-		src := graphSource{msg: s.messages[h], extra: s.extra[h], attach: s.attachRoot(h)}
-		copy(src.rec[:], r)
-		// Whether the commit wrote anything is not in the record until now: resident, it is
-		// answered by the ops side map and the DAG's eviction set. On disk the record must say.
-		setRecHasOps(src.rec[:], hasOps(h))
-		snap.resident = append(snap.resident, src)
-		if tx := recTx(r); txOf(h, tx) {
-			snap.residentTx = append(snap.residentTx, graphTx{key: txKey(tx), hash: h})
+		if _, hid := s.hidden[h]; hid && !shadowed {
+			continue
+		}
+		in.resident = append(in.resident, residentEntry{hash: h, slot: i, flags: flags(h, r)})
+		msg, extra, attach := s.messages[h], s.extra[h], s.attachRoot(h)
+		if msg != "" || extra != nil || attach != nil {
+			if in.side == nil {
+				in.side = make(map[codec.Hash]residentSide)
+			}
+			in.side[h] = residentSide{msg: msg, extra: extra, attach: attach}
 		}
 	}
-	sort.Slice(snap.resident, func(a, b int) bool {
-		return bytes.Compare(snap.resident[a].hash(), snap.resident[b].hash()) < 0
+	in.chunks, in.per = s.freeze()
+}
+
+// sortResident orders a write's resident entries by hash, as the format stores them. Run without
+// the lock.
+func (in *graphWriteInput) sortResident() {
+	sort.Slice(in.resident, func(a, b int) bool {
+		return bytes.Compare(in.resident[a].hash.Bytes[:], in.resident[b].hash.Bytes[:]) < 0
 	})
-	sort.Slice(snap.residentTx, func(a, b int) bool {
-		return bytes.Compare(snap.residentTx[a].key[:], snap.residentTx[b].key[:]) < 0
-	})
-	if !full {
-		return snap
-	}
-	for i := len(s.segs) - 1; i >= 0; i-- { // oldest first
-		b := s.segs[i]
+}
+
+// segmentsForWrite adds inputs (oldest first) to a merge: a reference on each mapping, held until
+// the write releases it, and the part of the overlay - hidden records, generation overrides -
+// that falls in them.
+func (s *nodeStore) segmentsForWrite(in *graphWriteInput, inputs []*graphBase) {
+	all := len(inputs) == len(s.segs)
+	for _, b := range inputs {
 		r, err := b.mapping.Acquire()
 		if err != nil {
 			continue
 		}
-		snap.segs = append(snap.segs, b)
-		snap.releases = append(snap.releases, r.Release)
+		in.inputs = append(in.inputs, b)
+		in.releases = append(in.releases, r.Release)
 	}
-	snap.hidden = make(map[codec.Hash]struct{}, len(s.hidden))
+	inInputs := func(h codec.Hash) bool {
+		if all {
+			return true
+		}
+		key := bloomKeyHash(&h)
+		for _, b := range in.inputs {
+			if b.bloom.has(key) {
+				if _, ok := b.find(h); ok {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	in.hidden = make(map[codec.Hash]struct{})
 	for h := range s.hidden {
-		snap.hidden[h] = struct{}{}
+		if inInputs(h) {
+			in.hidden[h] = struct{}{}
+		}
 	}
-	snap.genOverride = make(map[codec.Hash]uint32, len(s.genOverride))
+	in.genOverride = make(map[codec.Hash]uint32)
 	for h, g := range s.genOverride {
-		snap.genOverride[h] = g
+		if inInputs(h) {
+			in.genOverride[h] = g
+		}
 	}
-	return snap
 }
 
-func (snap *graphSnapshot) release() {
-	for _, r := range snap.releases {
-		r()
+// attachFlushed adds nb, written from exactly the resident entries (sorted, so entry i is record
+// i), as the newest segment: each flushed commit leaves the resident tier, keeping any generation
+// it gained meanwhile as an override; one deleted meanwhile becomes a hidden record. Ends the
+// freeze. O(flushed commits). Reports false, changing nothing, if nb is not what entries describe.
+func (s *nodeStore) attachFlushed(nb *graphBase, entries []residentEntry) bool {
+	if nb.count != len(entries) || (nb.count > 0 && (nb.hashAt(0) != entries[0].hash || nb.hashAt(nb.count-1) != entries[nb.count-1].hash)) {
+		return false
 	}
-	snap.releases = nil
+	s.unfreeze()
+	s.free = slices.Grow(s.free, len(entries)) // one allocation, not a 1.25x ladder
+	for pos := range entries {
+		h := entries[pos].hash
+		if i, ok := s.index[h]; ok {
+			if g := recGeneration(s.at(i)); g != nb.generation(pos) {
+				if s.genOverride == nil {
+					s.genOverride = make(map[codec.Hash]uint32)
+				}
+				s.genOverride[h] = g
+			}
+			s.freeSlot(h, i)
+			delete(s.messages, h)
+			delete(s.extra, h)
+			delete(s.attachRoots, h)
+			continue
+		}
+		s.hide(nb, h) // deleted while the flush ran
+	}
+	s.segs = append([]*graphBase{nb}, s.segs...)
+	s.segRecords += nb.count
+	s.compactSlab()
+	s.index = shrunk(s.index)
+	s.messages = shrunk(s.messages)
+	s.extra = shrunk(s.extra)
+	s.attachRoots = shrunk(s.attachRoots)
+	return true
 }
 
-// sources merges every input stream - each segment's visible records, then the resident tier -
-// in hash order. Streams are disjoint, so the merge never has to choose between two records for
-// one commit; if it ever did, the later stream (newer) would win.
-func (snap *graphSnapshot) sources() (func() (graphSource, bool), func() (graphTx, bool)) {
-	type stream struct {
-		next func() (graphSource, bool)
-		head *graphSource
+// attachMerged replaces the segments in replaced with nb, their merge, in time proportional to
+// the overlay rather than to the records: nb holds exactly the records of replaced that were
+// visible when the merge began, so only what changed since - commits deleted (they stay hidden,
+// now in nb) and generations recomputed (epoch says whether any were) - needs reconciling. Reports
+// false, changing nothing, when it cannot be sure of that; the caller then runs attach, which
+// checks every record.
+func (s *nodeStore) attachMerged(nb *graphBase, replaced []*graphBase, epoch uint64) bool {
+	if s.genEpoch != epoch {
+		return false
 	}
-	var streams []*stream
-	for _, b := range snap.segs {
-		b, pos := b, 0
-		streams = append(streams, &stream{next: func() (graphSource, bool) {
-			for pos < b.count {
-				p := pos
-				pos++
-				h := b.hashAt(p)
-				if _, gone := snap.hidden[h]; gone {
-					continue
-				}
-				src := b.toSource(p)
-				if g, ok := snap.genOverride[h]; ok {
-					setRecGeneration(src.rec[:], g)
-				}
-				return src, true
+	isReplaced := func(b *graphBase) bool {
+		for _, r := range replaced {
+			if r == b {
+				return true
 			}
-			return graphSource{}, false
-		}})
-	}
-	ri := 0
-	streams = append(streams, &stream{next: func() (graphSource, bool) {
-		if ri >= len(snap.resident) {
-			return graphSource{}, false
 		}
-		ri++
-		return snap.resident[ri-1], true
-	}})
-	next := func() (graphSource, bool) {
-		var best *stream
-		for _, st := range streams {
-			if st.head == nil {
-				if src, ok := st.next(); ok {
-					st.head = &src
+		return false
+	}
+	var kept []*graphBase
+	records := nb.count
+	for _, b := range s.segs {
+		if !isReplaced(b) {
+			kept = append(kept, b)
+			records += b.count
+		}
+	}
+	if len(kept)+len(replaced) != len(s.segs) {
+		return false
+	}
+	inKept := func(h codec.Hash) bool {
+		key := bloomKeyHash(&h)
+		for _, b := range kept {
+			if b.bloom.has(key) {
+				if _, ok := b.find(h); ok {
+					return true
 				}
 			}
-			if st.head == nil {
-				continue
-			}
-			if best == nil {
-				best = st
-				continue
-			}
-			switch c := bytes.Compare(st.head.hash(), best.head.hash()); {
-			case c < 0:
-				best = st
-			case c == 0:
-				best.head = nil // the newer stream's record wins; drop the older one
-				best = st
-			}
 		}
-		if best == nil {
-			return graphSource{}, false
-		}
-		out := *best.head
-		best.head = nil
-		return out, true
+		return false
 	}
-
-	type txStream struct {
-		next func() (graphTx, bool)
-		head *graphTx
-	}
-	var txs []*txStream
-	for _, b := range snap.segs {
-		b, i := b, 0
-		txs = append(txs, &txStream{next: func() (graphTx, bool) {
-			for i < b.txCount {
-				pos, key := b.txIndexAt(i)
-				i++
-				t := graphTx{key: key, hash: b.hashAt(pos)}
-				if _, gone := snap.hidden[t.hash]; gone {
-					continue
-				}
-				return t, true
-			}
-			return graphTx{}, false
-		}})
-	}
-	rti := 0
-	txs = append(txs, &txStream{next: func() (graphTx, bool) {
-		if rti >= len(snap.residentTx) {
-			return graphTx{}, false
-		}
-		rti++
-		return snap.residentTx[rti-1], true
-	}})
-	nextTx := func() (graphTx, bool) {
-		var best *txStream
-		for _, st := range txs {
-			if st.head == nil {
-				if t, ok := st.next(); ok {
-					st.head = &t
-				}
-			}
-			if st.head == nil {
-				continue
-			}
-			// Strictly less: on a tie the earlier (older) stream keeps it - first writer wins, as
-			// in txIndex. The writer drops the later duplicate.
-			if best == nil || bytes.Compare(st.head.key[:], best.head.key[:]) < 0 {
-				best = st
+	hidden := make(map[codec.Hash]struct{}, len(s.hidden))
+	nbHidden := 0
+	for h := range s.hidden {
+		if inKept(h) {
+			hidden[h] = struct{}{}
+		} else if nb.mayHold(&h) {
+			if _, ok := nb.find(h); ok {
+				hidden[h] = struct{}{} // deleted while the merge ran
+				nbHidden++
 			}
 		}
-		if best == nil {
-			return graphTx{}, false
-		}
-		out := *best.head
-		best.head = nil
-		return out, true
+		// Otherwise it was hidden when the merge began, and the merge dropped it.
 	}
-	return next, nextTx
+	override := make(map[codec.Hash]uint32, len(s.genOverride))
+	for h, g := range s.genOverride {
+		if inKept(h) {
+			override[h] = g
+		} else if pos, ok := nb.find(h); ok && nb.generation(pos) != g {
+			override[h] = g
+		}
+	}
+	// Every commit the segments showed, they still show.
+	if records-len(hidden) != s.segVisible() {
+		return false
+	}
+	nb.hiddenRecs = nbHidden
+	s.segs = append([]*graphBase{nb}, kept...)
+	s.hidden = hidden
+	s.genOverride = override
+	s.segRecords = records
+	for _, b := range replaced {
+		b.close()
+	}
+	return true
 }
 
 // attach adds nb as the newest segment, replacing the segments in replaced (all of them, for a
@@ -880,6 +969,7 @@ func (s *nodeStore) attach(nb *graphBase, replaced []*graphBase) {
 	for _, b := range replaced {
 		b.close()
 	}
+	s.recountHidden()
 	s.compactSlab()
 	// A Go map never gives back its buckets, so an index that held a million commits before the
 	// attach moved them out would keep costing what it cost then. Copying is O(what is left).
@@ -904,8 +994,8 @@ func shrunk[K comparable, V any](m map[K]V) map[K]V {
 // compactSlab gives back the chunks an attach emptied. Slots are renumbered, so this may only
 // run where nothing holds a slot index - which, under the DAG's write lock, is everywhere.
 func (s *nodeStore) compactSlab() {
-	if uint32(len(s.free)) < s.slotsPerChunk() {
-		return
+	if s.frozen > 0 || uint32(len(s.free)) < s.slotsPerChunk() {
+		return // a segment write is reading slots in place: numbers must not move under it
 	}
 	old := *s
 	s.chunks, s.used, s.free = nil, 0, nil
@@ -962,6 +1052,7 @@ func (s *nodeStore) attachTrusted(segs []*graphBase, hidden []codec.Hash) {
 			delete(s.attachRoots, h)
 		}
 	}
+	s.recountHidden()
 }
 
 // detach drops every segment, putting nothing back: for a DAG that is closing.

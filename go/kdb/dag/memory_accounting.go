@@ -17,9 +17,9 @@ const (
 // GraphResidentBytes estimates what the commit graph's resident tier holds on the heap, apart
 // from commit operations (OperationsResidentBytes) and trees (the storage engine's): the slab of
 // resident commit records, the hash -> slot index, the side maps for messages and extra parents,
-// the segment tier's hidden/override sets, and the transaction index. Computed from lengths, so
-// O(1) and safe for a metrics scrape; mapped segment files are not counted, because they are
-// page cache, not heap.
+// the segment tier's hidden/override sets and bloom filters, and the transaction index. Computed
+// from lengths, so O(segments) and safe for a metrics scrape; mapped segment files are not
+// counted, because they are page cache, not heap.
 //
 // Under GraphMemoryGo the resident tier is a map of whole commits; that is charged per entry
 // at the struct's size, which undercounts their parent slices - that mode is a fallback kept
@@ -47,5 +47,9 @@ func (d *InMemoryCommitDag) GraphResidentBytes() int64 {
 	b += int64(len(s.hidden)) * (hashKey + hashMapEntryOverhead)
 	b += int64(len(s.genOverride)) * (hashKey + 4 + hashMapEntryOverhead)
 	b += int64(len(d.txIndex)) * (int64(unsafe.Sizeof(codec.UUID{})) + hashKey + hashMapEntryOverhead)
+	// The segments' bloom filters are heap, not page cache: ~2.5 bytes a commit on disk.
+	for _, seg := range s.segs {
+		b += seg.bloom.bytes()
+	}
 	return b
 }

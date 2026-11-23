@@ -1,6 +1,7 @@
 package dag
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,7 +19,9 @@ import (
 // and restores the small remainder.
 //
 // The segments do not become an authority. The checkpoint vouches for exactly the segments it
-// names, and a segment it names is never deleted while it is the checkpoint on disk (graphPinned).
+// names, and a segment it names is never deleted while it is the checkpoint on disk - nor while it
+// is being written: the capture pins what it names (graphPinned), since a background merge may
+// supersede a segment between the capture and the write.
 // If a named segment is missing or different, the checkpoint is unusable and open replays the
 // delta log - the same fallback as any other unusable checkpoint. That is only sound where the
 // log is the whole record, so the caller uses this form only under history=full (keep == nil).
@@ -51,9 +54,17 @@ func (d *InMemoryCommitDag) CheckpointSnapshotWithGraph(keep func(document.Commi
 		return CheckpointState{}, nil, nil, ErrHeadNotLogged
 	}
 	refs := make([]GraphSegmentRef, 0, len(d.nodes.segs))
+	d.graphFiles.Lock()
+	if d.graphPinned == nil {
+		d.graphPinned = make(map[uint64]bool, len(d.nodes.segs))
+	}
 	for _, b := range d.nodes.segs {
 		refs = append(refs, GraphSegmentRef{Seq: b.seq, CRC: b.crc, Records: b.count})
+		// Until SetGraphCheckpointRefs replaces the pins with exactly these - or for good, if the
+		// write fails: a superset only defers deletes.
+		d.graphPinned[b.seq] = true
 	}
+	d.graphFiles.Unlock()
 	hidden := make([]codec.Hash, 0, len(d.nodes.hidden))
 	for h := range d.nodes.hidden {
 		hidden = append(hidden, h)
@@ -67,6 +78,11 @@ func (d *InMemoryCommitDag) CheckpointSnapshotWithGraph(keep func(document.Commi
 // as unusable. Segments on disk the checkpoint does not name were written after it and are
 // removed (unless read-only): their commits are either in the checkpoint's resident tier or after
 // it in the log, and replay brings those back.
+//
+// A named segment may still be under its .pending name: a merge output the checkpoint named,
+// with the process gone before the inputs it replaced were deleted and it was renamed. It is used
+// from there, and - once every file the checkpoint does not name is gone, so nothing on disk shares
+// a record with it - renamed (unless read-only).
 func (d *InMemoryCommitDag) AttachCheckpointGraph(refs []GraphSegmentRef, hidden []codec.Hash) error {
 	d.mu.RLock()
 	dir, ro, enabled := d.graphDir, d.graphReadOnly, d.graph.FileEnabled
@@ -85,10 +101,18 @@ func (d *InMemoryCommitDag) AttachCheckpointGraph(refs []GraphSegmentRef, hidden
 	for i := len(refs) - 1; i >= 0; i-- {
 		ref := refs[i]
 		named[ref.Seq] = true
-		b, err := openGraphBase(filepath.Join(dir, graphSegmentName(ref.Seq)), d.NamespaceID)
+		final := filepath.Join(dir, graphSegmentName(ref.Seq))
+		at := final
+		if _, err := os.Stat(final); errors.Is(err, os.ErrNotExist) {
+			if _, perr := os.Stat(final + graphPendingSuffix); perr == nil {
+				at = final + graphPendingSuffix
+			}
+		}
+		b, err := openGraphBase(at, d.NamespaceID)
 		if err != nil {
 			return fail(err)
 		}
+		b.path, b.diskPath = final, at
 		if b.seq != ref.Seq || b.crc != ref.CRC || b.count != ref.Records {
 			b.close()
 			return fail(fmt.Errorf("%w: segment %d is not the one the checkpoint names (crc %08x/%08x, records %d/%d)",
@@ -102,41 +126,78 @@ func (d *InMemoryCommitDag) AttachCheckpointGraph(refs []GraphSegmentRef, hidden
 		segs[i], segs[j] = segs[j], segs[i]
 	}
 	onDisk, _ := listGraphSegments(dir)
+	maxSeq := maxGraphFileSeq(dir, onDisk)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.nodes.attachTrusted(segs, hidden)
+	d.graphFiles.Lock()
 	d.graphPinned = named
 	d.graphDeferred = nil
-	if n := len(onDisk); n > 0 {
-		d.graphNextSeq = onDisk[n-1] + 1
+	d.graphFiles.Unlock()
+	if len(onDisk) > 0 || maxSeq > 0 {
+		d.graphNextSeq = max(d.graphNextSeq, maxSeq+1)
+	}
+	if ro {
+		return nil
 	}
 	for _, seq := range onDisk {
-		if !named[seq] && !ro {
+		if !named[seq] {
 			os.Remove(filepath.Join(dir, graphSegmentName(seq)))
 		}
+	}
+	usingPending := make(map[uint64]bool)
+	for _, b := range segs {
+		if b.diskPath != b.path {
+			usingPending[b.seq] = true
+		}
+	}
+	removeGraphLeftovers(dir, usingPending)
+	renamed := false
+	for _, b := range segs {
+		if b.diskPath != b.path && os.Rename(b.diskPath, b.path) == nil {
+			b.diskPath = b.path
+			renamed = true
+		}
+	}
+	if renamed {
+		syncGraphDir(dir)
 	}
 	return nil
 }
 
 // SetGraphCheckpointRefs records which segments the checkpoint now on disk references, and
 // deletes superseded segments the previous checkpoint was holding back.
+//
+// Then every merge output that was waiting for those segments to go takes its final name - the
+// one this checkpoint names it by.
 func (d *InMemoryCommitDag) SetGraphCheckpointRefs(refs []GraphSegmentRef) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	pinned := make(map[uint64]bool, len(refs))
 	for _, r := range refs {
 		pinned[r.Seq] = true
 	}
+	d.graphFiles.Lock()
 	d.graphPinned = pinned
 	kept := d.graphDeferred[:0]
+	removed := false
 	for _, ds := range d.graphDeferred {
 		if pinned[ds.seq] {
 			kept = append(kept, ds)
 			continue
 		}
-		os.Remove(ds.path)
+		os.Remove(ds.diskPath)
+		removed = true
 	}
 	d.graphDeferred = kept
+	if removed {
+		d.publishPendingLocked(nil)
+	}
+	d.graphFiles.Unlock()
+	dir := d.graphDir
+	d.mu.Unlock()
+	if removed && dir != "" {
+		syncGraphDir(dir)
+	}
 }
 
 // DetachGraph drops the segment tier, for an open that attached a checkpoint's segments and then
@@ -145,5 +206,7 @@ func (d *InMemoryCommitDag) DetachGraph() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.nodes.detach()
+	d.graphFiles.Lock()
 	d.graphPinned = nil
+	d.graphFiles.Unlock()
 }

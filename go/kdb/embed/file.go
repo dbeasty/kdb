@@ -349,6 +349,12 @@ func (h *Host) openNamespace(
 		}
 	}
 	handleClosed = true
+	if opts.Storage.Graph.FileEnabled && !opts.ReadOnly {
+		// From here the resident commit graph is bounded by size, not by the maintenance timer: a
+		// commit that fills it starts a flush, and flushes start the merges they make due. Not
+		// earlier - before the graph is open, a flush could write commits a segment already holds.
+		d.StartGraphAutoFlush()
+	}
 	// storageClose is what makes Close() an orderly shutdown rather than a no-op that only
 	// releases the directory lock (kdb-spec-layer13 Component 47 §2.4/§4.5) - previously nothing
 	// retained handle past this function returning, so even a clean process exit never flushed
@@ -362,6 +368,10 @@ func (h *Host) openNamespace(
 		// shutdown below. Cancelling it costs nothing - it has written nothing until it finishes.
 		bgCompaction.stop()
 		refile.stop()
+		// So is a graph merge: the checkpoint below names whatever segments are attached, and a
+		// merge finishing after it would only leave its output waiting for a checkpoint that never
+		// comes (dag.StopGraphWork).
+		d.StopGraphWork()
 		// Drain the commit log first: under DurabilityAsync there can be
 		// records queued but not yet written, and sealing the segment out from
 		// under them would drop acknowledged commits on a clean shutdown.
