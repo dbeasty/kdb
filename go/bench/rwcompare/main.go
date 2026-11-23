@@ -29,6 +29,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"math"
 	"math/rand/v2"
 	"os"
@@ -125,11 +126,21 @@ func main() {
 				n = defaultOps(c)
 			}
 			spec := cellSpec{name: strings.TrimSpace(cell), conc: c, ops: n}
-			res := runCell(ctx, st, spec, ids, vals, &inserted, *dist, *seed+uint64(c))
+			res := runCell(ctx, st, spec, ids, vals, &inserted, *dist, cellSeed(*seed, spec.name, c))
 			res.print(*target, *label)
 			res.write(*jsonOut, *target, *label)
 		}
 	}
+}
+
+// cellSeed gives every cell its own random stream. Seeding by concurrency alone gave update@8 and
+// mixed50@8 the same (document, field, value) sequence, so the second cell rewrote values the
+// first had already written - thousands of writes that changed nothing, which no real workload
+// in this shape does.
+func cellSeed(seed uint64, cell string, conc int) uint64 {
+	h := fnv.New64a()
+	fmt.Fprintf(h, "%d/%s/%d", seed, cell, conc)
+	return h.Sum64()
 }
 
 func defaultOps(conc int) int {
