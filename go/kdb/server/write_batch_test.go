@@ -430,9 +430,9 @@ func TestCoalescedBatchesStayWithinTheByteCap(t *testing.T) {
 	pad := strings.Repeat("x", 1000)
 	let := holdGate(t, srv)
 	var wg sync.WaitGroup
-	for i := 0; i < writers; i++ {
+	write := func(i int) {
 		wg.Add(1)
-		go func(i int) {
+		go func() {
 			defer wg.Done()
 			body := fmt.Sprintf(`{"n":%d,"p":"%s"}`, i, pad)
 			if i == 0 {
@@ -441,13 +441,25 @@ func TestCoalescedBatchesStayWithinTheByteCap(t *testing.T) {
 			if _, err := srv.Upsert("app/data", mustRandomUUID(t), body, auth.Principal{}); err != nil {
 				t.Error(err)
 			}
-		}(i)
+		}()
+	}
+	// The oversized write queues first, at the head of the queue: leaders behind it must pass
+	// over it, not commit alone because it is in the way.
+	write(0)
+	waitQueued(t, srv, 1)
+	for i := 1; i < writers; i++ {
+		write(i)
 	}
 	waitQueued(t, srv, writers)
 	let()
 	wg.Wait()
-	batches := 0
+	batches, smallAlone := 0, 0
 	for _, c := range commitsOnMain(t, srv) {
+		if len(c.Operations) == 1 {
+			if w, ok := c.Operations[0].(document.WriteOp); ok && len(w.Patch) < coalesceMaxBytes && strings.Contains(w.Patch, pad) {
+				smallAlone++
+			}
+		}
 		size := 0
 		for _, op := range c.Operations {
 			if w, ok := op.(document.WriteOp); ok {
@@ -466,5 +478,56 @@ func TestCoalescedBatchesStayWithinTheByteCap(t *testing.T) {
 	}
 	if batches < 3 {
 		t.Fatalf("%d batches for 39 ~1 KB writes under a 16 KiB cap, want at least 3", batches)
+	}
+	if smallAlone > 1 {
+		t.Fatalf("%d of the small writes committed alone behind the oversized one", smallAlone)
+	}
+}
+
+// lead passes over a queued write too large for the batch instead of stopping at it - a large
+// write at the head of the queue must not send every leader behind it off alone - and keeps that
+// write's document out of the batch, so two writes to one document still commit in queue order.
+func TestLeadPassesOverAWriteTooLargeForTheBatch(t *testing.T) {
+	var b writeBatcher
+	mk := func(id codec.UUID, bytes int) *batchedWrite {
+		return &batchedWrite{docID: id, bytes: bytes}
+	}
+	bigDoc := mustRandomUUID(t)
+	big := mk(bigDoc, 2*coalesceMaxBytes)
+	smalls := make([]*batchedWrite, 20)
+	for i := range smalls {
+		smalls[i] = mk(mustRandomUUID(t), 1000)
+	}
+	laterToBigDoc := mk(bigDoc, 10) // fits, but its document's earlier write was passed over
+	b.add(big)
+	for _, w := range smalls[:10] {
+		b.add(w)
+	}
+	b.add(laterToBigDoc)
+	for _, w := range smalls[10:] {
+		b.add(w)
+	}
+	leader := smalls[19]
+	batch, ok := b.lead(leader)
+	if !ok {
+		t.Fatal("leader not queued")
+	}
+	if batch[0] != leader {
+		t.Fatal("the leader is not first in its batch")
+	}
+	for _, w := range batch {
+		if w == big {
+			t.Fatal("the oversized write joined a batch")
+		}
+		if w == laterToBigDoc {
+			t.Fatal("a later write to the oversized write's document was committed ahead of it")
+		}
+	}
+	// The leader plus the ten small writes before the second write to bigDoc, which closes it.
+	if len(batch) != 11 {
+		t.Fatalf("batch of %d, want 11 (leader + the 10 small writes before the second write to one document)", len(batch))
+	}
+	if n := b.queued(); n != 21-11+1 {
+		t.Fatalf("%d writes left queued, want %d", n, 21-11+1)
 	}
 }

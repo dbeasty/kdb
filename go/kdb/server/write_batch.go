@@ -94,10 +94,13 @@ func (b *writeBatcher) remove(w *batchedWrite) bool {
 }
 
 // lead forms the batch w leads, for a caller holding the write gate: w, then the writes queued
-// behind it in arrival order, until the caps or the first write to a document already in the
-// batch. Writes queued at the same time are concurrent, so committing them in this order rather
-// than arrival order is one of the orders a client could have observed anyway. ok is false when
-// w is no longer queued - an earlier leader already took it.
+// behind it in arrival order, until the write cap or the first write to a document already in
+// the batch. A write that would take the batch past the byte cap is passed over, not a stop - one
+// large write at the head of the queue would otherwise send every leader off alone until its own
+// turn - and its document is kept out of this batch, so writes to one document still commit in
+// the order they queued. Writes queued at the same time are concurrent, so committing them in
+// this order rather than arrival order is one of the orders a client could have observed anyway.
+// ok is false when w is no longer queued - an earlier leader already took it.
 func (b *writeBatcher) lead(w *batchedWrite) (batch []*batchedWrite, ok bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -119,8 +122,12 @@ func (b *writeBatcher) lead(w *batchedWrite) (batch []*batchedWrite, ok bool) {
 		if i == at {
 			continue
 		}
-		if len(batch) == coalesceMaxWrites || size+p.bytes > coalesceMaxBytes || docs[p.docID] {
+		if len(batch) == coalesceMaxWrites || docs[p.docID] {
 			break
+		}
+		if size+p.bytes > coalesceMaxBytes {
+			docs[p.docID] = true
+			continue
 		}
 		batch = append(batch, p)
 		docs[p.docID] = true
