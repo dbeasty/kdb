@@ -3,7 +3,9 @@
 # and the rwcompare client in a second container on the same Docker network, so neither database
 # pays Docker Desktop's host port proxy (~0.8 ms per round trip on macOS).
 #
-# Usage: run.sh <kdb|mongo> <durability: fast|durable> <label> [rwcompare flags...]
+# Usage: run.sh <kdb|kdb-embed|mongo> <durability: fast|durable> <label> [rwcompare flags...]
+#   kdb-embed runs KDB inside the benchmark process, in one container given the server's CPU and
+#   memory limits - the embedded deployment, with no network at all.
 #   fast    = acknowledged from memory, flushed in the background within 100 ms
 #             (kdb --durability async --async-sync-interval-ms 100; mongo {w:1}, its default)
 #   durable = acknowledged once synced (kdb --durability sync; mongo {j:true})
@@ -74,16 +76,28 @@ case $target in
     addr=mongodb://$server:27017
     [[ $durability == durable ]] && client_flags=(-mongo-j)
     ;;
-  *) echo "target must be kdb or mongo" >&2; exit 2 ;;
+  kdb-embed)
+    addr=/data
+    client_flags=(-embed-durability "$durability")
+    ;;
+  *) echo "target must be kdb, kdb-embed or mongo" >&2; exit 2 ;;
 esac
 # The client retries its connect for up to a minute while the server starts.
 
 wait_quiet
-docker stats --no-stream --format '# server {{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}}' $server
-docker run --rm --network $net --cpus "$ccpus" -v "$bin_dir":/opt/bench:ro -v "$out":/out \
+client_limits=(--cpus "$ccpus")
+if [[ $target == kdb-embed ]]; then
+  # The database is in this container: it gets the server's limits and the data volume.
+  client_limits=(--name $server --cpus "$cpus" --memory "$mem" -v $server-data:/data)
+else
+  docker stats --no-stream --format '# server {{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}}' $server
+fi
+docker run --rm --network $net "${client_limits[@]}" -v "$bin_dir":/opt/bench:ro -v "$out":/out \
   --platform linux/amd64 gcr.io/distroless/static-debian12:latest /opt/bench/rwcompare \
   -target "$target" -addr "$addr" -label "$label-$durability" -json /out/results.jsonl \
   ${client_flags[@]+"${client_flags[@]}"} "$@" | tee -a "$out/$target-$label-$durability.txt"
-docker stats --no-stream --format '# server {{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}}' $server | tee -a "$out/$target-$label-$durability.txt"
+if [[ $target != kdb-embed ]]; then
+  docker stats --no-stream --format '# server {{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}}' $server | tee -a "$out/$target-$label-$durability.txt"
+fi
 docker run --rm -v $server-data:/d golang:1.26 du -sh /d | sed 's/^/# disk /' | tee -a "$out/$target-$label-$durability.txt"
-docker rm -f $server >/dev/null
+docker rm -f $server >/dev/null 2>&1 || true

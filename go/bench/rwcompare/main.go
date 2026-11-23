@@ -13,8 +13,10 @@
 //
 // Targets:
 //
-//	kdb    - a kdb-service over its wire protocol (go/kdb/client): Upsert / GetJSON
-//	mongo  - a mongod over its wire protocol (official Go driver): insertOne / findOne / updateOne $set
+//	kdb       - a kdb-service over its wire protocol (go/kdb/client): Upsert / GetJSON
+//	kdb-embed - KDB in this process (embed.OpenFileRuntime + server.KdbServerRuntime): the same
+//	            Upsert / GetDocument with no network; -addr is the data directory
+//	mongo     - a mongod over its wire protocol (official Go driver): insertOne / findOne / updateOne $set
 //
 // Run both servers in containers with the same CPU and memory limits and run this binary on the
 // same Docker network (scripts in this directory), so neither side pays Docker Desktop's port
@@ -37,7 +39,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/client"
+	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/embed"
+	"github.com/limidus/kdb/go/kdb/schema"
+	"github.com/limidus/kdb/go/kdb/server"
+	"github.com/limidus/kdb/go/kdb/storage"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -55,7 +63,8 @@ type store interface {
 }
 
 func main() {
-	target := flag.String("target", "kdb", "kdb or mongo")
+	target := flag.String("target", "kdb", "kdb, kdb-embed or mongo")
+	embedDur := flag.String("embed-durability", "fast", "kdb-embed only: fast (async, 100 ms flush) or durable (sync)")
 	addr := flag.String("addr", "127.0.0.1:9090", "kdb-service address (kdb) or mongodb:// URI (mongo)")
 	label := flag.String("label", "", "free-form label copied into every result line (e.g. image tag, durability)")
 	ns := flag.String("namespace", "bench/ycsb", "KDB namespace / Mongo database.collection")
@@ -79,6 +88,8 @@ func main() {
 		switch *target {
 		case "kdb":
 			st, err = openKDB(ctx, *addr, *ns, max(maxInt(parseInts(*concs)), *loadConc))
+		case "kdb-embed":
+			st, err = openEmbedded(*addr, *ns, *embedDur)
 		case "mongo":
 			st, err = openMongo(ctx, *addr, *ns, max(maxInt(parseInts(*concs)), *loadConc), *mongoJ)
 		default:
@@ -390,6 +401,66 @@ func (s *kdbStore) Close() error {
 	}
 	return nil
 }
+
+// --- KDB embedded ---------------------------------------------------------------------
+
+type embedStore struct {
+	rt  *embed.EmbeddedKdbRuntime
+	srv *server.KdbServerRuntime
+	ns  string
+}
+
+// openEmbedded opens a file runtime in this process the way kdb-service opens one, with the
+// service's cache pool sizing (an eighth of the container) instead of the embedded 64 MiB default,
+// so the comparison with the wire target is about the network and not the cache.
+func openEmbedded(dir, ns, durability string) (*embedStore, error) {
+	opts := embed.FileRuntimeOptionsFromEnv()
+	opts.Storage.MemoryBudgetBytes, _ = server.CachePoolBytes(0)
+	if durability == "fast" {
+		opts.Storage.Durability = storage.DurabilityAsync
+		opts.Storage.AsyncSyncIntervalMillis = 100
+	} else {
+		opts.Storage.Durability = storage.DurabilitySync
+	}
+	catalog, _, _ := strings.Cut(ns, "/")
+	rt, err := embed.OpenFileRuntimeWithOptions(dir, catalog, ns, schema.None(), opts)
+	if err != nil {
+		return nil, err
+	}
+	return &embedStore{rt: rt, srv: server.NewKdbServerRuntime(rt), ns: ns}, nil
+}
+
+func (s *embedStore) Insert(_ context.Context, _ int, id string, doc [fields]string) error {
+	u, err := codec.UUIDFromString(id)
+	if err != nil {
+		return err
+	}
+	_, err = s.srv.Upsert(s.ns, u, string(kdbJSON(doc)), auth.Principal{})
+	return err
+}
+
+func (s *embedStore) Read(_ context.Context, _ int, id string) (int, error) {
+	u, err := codec.UUIDFromString(id)
+	if err != nil {
+		return 0, err
+	}
+	body, _, found, err := s.srv.GetDocument(s.ns, u)
+	if err == nil && !found {
+		err = fmt.Errorf("read %s: not found", id)
+	}
+	return len(body), err
+}
+
+func (s *embedStore) Update(_ context.Context, _ int, id string, field int, value string) error {
+	u, err := codec.UUIDFromString(id)
+	if err != nil {
+		return err
+	}
+	_, err = s.srv.Upsert(s.ns, u, `{"field`+strconv.Itoa(field)+`":"`+value+`"}`, auth.Principal{})
+	return err
+}
+
+func (s *embedStore) Close() error { s.rt.Close(); return nil }
 
 // --- MongoDB ----------------------------------------------------------------------------
 
