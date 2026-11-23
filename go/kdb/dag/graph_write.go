@@ -277,7 +277,7 @@ func writeGraphSegment(dir, namespaceID string, seq uint64, full bool, in *graph
 	}
 
 	crc := crc32.New(crcTable)
-	bw := bufio.NewWriterSize(io.MultiWriter(tmp, crc), 256<<10)
+	bw := bufio.NewWriterSize(io.MultiWriter(&trickleWriter{f: tmp, every: graphTrickleBytes}, crc), 256<<10)
 	var off int64
 	write := func(p []byte) {
 		if err == nil {
@@ -649,11 +649,32 @@ func writeGraphSegment(dir, namespaceID string, seq uint64, full bool, in *graph
 	if _, err = tmp.Write(foot[graphFooterSize-8:]); err != nil {
 		return "", 0, err
 	}
-	if err = tmp.Sync(); err != nil {
+	if err = syncGraphFile(tmp); err != nil {
 		return "", 0, err
 	}
 	if err = tmp.Close(); err != nil {
 		return "", 0, err
 	}
 	return tmp.Name(), count, nil
+}
+
+// trickleWriter syncs its file every `every` bytes written (never, for 0) - see graphTrickleBytes.
+type trickleWriter struct {
+	f        *os.File
+	every    int
+	unsynced int
+}
+
+func (w *trickleWriter) Write(p []byte) (int, error) {
+	n, err := w.f.Write(p)
+	if err != nil || w.every <= 0 {
+		return n, err
+	}
+	if w.unsynced += n; w.unsynced >= w.every {
+		w.unsynced = 0
+		if err := syncGraphFile(w.f); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }

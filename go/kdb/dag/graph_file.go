@@ -80,8 +80,10 @@ import (
 // step an array index within a segment instead of a hash search.
 //
 // Durability: the writer syncs the file and its directory, but plainly, not with the store's
-// full-flush primitive. It does not need to - a segment torn by a crash fails its checksum and is
-// rebuilt - and a full flush of a file this size would stall every neighbouring writer on macOS.
+// full-flush primitive (graph_sync_*.go). It does not need to - a segment torn by a crash fails its
+// checksum and is rebuilt - and a full flush every few seconds would stall every neighbouring
+// writer on macOS. On Linux it syncs every megabyte as it writes (Cassandra's trickle_fsync), so
+// no single sync queues a whole segment ahead of the commit log's.
 
 const (
 	graphMagic   = "KDBGRAF4"
@@ -554,7 +556,7 @@ func (s *graphSource) hash() []byte { return s.rec[grHash : grHash+32] }
 
 func syncGraphDir(dir string) {
 	if d, err := os.Open(dir); err == nil {
-		d.Sync()
+		syncGraphFile(d) // plainly, as the files themselves - see graph_sync_darwin.go
 		d.Close()
 	}
 }
