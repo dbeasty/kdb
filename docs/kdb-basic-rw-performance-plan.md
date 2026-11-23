@@ -498,37 +498,38 @@ Fast durability:
 | insert | 8 | 22,636 (23,701 / 21,571) | 28,579 (28,778 / 28,379) | 1.26x | 3.4/14, 4.1/16 ; 6.5/13, 5.5/11 |
 | insert | 32 | 20,605 (20,674 / 20,536) | 41,816 (41,851 / 41,781) | 2.03x | 16.5/24, 17.2/23 ; 11.3/17, 10.9/16 |
 
-Durable (`--durability sync`, kdb-service defaults; base pass 1, W8 pass 1, W8 pass 2, base pass 2,
-each under the shared bench lock - other sessions' passes ran between them):
+Durable (`--durability sync`, kdb-service defaults; three passes - base, W8, W8, base, base, W8 -
+each under the shared bench lock, with other sessions' passes between them):
 
 | cell | c | base | w8 | w8 / base | write p99.9 / max ms (base, w8) |
 |---|--:|--:|--:|--:|---|
-| load | 32 | 24,857 (23,270 / 26,445) | 26,876 (25,418 / 28,334) | 1.08x | 8.3/75, 8.9/74 ; 12.7/92, 8.1/91 |
-| read | 1 | 12,641 (12,304 / 12,978) | 13,635 (14,894 / 12,377) | 1.08x |  |
-| read | 8 | 96,030 (94,656 / 97,403) | 89,576 (93,430 / 85,722) | 0.93x |  |
-| read | 32 | 115,643 (112,300 / 118,987) | 107,900 (111,091 / 104,710) | 0.93x |  |
-| update | 1 | 4,392 (4,188 / 4,596) | 3,563 (2,826 / 4,300) | 0.81x | 1.4/10, 0.6/8 ; 6.3/14, 1.2/17 |
-| update | 8 | 11,773 (10,403 / 13,143) | 12,176 (12,725 / 11,627) | 1.03x | 4.6/12, 4.5/34 ; 4.5/14, 4.8/17 |
-| update | 32 | 22,751 (21,254 / 24,248) | 19,326 (23,255 / 15,397) | 0.85x | 8.3/18, 6.9/16 ; 10.4/43, 14.9/77 |
-| mixed50 | 1 | 6,223 (5,836 / 6,610) | 6,173 (5,285 / 7,061) | 0.99x | 1.4/13, 2.8/27 ; 1.2/15, 1.2/14 |
-| mixed50 | 8 | 20,646 (18,943 / 22,349) | 19,849 (18,560 / 21,138) | 0.96x | 4.7/7, 5.5/11 ; 5.8/8, 6.5/11 |
-| mixed50 | 32 | 39,619 (36,453 / 42,784) | 47,573 (46,163 / 48,983) | 1.20x | 9.3/23, 7.9/38 ; 8.0/28, 13.8/28 |
-| insert | 1 | 3,800 (3,699 / 3,901) | 2,579 (3,935 / 1,224) | 0.68x | 1.0/4, 0.9/3 ; 2.1/31, 7.3/12 |
-| insert | 8 | 11,239 (11,306 / 11,171) | 9,438 (13,635 / 5,241) | 0.84x | 5.6/16, 5.7/13 ; 6.4/12, 13.8/18 |
-| insert | 32 | 21,742 (21,250 / 22,234) | 27,099 (26,335 / 27,862) | 1.25x | 16.1/21, 13.0/18 ; 13.7/17, 13.4/16 |
+| load | 32 | 25,495 (23,270 / 26,445 / 26,769) | 27,909 (25,418 / 28,334 / 29,976) | 1.09x | 8.3/75, 8.9/74, 7.0/49 ; 12.7/92, 8.1/91, 9.7/88 |
+| read | 1 | 12,921 (12,304 / 12,978 / 13,480) | 13,261 (14,894 / 12,377 / 12,513) | 1.03x |  |
+| read | 8 | 99,317 (94,656 / 97,403 / 105,892) | 92,818 (93,430 / 85,722 / 99,301) | 0.93x |  |
+| read | 32 | 121,600 (112,300 / 118,987 / 133,514) | 112,564 (111,091 / 104,710 / 121,890) | 0.93x |  |
+| update | 1 | 4,164 (4,188 / 4,596 / 3,706) | 3,962 (2,826 / 4,300 / 4,759) | 0.95x | 1.4/10, 0.6/8, 1.4/12 ; 6.3/14, 1.2/17, 1.3/9 |
+| update | 8 | 11,401 (10,403 / 13,143 / 10,658) | 12,752 (12,725 / 11,627 / 13,904) | 1.12x | 4.6/12, 4.5/34, 4.0/11 ; 4.5/14, 4.8/17, 4.3/15 |
+| update | 32 | 23,016 (21,254 / 24,248 / 23,548) | 22,000 (23,255 / 15,397 / 27,347) | 0.96x | 8.3/18, 6.9/16, 7.5/12 ; 10.4/43, 14.9/77, 6.7/16 |
+| mixed50 | 1 | 6,114 (5,836 / 6,610 / 5,896) | 6,207 (5,285 / 7,061 / 6,275) | 1.02x | 1.4/13, 2.8/27, 1.6/7 ; 1.2/15, 1.2/14, 1.7/14 |
+| mixed50 | 8 | 20,480 (18,943 / 22,349 / 20,148) | 19,830 (18,560 / 21,138 / 19,793) | 0.97x | 4.7/7, 5.5/11, 5.3/8 ; 5.8/8, 6.5/11, 6.4/12 |
+| mixed50 | 32 | 40,557 (36,453 / 42,784 / 42,434) | 46,926 (46,163 / 48,983 / 45,633) | 1.16x | 9.3/23, 7.9/38, 8.9/12 ; 8.0/28, 13.8/28, 8.1/21 |
+| insert | 1 | 4,001 (3,699 / 3,901 / 4,404) | 3,034 (3,935 / 1,224 / 3,942) | 0.76x | 1.0/4, 0.9/3, 0.7/4 ; 2.1/31, 7.3/12, 2.2/6 |
+| insert | 8 | 11,491 (11,306 / 11,171 / 11,997) | 11,003 (13,635 / 5,241 / 14,132) | 0.96x | 5.6/16, 5.7/13, 4.4/13 ; 6.4/12, 13.8/18, 6.4/10 |
+| insert | 32 | 22,473 (21,250 / 22,234 / 23,934) | 27,411 (26,335 / 27,862 / 28,037) | 1.22x | 16.1/21, 13.0/18, 13.9/18 ; 13.7/17, 13.4/16, 12.1/15 |
 
-The durable numbers are noisy in a way the CPU-load check cannot see - W8's second pass has cells
-a third of its first (insert at 1 worker 1,224 against 3,935), the shape of another session's disk
-work stalling syncs, and base's own passes differ by 10-25%. Read pass by pass, the first pair
-(nearest in time, both clean-looking) has W8 at +21-22% for updates and inserts at 8 workers and
-+9-27% at 32, single-worker writes within noise. That W8 helps less under durable writes than
-under fast ones is expected: a durable writer spends most of its time waiting for its sync, not at
-the gate, so fewer writers are queued when a batch forms - group commit already shares the sync,
-and W8 only adds the shared update.
+The durable means are dragged by one bad pass: W8's second has cells a third of its others
+(insert at 1 worker 1,224 against 3,935 and 3,942), the shape of another session's disk work
+stalling syncs - the CPU-load check cannot see it - and base's own passes differ by 10-20%. Paired
+by time without that pass (passes 1 and 3), W8 is +9-27% at 32 workers (insert +24% / +17%,
+update +9% / +16%, mixed +27% / +8%), +18-30% for updates and inserts at 8, and within noise at 1;
+the read control is 0.93x. That W8 helps less under durable writes than under fast ones is
+expected: a durable writer spends most of its time waiting for its sync, not at the gate, so fewer
+writers are queued when a batch forms - group commit already shares the sync, and W8 only adds the
+shared update.
 
 - **Concurrent writes roughly double under fast durability** at 32 workers (update 1.81x, insert
   2.03x, the load phase 2.20x; 50/50 mixes 1.60x) and gain 20-32% at 8; under durable writes the
-  gain is smaller (+9-27% at 32, +21% at 8 in the cleaner pair) because writers wait on the sync
+  gain is smaller (+9-27% at 32, +18-30% at 8 in the clean passes) because writers wait on the sync
   rather than queue at the gate. Fast tails shrink with them (worst write at 32
   workers 13-17 ms against 15-55 ms). One writer is unchanged - it forms batches of one.
 - **Reads pay for it when the cache is short.** Point reads right after a batched load ran 9-14%
