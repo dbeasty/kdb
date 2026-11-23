@@ -206,6 +206,10 @@ type trieEdit struct {
 	memo, placed map[tref]tref
 	n            int
 	recs         []editRec // grows only for a rebase (translate); an update needs at most 2*trieDepth+4
+	// prev/hadPrev: what insert found under its key before replacing it - so an update learns
+	// the version it supersedes from the walk it makes anyway, not from a lookup of its own.
+	prev    codec.Hash
+	hadPrev bool
 }
 
 type editRec struct {
@@ -223,6 +227,7 @@ var editPool = sync.Pool{New: func() any { return new(trieEdit) }}
 func getEdit(v trieView) *trieEdit {
 	e := editPool.Get().(*trieEdit)
 	e.v, e.n = v, 0
+	e.prev, e.hadPrev = codec.Hash{}, false
 	return e
 }
 
@@ -334,6 +339,7 @@ func (e *trieEdit) insert(r tref, key *[16]byte, content codec.Hash, depth int) 
 	if e.isLeaf(r) {
 		id, c := e.leafEntry(r)
 		if id == *key {
+			e.prev, e.hadPrev = c, true
 			if c == content {
 				return r
 			}
@@ -479,11 +485,13 @@ func (s *trieSlab) commit(e *trieEdit, r tref, gen uint32) *trieTree {
 // trieWith returns the tree h with (id, contentHash) set, sharing every subtree not on id's
 // path with h. O(trieDepth). A nil h is the empty tree; the result then starts a new slab.
 func trieWith(h *trieTree, id codec.UUID, contentHash codec.Hash) *trieTree {
-	return trieWithSpine(h, id, contentHash, nil)
+	out, _, _ := trieWithSpine(h, id, contentHash, nil)
+	return out
 }
 
-// trieWithSpine is trieWith taking the new leaf's hashes from spine (nil: hash them here).
-func trieWithSpine(h *trieTree, id codec.UUID, contentHash codec.Hash, spine *LeafSpine) *trieTree {
+// trieWithSpine is trieWith taking the new leaf's hashes from spine (nil: hash them here). It also
+// reports the content hash id had in h, if any.
+func trieWithSpine(h *trieTree, id codec.UUID, contentHash codec.Hash, spine *LeafSpine) (out *trieTree, prev codec.Hash, hadPrev bool) {
 	var s *trieSlab
 	var root tref
 	var gen uint32
@@ -497,14 +505,15 @@ func trieWithSpine(h *trieTree, id codec.UUID, contentHash codec.Hash, spine *Le
 	e.spine = spine
 	key := uuidKey(id)
 	nr := e.insert(root, &key, contentHash, 0)
-	out := h
+	out = h
 	if nr != root {
 		out = s.commit(e, nr, gen)
 		s.maybeRewrite(out)
 	}
+	prev, hadPrev = e.prev, e.hadPrev
 	putEdit(e)
 	runtime.KeepAlive(h)
-	return out
+	return out, prev, hadPrev
 }
 
 // trieWithAll is trieWith for a batch: items sorted by key, no key twice. Each node the batch

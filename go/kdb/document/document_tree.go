@@ -112,14 +112,21 @@ func (t DocumentTree) With(docID codec.UUID, contentHash codec.Hash) (DocumentTr
 // WithSpine is With for a version whose leaf hashes were folded in advance (NewLeafSpine); a nil
 // spine, or one for another version, is hashed here as With does. The tree is the same either way.
 func (t DocumentTree) WithSpine(docID codec.UUID, contentHash codec.Hash, spine *LeafSpine) (DocumentTree, error) {
+	nt, _, _, err := t.WithSpinePrev(docID, contentHash, spine)
+	return nt, err
+}
+
+// WithSpinePrev is WithSpine also reporting the version docID had in t (HashFor before the
+// update), learned from the update's own walk down the trie: a writer that needs both - the
+// write gate, to unpin or demote what it replaces - walks once instead of three times.
+func (t DocumentTree) WithSpinePrev(docID codec.UUID, contentHash codec.Hash, spine *LeafSpine) (DocumentTree, codec.Hash, bool, error) {
 	h := t.trieRootOrBuild()
-	_, existed := h.get(docID)
-	nh := trieWithSpine(h, docID, contentHash, spine)
+	nh, prev, existed := trieWithSpine(h, docID, contentHash, spine)
 	newSize := t.Size()
 	if !existed {
 		newSize++
 	}
-	return DocumentTree{TreeHash: nh.rootHash(), size: newSize, trie: nh}, nil
+	return DocumentTree{TreeHash: nh.rootHash(), size: newSize, trie: nh}, prev, existed, nil
 }
 
 // WithAll is With for each of entries in turn - the same tree, the same hash - built with each
