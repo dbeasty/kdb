@@ -984,6 +984,42 @@ func (r *DefaultReader) StreamCommits(segment storage.DeltaSegmentRef, fn func(d
 	})
 }
 
+// StreamCommitsSince implements storage.DeltaTailReader. Only a segment this process holds open
+// for appending qualifies (the shim stamps it as still changing): its size is then the exact
+// end of what was written, always a frame boundary because appends write whole frames, so the
+// bytes after fromOffset are read once and nothing before them is touched.
+func (r *DefaultReader) StreamCommitsSince(seq, fromOffset int64, fn func(document.Commit, int64) error) (int64, bool, error) {
+	stamper, canStamp := r.shim.(storage.SegmentStamper)
+	sizer, canSize := r.shim.(interface {
+		SegmentSize(segmentName string) (int64, error)
+	})
+	if !canStamp || !canSize || fromOffset < 0 {
+		return fromOffset, false, nil
+	}
+	name := storio.SegmentNameBuilder.DeltaSequenced(r.namespaceID, seq)
+	if _, stamped, err := stamper.SegmentStamp(name); err != nil || stamped {
+		return fromOffset, false, nil // sealed, or written by another process
+	}
+	size, err := sizer.SegmentSize(name)
+	if err != nil || size < fromOffset {
+		return fromOffset, false, nil
+	}
+	if size == fromOffset {
+		return size, true, nil
+	}
+	raw, err := r.shim.ReadFromSegment(name, fromOffset, int(size-fromOffset))
+	if err != nil {
+		return fromOffset, false, err
+	}
+	n, err := scanFrames(raw, func(s ScannedCommit) error { return fn(s.Commit, fromOffset+int64(s.FrameOffset)) })
+	if err != nil || n != len(raw) {
+		return fromOffset, false, nil
+	}
+	return size, true, nil
+}
+
+var _ storage.DeltaTailReader = (*DefaultReader)(nil)
+
 // ReadCommitAt implements storage.DeltaCommitStreamer: it decodes just the
 // commit framed at frameOffset. Reads only that frame's bytes - its length
 // is in its own header - so recovering one commit out of a large segment

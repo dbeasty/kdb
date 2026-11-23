@@ -111,6 +111,10 @@ type segIndex struct {
 	// (Windows): records stay off the heap either way, at a few small reads per lookup.
 	file  *os.File
 	count int
+	// end, when tailable, is the offset this segment's records are complete up to: the next
+	// frame a catch-up with the segment being written reads (see refreshTail).
+	end      int64
+	tailable bool
 }
 
 func (s *segIndex) mapped() bool { return s.mapping != nil }
@@ -254,6 +258,9 @@ func (x *Index) Refresh() (bool, error) {
 		// A reader that cannot report frame offsets cannot be asked for one frame later either.
 		return false, nil
 	}
+	if changed, done := x.refreshTail(); done {
+		return changed, nil
+	}
 	listed, err := x.reader.ListSegments()
 	if err != nil {
 		return false, err
@@ -282,6 +289,13 @@ func (x *Index) Refresh() (bool, error) {
 		sealed := seg.SequenceNumber < newest
 		old := have[seg.SequenceNumber]
 		delete(have, seg.SequenceNumber)
+		if old != nil && old.tailable && !sameSegment(old.ref, seg) && old.end == seg.SizeBytes &&
+			old.ref.FirstCommitHash == seg.FirstCommitHash {
+			// Caught up with incrementally (refreshTail) to exactly what the listing found: the
+			// same records, under the listing's ref.
+			old = &segIndex{ref: seg, recs: old.recs, end: old.end, tailable: true}
+			changed = true
+		}
 		if old != nil && sameSegment(old.ref, seg) {
 			if old.offHeap() || !sealed || !useDir || x.readOnly {
 				next = append(next, old)
@@ -323,7 +337,9 @@ func (x *Index) Refresh() (bool, error) {
 				continue
 			}
 		}
-		next = append(next, &segIndex{ref: seg, recs: recs})
+		// The scan read the segment as it was then, which is at least everything up to the
+		// listed size: a later catch-up starts there (re-reading a frame only re-adds its keys).
+		next = append(next, &segIndex{ref: seg, recs: recs, end: seg.SizeBytes, tailable: true})
 	}
 	// Whatever is left in have is a segment that is no longer in the log: truncated away, or
 	// deleted by a repair. Its sidecar goes with it.
@@ -356,6 +372,113 @@ func (x *Index) Refresh() (bool, error) {
 		x.removeOrphans(listed)
 	}
 	return true, nil
+}
+
+// refreshTail catches the index up with the segment being written by reading only the frames
+// appended to it since the last refresh, and reports done=false when it cannot - a segment came
+// or went, the newest segment is not on the heap or not being written by this process, or what
+// follows is not clean - leaving Refresh to list and rescan as before.
+//
+// Without it every miss that reached Refresh listed the log - rescanning the open segment to
+// describe it - and indexed that whole segment again, because its size had changed: up to 64 MiB
+// of frames read and every commit in them decoded, per cold read, on the read path. Cassandra
+// never reads its commit log to serve a read; this keeps the fallback that does to the commits
+// written since it last looked.
+func (x *Index) refreshTail() (changed, done bool) {
+	tail, ok := x.reader.(storage.DeltaTailReader)
+	if !ok {
+		return false, false
+	}
+	lister, ok := x.reader.(storage.DeltaSegmentSequenceLister)
+	if !ok {
+		return false, false
+	}
+	seqs, err := lister.SegmentSequences()
+	if err != nil || len(seqs) == 0 {
+		return false, false
+	}
+	x.mu.RLock()
+	segs := x.segs
+	x.mu.RUnlock()
+	if len(segs) != len(seqs) {
+		return false, false
+	}
+	// segs is newest first, seqs ascending: the same set, in mirror order.
+	for i, s := range segs {
+		if s.ref.SequenceNumber != seqs[len(seqs)-1-i] {
+			return false, false
+		}
+	}
+	newest := segs[0]
+	if newest.offHeap() || !newest.tailable {
+		return false, false
+	}
+	type rec struct {
+		key codec.Hash
+		off int64
+	}
+	var added []rec
+	var last codec.Hash
+	end, ok, err := tail.StreamCommitsSince(newest.ref.SequenceNumber, newest.end, func(c document.Commit, off int64) error {
+		x.opts.Keys(c, func(h codec.Hash) { added = append(added, rec{h, off}) })
+		last = c.Hash
+		return nil
+	})
+	if err != nil || !ok {
+		return false, false
+	}
+	if end == newest.end {
+		return false, true
+	}
+	slices.SortFunc(added, func(a, b rec) int {
+		if c := bytes.Compare(a.key.Bytes[:], b.key.Bytes[:]); c != 0 {
+			return c
+		}
+		switch {
+		case a.off < b.off:
+			return -1
+		case a.off > b.off:
+			return 1
+		}
+		return 0
+	})
+	fresh := make([]byte, 0, len(added)*recordSize)
+	for i, r := range added {
+		if i+1 < len(added) && added[i+1].key == r.key {
+			continue // the newest frame holding the key is the one kept
+		}
+		fresh = append(fresh, r.key.Bytes[:]...)
+		fresh = binary.LittleEndian.AppendUint64(fresh, uint64(r.off))
+	}
+	ref := newest.ref
+	ref.SizeBytes = end
+	if len(added) > 0 {
+		ref.LastCommitHash = last
+	}
+	merged := mergeRecords(newest.recs, fresh)
+	next := append([]*segIndex{{ref: ref, recs: merged, end: end, tailable: true}}, segs[1:]...)
+	x.mu.Lock()
+	x.segs = next
+	x.mu.Unlock()
+	return true, true
+}
+
+// mergeRecords merges two sorted record arrays with unique keys into one; for a key in both, the
+// record from newer (frames appended later) wins.
+func mergeRecords(older, newer []byte) []byte {
+	out := make([]byte, 0, len(older)+len(newer))
+	for len(older) > 0 && len(newer) > 0 {
+		switch c := bytes.Compare(older[:32], newer[:32]); {
+		case c < 0:
+			out, older = append(out, older[:recordSize]...), older[recordSize:]
+		case c > 0:
+			out, newer = append(out, newer[:recordSize]...), newer[recordSize:]
+		default:
+			out, older, newer = append(out, newer[:recordSize]...), older[recordSize:], newer[recordSize:]
+		}
+	}
+	out = append(out, older...)
+	return slices.Clip(append(out, newer...))
 }
 
 func sameSegment(a, b storage.DeltaSegmentRef) bool {

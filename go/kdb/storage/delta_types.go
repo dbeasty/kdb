@@ -76,6 +76,19 @@ type DeltaCommitStreamer interface {
 	ReadCommitAt(segment DeltaSegmentRef, frameOffset int64) (document.Commit, error)
 }
 
+// DeltaTailReader is implemented by readers that can read what has been appended to the segment
+// this process is writing, past an offset an earlier read ended at, without listing or rescanning
+// the segment: what an index of the log needs to catch up with the newest commits in time
+// proportional to them rather than to the segment.
+type DeltaTailReader interface {
+	// StreamCommitsSince hands fn each commit framed in segment seq from fromOffset (a frame
+	// boundary: 0, or an end this method returned) to the end of what has been appended, with
+	// its frame offset, and returns that end. ok is false - and nothing fn saw may be kept -
+	// when seq is not being appended to by this process, or what follows fromOffset is not a
+	// clean run of whole frames; the caller then falls back to a full listing and scan.
+	StreamCommitsSince(seq, fromOffset int64, fn func(commit document.Commit, frameOffset int64) error) (end int64, ok bool, err error)
+}
+
 // DeltaPayloadStreamer is implemented by readers that can walk a segment's frames one at a time,
 // handing over each decompressed CommitPayload (valid only during fn) rather than a decoded
 // commit. It stops quietly at a frame it cannot read whole and intact; see
