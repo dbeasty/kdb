@@ -13,7 +13,8 @@ lower than before D2 and below MongoDB's; concurrent writes under fast durabilit
 0.36-0.47x, bound by the per-namespace commit rate (~20-24k/s), which only W8 (several writes per
 commit) gets past. M1 found what holds KDB's memory - the commit graph's
 resident tier, unbounded between maintenance passes - and proposes a fix that needs a design.
-**Waiting on the user:** W8 (design below, with the decisions it needs) and E2 (trade-off below).
+**Waiting on the user:** W8 (design below, with the decisions it needs). E2 is decided (option 3,
+built; below).
 
 ## Goal and constraints
 
@@ -394,7 +395,7 @@ Expected: resident graph memory bounded at a few tens of MiB whatever the write 
 | # | item | Cassandra mechanism | expected | status |
 |---|---|---|---|---|
 | W8 | **Several writes per commit**: the only way past the per-namespace commit rate (~22-25k/s) | commit-log group sync + applying a batch of mutations as one update | concurrent writes towards MongoDB's 46-60k/s | **design below; needs the user's decisions before any code** |
-| E2 | Embedded cache default: fixed 64 MiB vs machine-sized | caches sized from the heap | embedded reads with hot data > 64 MiB | **trade-off below; the user's decision** |
+| E2 | Embedded cache default: fixed 64 MiB vs machine-sized | caches sized from the heap | embedded reads with hot data > 64 MiB | **decided: option 3, built (below)** |
 | W9 | **Stale premerges** (new, from the W7 profile): a zipfian-hot document is often written again between an Upsert's premerge and its turn at the gate, so the gate re-merges it - 11% of gate time at update@32. Merge faster at the gate: one parse of the stored body instead of several - the merge is of top-level keys only | `AtomicBTreePartition` retries its CAS before taking the lock | up to ~10% of gate time on hot keys | low (faster merge) |
 | M1 | Bound the commit graph's resident tier: flush by size, merge graph segments size-tiered, stream the flush | memtable flush on heap space; SizeTieredCompactionStrategy | ~300 MiB less at this workload, no 2x flush peak, bounded at any write rate | measured and diagnosed (M1 above); needs a design pass on the graph file (#159) |
 
@@ -453,9 +454,58 @@ tool relies on (history UIs, `kdb inspect`, audit exports, peers counting commit
 batch may mix principals (or the batch commit is authored by the runtime); the cap; and the tx-id
 rule should a client-supplied id ever reach these paths.
 
-### E2 - embedded cache default (decision)
+### E2 - embedded cache default (decided: option 3)
 
-kdb-service sizes its document cache from the machine (an eighth of the container, via
+**Decided (2026-11-22): option 3, still configurable.** Built in
+`perf/rw-e2-embed-cache`:
+
+- `StorageOptions.MemoryBudgetBytes` set: unchanged. The figure is that runtime's (or that host's)
+  own.
+- Unset: `embed.DefaultMemoryBudgetBytes()`, a sixteenth of the memory the process may use (the
+  cgroup limit, else physical RAM), at least 64 MiB (the old fixed value, so no host gets less) and
+  at most 256 MiB. Android and iOS stay at 64 MiB.
+- One pool per process: every default-sized host, runtime and `database/sql` connection registers
+  with one shared, reference-counted `BudgetArbiter` (the one hosts already used per host), so N
+  stores divide the default instead of each taking it. It is sized when the first store opens; the
+  last close stops its goroutine.
+- Cassandra's shape for caches nobody sized: a fraction with a cap. `key_cache_size` defaults to
+  min(5% of heap, 100 MB), `file_cache_size` to min(¼ of heap, 512 MB). kdb-service takes an
+  eighth (it owns its container); an embedded store takes half that.
+
+Measured with the same `kdb-embed` setup (4 CPUs / 3 GB, so the new default is 192 MiB; 100k 1 KB
+documents; 1M-operation cells; `-embed-cache 67108864` for the old default, `-1` for the new one,
+`0` for the service's 384 MiB), two passes in alternating order, ops/s mean (passes):
+
+| cell | c | old 64 MiB | new default (192 MiB) | service sizing (384 MiB) | new / old |
+|---|--:|--:|--:|--:|--:|
+| read | 1 | 302,794 (291,188 / 314,399) | 482,172 (481,990 / 482,353) | 994,790 | 1.59x |
+| read | 8 | 828,123 (750,921 / 905,324) | 1,612,520 (1,499,134 / 1,725,906) | 3,564,596 | 1.95x |
+| read | 32 | 1,029,987 (1,004,755 / 1,055,219) | 1,883,911 (1,840,785 / 1,927,037) | 3,793,752 | 1.83x |
+| read95 | 1 | 158,420 (157,774 / 159,066) | 200,343 (195,204 / 205,481) | 277,591 | 1.26x |
+| read95 | 8 | 159,765 (159,447 / 160,082) | 212,485 (205,270 / 219,700) | 262,031 | 1.33x |
+| read95 | 32 | 155,490 (160,560 / 150,420) | 202,706 (198,615 / 206,797) | 240,510 | 1.30x |
+| load (100k inserts) | 32 | 30,458 (29,749 / 31,167) | 27,114 (26,103 / 28,124) | 27,254 | 0.89x |
+| peak RSS after the cells | | 593-603 MB | 886-892 MB | 1,057-1,075 MB | +290 MB |
+
+Writes, the same way (default op counts, old and new only, two passes alternated):
+
+| cell | c | old 64 MiB | new default (192 MiB) | new / old |
+|---|--:|--:|--:|--:|
+| load (100k inserts) | 32 | 32,526 (29,663 / 35,388) | 28,484 (28,104 / 28,864) | 0.88x |
+| update | 1 / 8 / 32 | 18,766 / 20,554 / 17,902 | 19,402 / 19,372 / 18,294 | 1.03x / 0.94x / 1.02x |
+| insert | 1 / 8 / 32 | 26,312 / 26,516 / 26,659 | 27,077 / 26,310 / 26,465 | 1.03x / 0.99x / 0.99x |
+| peak RSS after the cells | | 1.22 GB | 1.38-1.48 GB | +160-260 MB |
+
+Reads gain 1.6-1.95x and read95 1.3x; the service's sizing would roughly double that again, at
+another 170 MB. Steady-state writes are unchanged (0.94-1.03x). The one cost that repeats in all
+four passes is the first 100k inserts into an empty store, about 11% slower (3.4-3.6 s against
+2.8-3.4 s) with either bigger cache: the cache keeps those bodies resident, so the collector has
+more live heap to mark while it grows. Once the store is loaded, inserts run at the old rate. The memory cost is about twice the budget increase (128 MiB more budget, ~290 MB
+more resident): Go's collector lets the heap grow to twice what is live (`GOGC=100`), so a bigger
+cache holds more garbage too. That is the trade an embedder now gets by default and can undo with
+`MemoryBudgetBytes = 64 << 20`.
+
+**Before the decision.** kdb-service sizes its document cache from the machine (an eighth of the container, via
 `server.CachePoolBytes`); an embedded runtime takes a fixed 64 MiB (`MemoryBudgetBytes` zero). An
 embedded store whose hot data is larger than that serves reads from cold loads. Measured with the
 benchmark's `kdb-embed` target (KDB in the client process, 4 CPUs / 3 GB, bounded live bodies as
