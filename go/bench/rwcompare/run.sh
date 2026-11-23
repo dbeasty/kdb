@@ -13,6 +13,7 @@
 # Environment:
 #   KDB_BIN       linux kdb-service binary to run (default: build from this checkout)
 #   KDB_FLAGS     extra kdb-service flags
+#   KDB_ENV       space-separated NAME=value pairs set in the kdb container (e.g. KDB_PREALLOCATE_SEGMENTS=true)
 #   SERVER_CPUS   server container CPUs (default 4)   SERVER_MEM  (default 3g)
 #   CLIENT_CPUS   client container CPUs (default 4)
 #   OUT           results directory (default ./results/<date>)
@@ -58,11 +59,13 @@ docker volume rm $server-data >/dev/null 2>&1 || true
 docker volume create $server-data >/dev/null
 
 client_flags=()
+env_flags=()
+for kv in ${KDB_ENV:-}; do env_flags+=(-e "$kv"); done
 case $target in
   kdb)
     dur_flags=(--durability sync)
     [[ $durability == fast ]] && dur_flags=(--durability async --async-sync-interval-ms 100)
-    docker run -d --name $server --network $net --cpus "$cpus" --memory "$mem" \
+    docker run -d --name $server --network $net --cpus "$cpus" --memory "$mem" ${env_flags[@]+"${env_flags[@]}"} \
       -v $server-data:/data -v "$(dirname "$KDB_BIN")":/opt/kdb:ro \
       --platform linux/amd64 gcr.io/distroless/static-debian12:latest \
       /opt/kdb/"$(basename "$KDB_BIN")" --data-dir /data --admin-addr 0.0.0.0:9093 \
@@ -88,7 +91,7 @@ wait_quiet
 client_limits=(--cpus "$ccpus")
 if [[ $target == kdb-embed ]]; then
   # The database is in this container: it gets the server's limits and the data volume.
-  client_limits=(--name $server --cpus "$cpus" --memory "$mem" -v $server-data:/data)
+  client_limits=(--name $server --cpus "$cpus" --memory "$mem" -v $server-data:/data ${env_flags[@]+"${env_flags[@]}"})
 else
   docker stats --no-stream --format '# server {{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}}' $server
 fi

@@ -269,7 +269,7 @@ func (r cellResult) print(target, label string) {
 		line += fmt.Sprintf("  read p50=%-8s p99=%-8s", us(pct(r.reads, 50)), us(pct(r.reads, 99)))
 	}
 	if len(r.writes) > 0 {
-		line += fmt.Sprintf("  write p50=%-8s p99=%-8s", us(pct(r.writes, 50)), us(pct(r.writes, 99)))
+		line += fmt.Sprintf("  write p50=%-8s p99=%-8s p99.9=%-8s max=%-8s", us(pct(r.writes, 50)), us(pct(r.writes, 99)), us(pct(r.writes, 99.9)), us(pct(r.writes, 100)))
 	}
 	if r.errors > 0 {
 		line += fmt.Sprintf("  ERRORS=%d first=%q", r.errors, r.firstErr)
@@ -286,6 +286,8 @@ func (r cellResult) write(path, target, label string) {
 		"ops": len(r.reads) + len(r.writes), "seconds": r.elapsed.Seconds(), "opsPerSec": r.opsPerSec(),
 		"readP50us": pct(r.reads, 50).Microseconds(), "readP99us": pct(r.reads, 99).Microseconds(),
 		"writeP50us": pct(r.writes, 50).Microseconds(), "writeP99us": pct(r.writes, 99).Microseconds(),
+		"writeP999us": pct(r.writes, 99.9).Microseconds(), "writeMaxUs": pct(r.writes, 100).Microseconds(),
+		"readP999us": pct(r.reads, 99.9).Microseconds(), "readMaxUs": pct(r.reads, 100).Microseconds(),
 		"errors": r.errors, "time": time.Now().UTC().Format(time.RFC3339),
 	}
 	b, _ := json.Marshal(row)

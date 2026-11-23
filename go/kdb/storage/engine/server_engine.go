@@ -156,6 +156,9 @@ type ServerEngine struct {
 	pendingLocations map[codec.Hash][][]TreeChange
 	pendingOrder     []codec.Hash
 	pending          *shardedPendingStore
+	// flushing is set while maybeFlushMemtable's background flush runs; Close waits on flushes.
+	flushing atomic.Bool
+	flushes  sync.WaitGroup
 	// prepared holds versions a writer hashed before it reached whatever serializes CommitTree
 	// (PrepareVersion), keyed by document.
 	preparedMu       sync.Mutex
@@ -393,6 +396,9 @@ func (e *ServerEngine) Close() error {
 	// difference between a historical read resolving by address next time
 	// and having to replay the log to rebuild what it needed.
 	var firstErr error
+	// A background flush first (maybeFlushMemtable): it must not start writing a table after the
+	// blob store below is closed.
+	e.flushes.Wait()
 	// Only where there is somewhere to flush to: an engine built without an
 	// IO shim (in-memory targets, and much of the test suite) has a
 	// memtable whose writer would dereference a nil store.
@@ -970,14 +976,33 @@ func (e *ServerEngine) CommitTree(namespaceID string, parentTreeHash codec.Hash)
 // Best-effort: a failed flush leaves the generation reachable through
 // pendingFlush, so nothing written is lost, and the next commit tries
 // again.
+//
+// The table is written on a goroutine of its own, as Cassandra writes a full memtable on its flush
+// writer while writes go on into a fresh one (ColumnFamilyStore.switchMemtable): the caller is a
+// commit, and on the server a commit holds the write gate, so writing the table and syncing it in
+// line put every writer behind a disk write - the largest stalls in a write-heavy run. A writer
+// waits only when a second generation fills before the first has been written (twice the
+// threshold), as Cassandra blocks writes once memtables pending flush pass their cleanup threshold.
 func (e *ServerEngine) maybeFlushMemtable() {
 	if e.memTable == nil || e.config.IOShim == nil {
 		return
 	}
-	if e.memTable.SizeBytes() < e.memtableFlushBytes() {
+	size, limit := e.memTable.SizeBytes(), e.memtableFlushBytes()
+	if size < limit {
 		return
 	}
-	_, _ = e.memTable.Flush(0)
+	if e.flushing.CompareAndSwap(false, true) {
+		e.flushes.Add(1)
+		go func() {
+			defer e.flushes.Done()
+			defer e.flushing.Store(false)
+			_, _ = e.memTable.Flush(0)
+		}()
+		return
+	}
+	if size >= 2*limit {
+		_, _ = e.memTable.Flush(0)
+	}
 }
 
 func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec.Hash) (document.DocumentTree, error) {
