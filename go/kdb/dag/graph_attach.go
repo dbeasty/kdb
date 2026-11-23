@@ -574,7 +574,7 @@ func (d *InMemoryCommitDag) mergeOnce() (bool, error) {
 		d.mu.Unlock()
 		return false, nil
 	}
-	in := &graphWriteInput{stop: &d.graphStop}
+	in := &graphWriteInput{stop: &d.graphStop, throttle: graphMergeThroughput}
 	d.nodes.segmentsForWrite(in, inputs)
 	epoch := d.nodes.genEpoch
 	dir, seq := d.graphDir, d.graphNextSeq

@@ -11,6 +11,7 @@ import (
 	"os"
 	"sort"
 	"sync/atomic"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 )
@@ -57,6 +58,9 @@ type graphWriteInput struct {
 	genOverride map[codec.Hash]uint32   // input records whose generation the DAG has changed
 
 	stop *atomic.Bool // set when the DAG is closing: the write gives up
+	// throttle caps the write at this many bytes a second (0: as fast as it goes) - see
+	// graphMergeThroughput.
+	throttle int64
 }
 
 func (in *graphWriteInput) release() {
@@ -278,7 +282,7 @@ func writeGraphSegment(dir, namespaceID string, seq uint64, full bool, in *graph
 	}
 
 	crc := crc32.New(crcTable)
-	bw := bufio.NewWriterSize(io.MultiWriter(&trickleWriter{f: tmp, every: graphTrickleBytes}, crc), 256<<10)
+	bw := bufio.NewWriterSize(io.MultiWriter(&trickleWriter{f: tmp, every: graphTrickleBytes, rate: in.throttle, start: time.Now()}, crc), 256<<10)
 	var off int64
 	write := func(p []byte) {
 		if err == nil {
@@ -659,23 +663,44 @@ func writeGraphSegment(dir, namespaceID string, seq uint64, full bool, in *graph
 	return tmp.Name(), count, nil
 }
 
-// trickleWriter syncs its file every `every` bytes written (never, for 0) - see graphTrickleBytes.
+// trickleWriter syncs its file every `every` bytes written (never, for 0) - see graphTrickleBytes
+// - and, with a rate, sleeps to keep to it.
 type trickleWriter struct {
 	f        *os.File
 	every    int
 	unsynced int
+	rate     int64 // bytes a second; 0 for no limit
+	start    time.Time
+	written  int64
 }
 
 func (w *trickleWriter) Write(p []byte) (int, error) {
 	n, err := w.f.Write(p)
-	if err != nil || w.every <= 0 {
+	if err != nil {
 		return n, err
 	}
-	if w.unsynced += n; w.unsynced >= w.every {
-		w.unsynced = 0
-		if err := syncGraphFile(w.f); err != nil {
-			return n, err
+	if w.every > 0 {
+		if w.unsynced += n; w.unsynced >= w.every {
+			w.unsynced = 0
+			if err := syncGraphFile(w.f); err != nil {
+				return n, err
+			}
+		}
+	}
+	if w.rate > 0 {
+		w.written += int64(n)
+		if ahead := time.Duration(w.written*int64(time.Second)/w.rate) - time.Since(w.start); ahead > 0 {
+			time.Sleep(ahead)
 		}
 	}
 	return n, nil
 }
+
+// graphMergeThroughput is how fast a background merge writes: Cassandra's compaction throughput
+// limit (compaction_throughput, 64 MiB/s by default), for the same reason. A size-tiered merge is
+// a burst - the biggest at a million commits rewrites ~100 MB, a second of a core's CPU at full
+// speed - and writers on the same CPUs paid for it in their slowest requests. Spread out, it uses
+// a fraction of a core; 64 MiB/s is still ~8x what merging asks for on average at 25,000 commits
+// a second (2.7 records of ~116 bytes a commit). Flushes are not throttled - they are what bounds
+// memory - and neither is an operator's CompactGraphFile.
+const graphMergeThroughput = 64 << 20
