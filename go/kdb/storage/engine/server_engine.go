@@ -1024,8 +1024,12 @@ func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec
 		e.snapshotBodiesSet = false // see ApplySnapshotBatch
 	}
 	for _, id := range deletes {
-		if prev, ok := e.tree.HashFor(id); ok && !bounded {
-			e.docsByHash.Unpin(prev)
+		if prev, ok := e.tree.HashFor(id); ok {
+			if bounded {
+				e.docsByHash.Demote(prev)
+			} else {
+				e.docsByHash.Unpin(prev)
+			}
 		}
 		var err error
 		e.tree, err = e.tree.Without(id)
@@ -1061,8 +1065,13 @@ func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec
 			}
 		}
 		e.docsByHash.Put(h, doc)
-		if hadPrev && prev != h && !bounded {
-			e.docsByHash.Unpin(prev)
+		if hadPrev && prev != h {
+			if bounded {
+				// Superseded: first out of the cache, so live versions stay (R1).
+				e.docsByHash.Demote(prev)
+			} else {
+				e.docsByHash.Unpin(prev)
+			}
 		}
 		e.tree, err = e.tree.WithSpine(doc.ID, h, spine)
 		if err != nil {

@@ -125,6 +125,10 @@ type docHashShard struct {
 	// pinnedPeak is pinned's high-water length: Go maps do not shrink when entries are deleted,
 	// so the footprint follows the peak, not the current length.
 	pinnedPeak int
+	// demoted holds versions superseded while still pinned (see Demote): when the last pin goes
+	// they join the recency ring at its tail rather than its head. Allocated on first use; holds
+	// only versions not yet durable, so it stays small.
+	demoted map[codec.Hash]struct{}
 	// bytes is the live charge the budget is applied to: the sum over resident versions of
 	// len(body) + docHashEntryOverhead.
 	bytes  int64
@@ -352,6 +356,9 @@ func (sh *docHashShard) bodyString(chunk, off, n uint32) string {
 func (s *shardedDocByHashStore) Pin(h codec.Hash) {
 	sh := s.shardFor(h)
 	sh.mu.Lock()
+	if len(sh.demoted) > 0 {
+		delete(sh.demoted, h) // live again
+	}
 	if i, ok := sh.index.find(sh.slots, &h); ok {
 		r := &sh.slots[i]
 		if r.pins == 0 {
@@ -384,7 +391,12 @@ func (s *shardedDocByHashStore) Unpin(h codec.Hash) {
 		r := &sh.slots[i]
 		r.pins--
 		if r.pins == 0 {
-			sh.lruPushFront(i)
+			if _, superseded := sh.demoted[h]; superseded {
+				delete(sh.demoted, h)
+				sh.lruPushBack(i)
+			} else {
+				sh.lruPushFront(i)
+			}
 		}
 	} else if n, ok := sh.pinned[h]; ok {
 		if n <= 1 {
@@ -395,6 +407,44 @@ func (s *shardedDocByHashStore) Unpin(h codec.Hash) {
 	}
 	sh.evictLocked()
 	sh.mu.Unlock()
+}
+
+// Demote marks h - a version a commit has just superseded - as the first to evict: it moves to
+// the tail of the recency ring with its second chance cleared, or, if it is still pinned (not
+// durable yet), it goes there when its last pin is released.
+//
+// Under bounded live bodies a live version and the versions it replaced share one budget. Left
+// where it was, a superseded version of a hot document stays near the front of the ring - it was
+// written recently - while colder live versions are evicted ahead of it, and reading those back
+// is a cold load from the log. Cassandra's memtable keeps only the latest cell of a row for the
+// same reason: history is the log's job, the in-memory tier's is what is current. A superseded
+// version stays readable (history reads still find it while it is resident, and the cold loader
+// once it is not); it is only first in line.
+//
+// A content hash can be shared by documents with identical bodies, so demoting one may make
+// another live document's version the next to go; that costs it a cold read, never its data.
+func (s *shardedDocByHashStore) Demote(h codec.Hash) {
+	sh := s.shardFor(h)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	i, ok := sh.index.find(sh.slots, &h)
+	if !ok {
+		return // not resident: nothing to make room from
+	}
+	r := &sh.slots[i]
+	if r.pins > 0 {
+		if sh.demoted == nil {
+			sh.demoted = make(map[codec.Hash]struct{})
+		}
+		sh.demoted[h] = struct{}{}
+		return
+	}
+	r.off &^= slotReferenced
+	if sh.head == noSlot || sh.slots[sh.head].prev == i {
+		return // already the tail
+	}
+	sh.lruRemove(i)
+	sh.lruPushBack(i)
 }
 
 // ResidentBytes is what the store actually occupies: every arena chunk it holds (live bodies,
@@ -533,6 +583,15 @@ func (sh *docHashShard) lruRemove(i uint32) {
 	}
 	r.prev, r.next = noSlot, noSlot
 	sh.lruLen--
+}
+
+// lruPushBack puts i on the ring at its tail, the next entry the evictor reaches.
+func (sh *docHashShard) lruPushBack(i uint32) {
+	head := sh.head
+	sh.lruPushFront(i)
+	if head != noSlot {
+		sh.head = head // the ring is circular: i now sits just before the head, at the tail
+	}
 }
 
 func (sh *docHashShard) lruMoveToFront(i uint32) {
