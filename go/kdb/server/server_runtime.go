@@ -745,21 +745,30 @@ func (s *KdbServerRuntime) premerge(namespaceID string, docID codec.UUID, patch 
 	if !resolved {
 		return premergedUpsert{}, false
 	}
+	pre := premergedUpsert{body: patch, absent: !found}
 	if !found {
 		if _, err := document.FromJSONWithID(docID, patch); err != nil {
 			return premergedUpsert{}, false
 		}
-		return premergedUpsert{body: patch, absent: true}, true
+	} else {
+		stored, err := s.Runtime.Storage.GetDocument(namespaceID, docID, tree)
+		if err != nil || stored == nil {
+			return premergedUpsert{}, false
+		}
+		merged, err := stored.Merge(patch)
+		if err != nil {
+			return premergedUpsert{}, false
+		}
+		pre.body, pre.source = merged.JSON, source
 	}
-	stored, err := s.Runtime.Storage.GetDocument(namespaceID, docID, tree)
-	if err != nil || stored == nil {
-		return premergedUpsert{}, false
+	// The version's hashing too: its content hash and Merkle leaf depend on nothing the gate
+	// decides. (Cassandra keeps Merkle trees off the write path altogether and builds them at
+	// repair time; KDB's commits name their tree, so the tree is updated per commit, but the
+	// part of that update that is the version's own can be done here.)
+	if preparer, ok := s.Runtime.Storage.(storage.VersionPreparer); ok {
+		preparer.PrepareVersion(namespaceID, document.Document{ID: docID, JSON: pre.body})
 	}
-	merged, err := stored.Merge(patch)
-	if err != nil {
-		return premergedUpsert{}, false
-	}
-	return premergedUpsert{body: merged.JSON, source: source}, true
+	return pre, true
 }
 
 // stillCurrent reports whether the document the merge was built from is still the one tree holds.

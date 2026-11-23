@@ -106,9 +106,15 @@ func (t DocumentTree) Walk(visit func(codec.UUID, codec.Hash) bool) {
 }
 
 func (t DocumentTree) With(docID codec.UUID, contentHash codec.Hash) (DocumentTree, error) {
+	return t.WithSpine(docID, contentHash, nil)
+}
+
+// WithSpine is With for a version whose leaf hashes were folded in advance (NewLeafSpine); a nil
+// spine, or one for another version, is hashed here as With does. The tree is the same either way.
+func (t DocumentTree) WithSpine(docID codec.UUID, contentHash codec.Hash, spine *LeafSpine) (DocumentTree, error) {
 	h := t.trieRootOrBuild()
 	_, existed := h.get(docID)
-	nh := trieWith(h, docID, contentHash)
+	nh := trieWithSpine(h, docID, contentHash, spine)
 	newSize := t.Size()
 	if !existed {
 		newSize++

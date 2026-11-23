@@ -156,6 +156,10 @@ type ServerEngine struct {
 	pendingLocations map[codec.Hash][][]TreeChange
 	pendingOrder     []codec.Hash
 	pending          *shardedPendingStore
+	// prepared holds versions a writer hashed before it reached whatever serializes CommitTree
+	// (PrepareVersion), keyed by document.
+	preparedMu       sync.Mutex
+	prepared         map[codec.UUID]preparedVersion
 	enlistmentStates map[codec.UUID]storage.EnlistmentEvictionState
 
 	// treeMu guards tree, a running DocumentTree updated incrementally
@@ -551,6 +555,50 @@ func (e *ServerEngine) GetDocument(namespaceID string, docID codec.UUID, atCommi
 	}
 	cp := d
 	return &cp, nil
+}
+
+// preparedVersion is a version's content hash and leaf spine, worked out ahead of CommitTree.
+type preparedVersion struct {
+	json  string
+	hash  codec.Hash
+	spine *document.LeafSpine
+}
+
+// maxPreparedVersions bounds prepared: an entry whose commit never comes (the write failed, or
+// took the gate's own path) is otherwise only replaced by the document's next prepare.
+const maxPreparedVersions = 4096
+
+// PrepareVersion is storage.VersionPreparer: hash doc - its content hash and its leaf folded to
+// every depth of the trie - now, so the CommitTree that stores it only looks the hashes up. Both
+// are functions of the version alone; CommitTree uses them only for exactly this body.
+func (e *ServerEngine) PrepareVersion(namespaceID string, doc document.Document) {
+	h, err := doc.ContentHash()
+	if err != nil {
+		return
+	}
+	pv := preparedVersion{json: doc.JSON, hash: h, spine: document.NewLeafSpine(doc.ID, h)}
+	e.preparedMu.Lock()
+	if e.prepared == nil || len(e.prepared) >= maxPreparedVersions {
+		e.prepared = make(map[codec.UUID]preparedVersion)
+	}
+	e.prepared[doc.ID] = pv
+	e.preparedMu.Unlock()
+}
+
+// versionHashes is doc's content hash and, when PrepareVersion worked them out for this exact
+// body, its leaf spine; otherwise the hash is computed here and the trie folds the leaf itself.
+func (e *ServerEngine) versionHashes(doc document.Document) (codec.Hash, *document.LeafSpine, error) {
+	e.preparedMu.Lock()
+	pv, ok := e.prepared[doc.ID]
+	if ok {
+		delete(e.prepared, doc.ID)
+	}
+	e.preparedMu.Unlock()
+	if ok && pv.json == doc.JSON {
+		return pv.hash, pv.spine, nil
+	}
+	h, err := doc.ContentHash()
+	return h, nil, err
 }
 
 // DocumentHash is storage.DocumentHasher: the version of docID that tree treeHash holds, read off
@@ -963,7 +1011,7 @@ func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec
 	baseTree := e.tree
 	changed := make([]TreeChange, 0, len(puts))
 	for _, doc := range puts {
-		h, err := doc.ContentHash()
+		h, spine, err := e.versionHashes(doc)
 		if err != nil {
 			return document.DocumentTree{}, err
 		}
@@ -991,7 +1039,7 @@ func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec
 		if hadPrev && prev != h && !bounded {
 			e.docsByHash.Unpin(prev)
 		}
-		e.tree, err = e.tree.With(doc.ID, h)
+		e.tree, err = e.tree.WithSpine(doc.ID, h, spine)
 		if err != nil {
 			return document.DocumentTree{}, err
 		}
