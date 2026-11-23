@@ -5,11 +5,11 @@ Written 2026-11-22 against `main` 6bc4d0e9 (v0.9.3 plus docs); measured rebased 
 read-error handling, not the paths measured here); branch `perf/basic-rw`. Every item that changes architecture names the Cassandra mechanism it
 follows, as `kdb-memory-cassandra-plan.md` and `kdb-qtask-cpu-plan.md` do. Pure local fixes do not.
 
-**Status (2026-11-22):** W1-W4 and F1 are implemented and measured in this branch. Reads beat
+**Status (2026-11-22):** W1-W4, F1 and D1 are implemented and measured in this branch. Reads beat
 MongoDB 1.3-2.1x; concurrent writes went from 0.29-0.32x to 0.41-0.46x MongoDB (fast durability);
-durable writes reach 0.78-1.11x with the D1 configuration. Two decisions are open: D1 (preallocated
-segments + `fdatasync` as the Linux default) and W8 (several writes per commit), the only item
-that takes concurrent writes past the per-namespace commit rate.
+durable writes are now 0.78-1.11x MongoDB `j:true` with kdb-service's new Linux default (D1). Open:
+W8 (several writes per commit), the only item that takes concurrent writes past the per-namespace
+commit rate, needs a design before it can be switched on.
 
 ## Goal and constraints
 
@@ -168,7 +168,7 @@ W4's gain is in its tails, not its means: in the mixed50@32 cell a memtable flus
 gate and stalled every writer for **1.26-1.31 s** (max latency, both passes; durable likewise). With
 W4 the worst write in that cell is 26-48 ms (fast) and 51-171 ms (durable).
 
-The durable-mode configuration (D1, not a default yet), on the W3 binary, two passes:
+The durable-mode configuration (D1, before it became the default), on the W3 binary, two passes:
 
 | cell | c | default | `--sync-mode fast` | preallocated segments | both | both vs default |
 |---|--:|--:|--:|--:|--:|--:|
@@ -185,14 +185,43 @@ preallocation alone helps; together the sync skips the metadata commit (as
 `kdb-segment-preallocation-plan.md` predicted) and the worst update stall at 32 workers drops from
 137-163 ms to 29-31 ms.
 
+### D1 - kdb-service on Linux defaults to `fdatasync` into preallocated segments
+
+`--sync-mode` now defaults to `fast` and the new `--preallocate-segments` (also
+`KDB_PREALLOCATE_SEGMENTS`, `preallocateSegments` in the config file) to on, **for kdb-service on
+Linux only**. Elsewhere the service keeps `full` without preallocation (on macOS `fast` is
+`F_BARRIERFSYNC`, which leaves the drive cache unflushed), and embedded runtimes keep their
+zero-value defaults (full, no preallocation), so an embedded store with many small namespaces does
+not pay a segment of disk each.
+
+The guarantee does not change on Linux: `fdatasync` forces the data, and any metadata needed to read
+it back, through the drive cache exactly as `fsync` does; it skips timestamps. On a growing file the
+new size is such metadata, so the two cost the same; preallocated segments never change size, so
+`fdatasync` becomes a data-only flush. The cost is disk: each open namespace's active segment takes
+its full size (64 MiB by default, `DeltaMaxSegmentBytes`) from creation, and creating one writes and
+syncs 64 MiB of zeros on the log writer once per rotation (D2 moves that off the write path).
+
+*Cassandra:* the commit log is fixed-size segments its `CommitLogSegmentManager` creates up front.
+
+Measured, the branch with no flags against v0.9.4 with no flags, durable, two passes:
+
+| cell | c | v0.9.4 | branch, new default | change | worst write, ms (v0.9.4 / branch) |
+|---|--:|--:|--:|--:|---|
+| load (inserts) | 32 | 17,231 | 27,077 | +57% | 14-153 / 44-107 |
+| update | 1 | 2,678 | 4,357 | +63% | 11 / 31-90 |
+| update | 32 | 13,559 | 22,665 | +67% | 1,653-1,861 / 35-45 |
+| mixed50 | 8 | 13,304 | 22,160 | +67% | 14-2,093 / 25-39 |
+| mixed50 | 32 | 25,546 | 42,094 | +65% | 1,215-1,330 / 42-110 |
+| insert | 1 | 2,609 | 4,030 | +54% | 5 / 29-31 |
+| insert | 32 | 15,602 | 23,355 | +50% | 21-236 / 55-142 |
+
 ## Not done yet - the plan
 
 Ordered by expected gain per effort. Gate-time shares are from the latest profile.
 
 | # | item | Cassandra mechanism | expected | risk / cost |
 |---|---|---|---|---|
-| D1 | **Durable writes: preallocated log segments + `fdatasync` by default for kdb-service on Linux.** Measured (below): durable update@1 2.0x, update@32 +30%, insert@32 +41%. Linux `fdatasync` is as power-loss-safe as `fsync`; with preallocation it skips the size-metadata commit. | `CommitLogSegmentManager` pre-creates fixed-size segments | KDB durable inserts already pass MongoDB `j:true`; updates reach 0.85-0.9x | **Decision needed:** 64 MiB of disk per active namespace up front - fine for a server, not for many small embedded namespaces (keep off for embed, or smaller embedded segments) |
-| D2 | Durable tails: with W4 the flush stall is gone, but durable cells still show single 100-450 ms writes (fast mode: none). Attribute them first (segment rotation and zero-fill, checkpoint, SSTable sync) with a block profile | segments created ahead of need; fsyncs of flushes off the commit path | p99.9 / max | measure first |
+| D2 | Durable tails: durable cells still show single 30-450 ms writes (fast mode: under 60 ms). One known cause: with D1 a new segment is created - 64 MiB of zeros written and synced - on the log writer at rotation, in line with commits. Create the next segment ahead of need on a goroutine, then attribute what is left (checkpoint, SSTable sync) with a block profile | `CommitLogSegmentManager`'s allocator keeps the next segment ready before the active one fills | p99.9 / max under durable writes | medium |
 | W5 | Serialize each commit once: the DAG's commit hash and the delta record encode the same payload twice under the gate | a `Mutation` is serialized once and the buffer reused (commit log, messaging) | ~5% of gate | low |
 | W6 | Insert validation: a new document is parsed into `map[string]any` (encoding/json) just to check it is an object; a validating scan is enough | - | inserts | low |
 | W7 | Remaining Merkle work under the gate: internal node hashes along the path (~7%), child record reads (~6%) | (Merkle off the write path) - only a batch can share them, see W8 | | medium |

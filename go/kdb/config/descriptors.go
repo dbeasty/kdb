@@ -459,9 +459,16 @@ func serviceSpecs() []settingSpec {
 		{
 			key: "storage.syncMode", flag: "sync-mode", env: "KDB_SYNC_MODE",
 			scope: ScopeNamespace, mutability: MutabilityRestart,
-			help:   "physical sync primitive: full (survives power loss) or fast (survives process/OS crash, an order of magnitude cheaper)",
+			help:   "physical sync primitive: full (fsync; F_FULLFSYNC on macOS) or fast (fdatasync on Linux - as power-loss-safe as fsync, and with preallocated segments a data-only sync; F_BARRIERFSYNC on macOS - survives process/OS crash, power loss can lose the drive cache). Default fast on Linux, full elsewhere",
 			value:  str(func(s ServiceSettings) string { return s.SyncMode }),
 			inFile: func(f *ServiceFile) bool { return f.SyncMode != nil },
+		},
+		{
+			key: "storage.preallocateSegments", flag: "preallocate-segments", env: "KDB_PREALLOCATE_SEGMENTS",
+			scope: ScopeProcess, mutability: MutabilityRestart,
+			help:   "create each new delta segment at its full size (zeroed) so appends never grow the file and a sync commits no size metadata. Costs one segment of disk (64 MiB by default) per open namespace up front. Default on on Linux, off elsewhere; applies to segments created after a restart",
+			value:  yn(func(s ServiceSettings) bool { return s.PreallocateSegments }),
+			inFile: func(f *ServiceFile) bool { return f.PreallocateSegments != nil },
 		},
 	}
 }

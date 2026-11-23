@@ -54,6 +54,7 @@ var fieldToKey = map[string]string{
 	"AsyncSyncIntervalMS":    "storage.asyncSyncIntervalMS",
 	"Compression":            "storage.compression",
 	"SyncMode":               "storage.syncMode",
+	"PreallocateSegments":    "storage.preallocateSegments",
 }
 
 func TestEverySettingIsDescribed(t *testing.T) {
@@ -130,7 +131,16 @@ func envProbeValue(key string) string {
 	case "storage.compression":
 		return "none"
 	case "storage.syncMode":
+		// The default is per platform (fast on Linux), so probe with the other one.
+		if defaultSyncMode == "fast" {
+			return "full"
+		}
 		return "fast"
+	case "storage.preallocateSegments":
+		if defaultPreallocate {
+			return "false"
+		}
+		return "true"
 	default:
 		return "probe-value"
 	}

@@ -1593,7 +1593,8 @@ Settings carry a mutability: *restart*, *live* (changeable through the control p
 | `--durability` | `KDB_DURABILITY` | `durability` | `sync` | restart | `sync`, `async`, `memory` |
 | `--async-sync-interval-ms` | `KDB_ASYNC_SYNC_INTERVAL_MS` | `asyncSyncIntervalMs` | 5 | restart | background flush under `async` |
 | `--compression` | `KDB_COMPRESSION` | `compression` | `zstd` | restart | `zstd` or `none` for new frames (recorded per frame) |
-| `--sync-mode` | `KDB_SYNC_MODE` | `syncMode` | `full` | restart | `full` (macOS `F_FULLFSYNC`; Linux `fsync`) or `fast` (macOS `F_BARRIERFSYNC`; Linux `fdatasync`) |
+| `--sync-mode` | `KDB_SYNC_MODE` | `syncMode` | `fast` on Linux, `full` elsewhere | restart | `full` (macOS `F_FULLFSYNC`; Linux `fsync`) or `fast` (macOS `F_BARRIERFSYNC`, not power-loss safe; Linux `fdatasync`, power-loss safe) |
+| `--preallocate-segments` | `KDB_PREALLOCATE_SEGMENTS` | `preallocateSegments` | on on Linux, off elsewhere | restart | delta segments created at full size, zeroed, so `fdatasync` commits no metadata; one segment (64 MiB) of disk per open namespace |
 | `--memory-budget-mb` | `KDB_MEMORY_BUDGET_MB` | `memoryBudgetMb` | 0 = auto (cgroup limit, else 75 % of RAM); -1 off | live | admission-control budget |
 | `--memory-limit-mb` | `KDB_MEMORY_LIMIT_MB` | `memoryLimitMb` | - | live | deprecated alias (an explicit 0 disables) |
 | `--memory-reserve-mb` | `KDB_MEMORY_RESERVE_MB` | `memoryReserveMb` | 48 | live | rescue reserve (clamped to a quarter of the budget) |
@@ -1678,7 +1679,7 @@ view reports a discarded value with a warning.
 | `KDB_CHECKPOINTS` | `off` disables the checkpoint that lets an open skip the delta log |
 | `KDB_ANCESTRY_PRUNING`, `KDB_GRAPH_FILE`, `KDB_GRAPH_REBUILD_COMMITS`, `KDB_GRAPH_MAX_SEGMENTS`, `KDB_GRAPH_CHUNK_BYTES` (size of an in-memory commit-record chunk, default 1 MiB; the first chunk of a namespace starts at 4 KiB and doubles), `KDB_HISTORY_ANCHOR_INTERVAL` | commit-graph and tree-anchor tuning. `KDB_GRAPH_FILE` maps the commit graph from segment files instead of the heap and is **on by default**; `KDB_GRAPH_FILE=off` holds it in the heap (see `docs/kdb-mmap-plan.md`) |
 | `KDB_TREE_FILE`, `KDB_TREE_RESIDENT_BYTES` | live document tree paging. `KDB_TREE_FILE=on` keeps the tree's cold records in mapped segment files (`ns/<namespace>/tree/`) instead of the heap, with `KDB_TREE_RESIDENT_BYTES` (default 64 MB) of recent writes resident; **on by default** since 2026-10-14 (`KDB_TREE_FILE=off` holds the tree in the heap; see `docs/benchmarks/2026-10-14-consolidated-pass.md`) |
-| `KDB_PREALLOCATE_SEGMENTS` | preallocate delta segments (off by default) |
+| `KDB_PREALLOCATE_SEGMENTS` | preallocate delta segments: off by default for embedded runtimes; kdb-service resolves it as a service setting (`--preallocate-segments`, on by default on Linux) |
 | `KDB_S3_BUCKET`, `_ENDPOINT`, `_REGION`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY`, `_PREFIX`, `_PATH_STYLE`, `_ENSURE_BUCKET` | S3 replica tier |
 | `KDB_S3_ARCHIVE_BUCKET`, `_ENDPOINT`, `_REGION`, `_PREFIX` | S3 archive tier (keeps what `history=none` reclaims; use a different bucket/prefix from the replica) |
 

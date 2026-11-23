@@ -339,7 +339,8 @@ memory budget, durability, abort watchdog) plus the exact build identity.
 | `--durability sync\|async\|memory` | `sync` | how much of the write-out a commit waits for |
 | `--async-sync-interval-ms N` | 5 | background flush period under `async` |
 | `--compression zstd\|none` | `zstd` | codec for new delta frames and SSTable blocks (recorded per frame) |
-| `--sync-mode full\|fast` | `full` | physical sync primitive (`fast` survives OS crash but not power loss) |
+| `--sync-mode full\|fast` | `fast` on Linux, `full` elsewhere | physical sync primitive: `fast` is `fdatasync` on Linux (as power-loss-safe as `fsync`) and `F_BARRIERFSYNC` on macOS (survives an OS crash, not power loss) |
+| `--preallocate-segments` | on on Linux, off elsewhere | create each delta segment at full size (64 MiB, zeroed) so a durable commit's sync has no size metadata to commit; one segment of disk per open namespace up front (`KDB_PREALLOCATE_SEGMENTS`, `preallocateSegments`) |
 | `--document-copies` | off | trade disk for read CPU: a document in a bulk commit (16 KiB of other bodies beside it, instead of 64 KiB) gets a by-value copy, so reading it does not decompress the commit. qtask's benchmark: +26% throughput, +54% data directory. Switchable on restart - the next open re-files existing documents in the background (`KDB_DOCUMENT_COPIES`, `documentCopies`) |
 | `--version` | — | print version and exit |
 
@@ -2214,8 +2215,18 @@ namespace). The classification rules are in [Flows §12](kdb-lld-flows.md#12-pee
 | `async` | the commit is queued in memory | up to one flush interval / in-flight batch |
 | `memory` | never written | everything on restart |
 
-`--sync-mode fast` (F_BARRIERFSYNC / fdatasync) is an order of magnitude cheaper than `full` and
-still survives process and OS crashes — but not power loss.
+On Linux, kdb-service defaults to `--sync-mode fast` with `--preallocate-segments`: `fdatasync` into
+segments that never change size. `fdatasync` forces the data through the drive cache exactly as
+`fsync` does, so an acknowledged write still survives power loss; what it skips is the file-size and
+timestamp journal commit, and with preallocation there is no size change to commit. On the
+benchmark in `docs/kdb-basic-rw-performance-plan.md` that doubled durable writes on one connection
+(2.3k to 4.6k/s) and brought durable writes to 0.8-1.1x MongoDB `j:true`. The price is disk: each open
+namespace's active segment takes its full 64 MiB from the start. `--preallocate-segments=false` and
+`--sync-mode full` restore the old behaviour; embedded runtimes keep it (full, no preallocation).
+
+On macOS `--sync-mode fast` is `F_BARRIERFSYNC`: an order of magnitude cheaper than `full`
+(`F_FULLFSYNC`) and it survives process and OS crashes, but not power loss - so `full` stays the
+default there.
 
 Concurrent commits share one physical fsync (group commit), so `sync` does **not** mean one disk
 sync per write under load.

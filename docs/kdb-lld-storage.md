@@ -265,8 +265,14 @@ that no manifest names, never a half-valid backup.
 
 | Mode | macOS | Linux | Survives |
 |------|-------|-------|----------|
-| `full` (default) | `F_FULLFSYNC` | `fsync` | power loss |
-| `fast` | `F_BARRIERFSYNC` | `fdatasync` | process and OS crash, **not** power loss — an order of magnitude cheaper |
+| `full` | `F_FULLFSYNC` | `fsync` | power loss |
+| `fast` | `F_BARRIERFSYNC` | `fdatasync` | macOS: process and OS crash, **not** power loss - an order of magnitude cheaper. Linux: power loss (`fdatasync` flushes the drive cache too; it skips only metadata not needed to read the data back) |
+
+Defaults: embedded runtimes use `full` without preallocation. kdb-service uses `fast` with
+preallocated segments on Linux (`--preallocate-segments`) and `full` elsewhere. Preallocation is
+what makes `fdatasync` cheaper than `fsync` - a growing file's new size is metadata both must
+commit - and costs one segment of disk per open namespace
+(`docs/kdb-segment-preallocation-plan.md`, `docs/kdb-basic-rw-performance-plan.md` D1).
 
 ### 4.3 What "acknowledged" means
 

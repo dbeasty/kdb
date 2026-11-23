@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -233,21 +234,55 @@ func TestResolveServiceStorageTunables(t *testing.T) {
 	})
 }
 
-// TestResolveServiceSyncMode covers the sync-mode setting the same way: full by
-// default (an acknowledged sync survives power loss unless the operator chose
-// otherwise), resolvable through the file/env/flag chain, and validated at
-// startup.
+// TestResolveServiceSyncMode covers the sync-mode setting the same way: a default
+// that survives power loss on every platform (fdatasync into preallocated
+// segments on Linux, full syncs elsewhere), resolvable through the file/env/flag
+// chain, and validated at startup.
 func TestResolveServiceSyncMode(t *testing.T) {
-	t.Run("defaults to full", func(t *testing.T) {
+	t.Run("defaults per platform", func(t *testing.T) {
 		s, err := ResolveService(nil, noEnv, noFlags, ServiceSettings{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if s.SyncMode != "full" {
-			t.Errorf("SyncMode = %q, want full", s.SyncMode)
+		wantMode, wantStorio, wantPrealloc := "full", storio.SyncModeFull, false
+		if runtime.GOOS == "linux" {
+			// fdatasync is power-loss safe on Linux; preallocation is what makes it cheaper than
+			// fsync, so the two only come together.
+			wantMode, wantStorio, wantPrealloc = "fast", storio.SyncModeFast, true
 		}
-		if m, err := ParseSyncMode(s.SyncMode); err != nil || m != storio.SyncModeFull {
-			t.Errorf("ParseSyncMode(%q) = %v, %v; want SyncModeFull", s.SyncMode, m, err)
+		if s.SyncMode != wantMode {
+			t.Errorf("SyncMode = %q, want %s on %s", s.SyncMode, wantMode, runtime.GOOS)
+		}
+		if m, err := ParseSyncMode(s.SyncMode); err != nil || m != wantStorio {
+			t.Errorf("ParseSyncMode(%q) = %v, %v; want %v", s.SyncMode, m, err, wantStorio)
+		}
+		if s.PreallocateSegments != wantPrealloc {
+			t.Errorf("PreallocateSegments = %v, want %v on %s", s.PreallocateSegments, wantPrealloc, runtime.GOOS)
+		}
+	})
+
+	t.Run("preallocation resolution chain", func(t *testing.T) {
+		off, on := false, true
+		s, err := ResolveService(&ServiceFile{PreallocateSegments: &off}, noEnv, noFlags, ServiceSettings{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.PreallocateSegments {
+			t.Error("preallocateSegments=false in the file must turn it off")
+		}
+		s, err = ResolveService(&ServiceFile{PreallocateSegments: &off}, envOf(map[string]string{"KDB_PREALLOCATE_SEGMENTS": "true"}), noFlags, ServiceSettings{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !s.PreallocateSegments {
+			t.Error("KDB_PREALLOCATE_SEGMENTS=true must override the file")
+		}
+		s, err = ResolveService(&ServiceFile{PreallocateSegments: &on}, noEnv, flagsOf("preallocate-segments"), ServiceSettings{PreallocateSegments: false})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.PreallocateSegments {
+			t.Error("an explicitly-set --preallocate-segments=false must override the file")
 		}
 	})
 
