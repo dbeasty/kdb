@@ -191,3 +191,63 @@ func TestPreallocatedSegmentIsPhysicallyFullSize(t *testing.T) {
 		t.Fatalf("segment with preallocation off is %d bytes, expected far smaller", offInfo.Size())
 	}
 }
+
+// Rotating through many preallocated segments - on Linux each one after the first prepared ahead
+// of need as an unnamed spare and linked in at rotation - keeps every commit, in order, readable
+// with preallocation on or off, and every segment is physically at least its preallocated size.
+func TestRotationThroughPreallocatedSegmentsKeepsEveryCommit(t *testing.T) {
+	const segBytes = 64 << 10
+	root := t.TempDir()
+	shim := shimAt(t, root, segBytes)
+	cfg := newConfig(shim, storage.CompressionNone)
+	cfg.DeltaMaxSegmentBytes = segBytes
+	w, err := Factory{Config: cfg}.OpenWriter(testNS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dw := w
+	var want []codec.Hash
+	var parent *codec.Hash
+	rotations := 0
+	for len(want) < 2000 {
+		if rotated, err := dw.RotateIfNeeded(); err != nil {
+			t.Fatal(err)
+		} else if rotated {
+			rotations++
+		}
+		batch := make([]storage.DeltaRecord, 0, 10)
+		for i := 0; i < 10; i++ {
+			c := buildCommit(t, parent)
+			batch = append(batch, record(t, c))
+			h := c.Hash
+			want = append(want, h)
+			parent = &h
+		}
+		if _, err := dw.AppendBatch(batch); err != nil {
+			t.Fatal(err)
+		}
+		if err := dw.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := dw.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	if rotations < 3 {
+		t.Fatalf("only %d rotations; the test needs several", rotations)
+	}
+	for seq := int64(0); seq <= int64(rotations); seq++ {
+		info, err := os.Stat(filepath.Join(root, filepath.FromSlash(storio.SegmentNameBuilder.DeltaSequenced(testNS, seq))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// At least its preallocated size: rotation happens between batches, so the last batch
+		// may run a little past it.
+		if info.Size() < segBytes {
+			t.Fatalf("segment %d is %d bytes on disk, want at least %d", seq, info.Size(), segBytes)
+		}
+	}
+	for _, prealloc := range []int64{0, segBytes} {
+		assertSameHashes(t, readAllCommits(t, shimAt(t, root, prealloc)), want)
+	}
+}

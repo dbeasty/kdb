@@ -56,6 +56,15 @@ type OSByteStore struct {
 	// a second segment created in a directory the first is still making cannot be flushed - and
 	// acknowledged - before that directory's own entry is pending a sync.
 	dirMu sync.Mutex
+	// spares holds the next delta segment of each namespace being written, created ahead of need
+	// (see spareSegment), keyed by the segment name it will become. Guarded by mu.
+	spares map[string]*spareSegment
+	// noSpares is set once creating a spare has failed for want of O_TMPFILE, so later segments
+	// do not try again.
+	noSpares atomic.Bool
+	// trickleBytes, when positive, is how much is appended to an SSTable between syncs (see
+	// trickleSyncBytes): only on Linux, and only for a store that syncs at all.
+	trickleBytes int64
 }
 
 // syncDir is fsx.SyncDir, a variable so tests can see which directories are synced.
@@ -66,19 +75,34 @@ const maxReadHandles = 512
 type openSegment struct {
 	file *os.File
 	size int64 // atomic
+	// next is the segment a writer rotates to after this one, for a preallocated delta segment
+	// whose successor can be prepared ahead of need (spareSegment); empty otherwise.
+	next string
+	// spareStarted is set once preparing next has begun.
+	spareStarted atomic.Bool
+	// trickle is set for an SSTable segment, which is synced every OSByteStore.trickleBytes as it
+	// is written; unsynced counts the bytes appended since the last such sync.
+	trickle  bool
+	unsynced int64 // atomic
 }
 
 func NewOSByteStore(config PlatformIOConfig) (*OSByteStore, error) {
 	if config.RootDirectory == nil || *config.RootDirectory == "" {
 		return nil, fmt.Errorf("os byte store requires root directory")
 	}
+	var trickle int64
+	if trickleSupported && config.FsyncOnFlush {
+		trickle = trickleSyncBytes
+	}
 	return &OSByteStore{
 		root:             *config.RootDirectory,
 		syncMode:         config.SyncMode,
 		preallocateBytes: config.PreallocateBytes,
+		trickleBytes:     trickle,
 		handles:          make(map[string]*openSegment),
 		readers:          make(map[string]*os.File),
 		unsyncedDirs:     make(map[string]struct{}),
+		spares:           make(map[string]*spareSegment),
 	}, nil
 }
 
@@ -124,10 +148,20 @@ func (s *OSByteStore) openFor(segmentName string) (*openSegment, error) {
 	}
 
 	p := s.pathFor(segmentName)
+	prealloc := s.preallocateFor(segmentName)
+	var spare *os.File
+	if prealloc > 0 {
+		// Taken - and waited for, if it is still being prepared - before dirMu, so that the wait
+		// holds up no other segment's creation.
+		spare = s.takeSpare(segmentName)
+	}
 	s.dirMu.Lock()
 	defer s.dirMu.Unlock()
 	created, err := s.mkdirAllRecorded(filepath.Dir(p))
 	if err != nil {
+		if spare != nil {
+			_ = spare.Close()
+		}
 		return nil, err
 	}
 	// Create and reopen are distinguished with O_EXCL rather than a prior Stat,
@@ -140,11 +174,31 @@ func (s *OSByteStore) openFor(segmentName string) (*openSegment, error) {
 	// *data* as soon as a segment is preallocated
 	// (docs/kdb-segment-preallocation-plan.md §3.1).
 	var logicalSize int64
-	f, err := fsx.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	var next string
+	var f *os.File
+	linked := false
+	if spare != nil {
+		// The segment was prepared ahead of need (spareSegment): give it its name. Linking
+		// fails if the name already exists, as the O_EXCL create below would, and that create
+		// then reports it and the reopen path handles it.
+		if lerr := linkUnnamedFile(spare, p); lerr == nil {
+			f, linked = spare, true
+		} else {
+			_ = spare.Close()
+		}
+	}
+	if prealloc > 0 {
+		if unnamedFilesSupported && !s.noSpares.Load() {
+			next, _ = nextDeltaSegmentName(segmentName)
+		}
+	}
+	if !linked {
+		f, err = fsx.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	}
 	switch {
 	case err == nil:
-		if n := s.preallocateFor(segmentName); n > 0 {
-			if perr := preallocateFile(f, n); perr != nil {
+		if prealloc > 0 && !linked {
+			if perr := preallocateFile(f, prealloc); perr != nil {
 				_ = f.Close()
 				return nil, perr
 			}
@@ -153,6 +207,7 @@ func (s *OSByteStore) openFor(segmentName string) (*openSegment, error) {
 		logicalSize = 0
 		created = append(created, filepath.Dir(p))
 	case os.IsExist(err):
+		next = ""
 		f, err = fsx.OpenFile(p, os.O_WRONLY, 0o644)
 		if err != nil {
 			return nil, err
@@ -189,10 +244,16 @@ func (s *OSByteStore) openFor(segmentName string) (*openSegment, error) {
 		_ = f.Close()
 		return existing, nil
 	}
-	seg = &openSegment{file: f, size: logicalSize}
+	seg = &openSegment{file: f, size: logicalSize, next: next, trickle: s.trickleBytes > 0 && isSSTableSegment(segmentName)}
 	s.handles[segmentName] = seg
 	s.mu.Unlock()
 	return seg, nil
+}
+
+// isSSTableSegment reports whether segmentName is an SSTable, finished or still being written
+// (ns/<id>/sstable/... or ns/<id>/sstable-partial/...).
+func isSSTableSegment(segmentName string) bool {
+	return strings.Contains(segmentName, "/sstable/") || strings.Contains(segmentName, "/sstable-partial/")
 }
 
 // mkdirAllRecorded is os.MkdirAll(dir), returning the directories whose entries it changed: the
@@ -279,7 +340,17 @@ func (s *OSByteStore) appendOnce(segmentName string, bytes []byte) (int64, error
 	if _, err := seg.file.WriteAt(bytes, offset); err != nil {
 		return 0, err
 	}
-	return atomic.AddInt64(&seg.size, int64(len(bytes))), nil
+	if seg.trickle && atomic.AddInt64(&seg.unsynced, int64(len(bytes))) >= s.trickleBytes {
+		// Before the size advances, so that a failed sync fails the append like a failed write:
+		// an error from fsync must reach the writer, since a later sync may no longer report it.
+		if err := syncFile(seg.file, s.syncMode); err != nil {
+			return 0, err
+		}
+		atomic.StoreInt64(&seg.unsynced, 0)
+	}
+	newSize := atomic.AddInt64(&seg.size, int64(len(bytes)))
+	s.maybePrepareSpare(seg, newSize)
+	return newSize, nil
 }
 
 // Size reports a segment's length without reading it: the logical size this process has
@@ -507,8 +578,12 @@ func (s *OSByteStore) Flush(segmentName string, fsync bool) error {
 	return s.syncPendingDirs()
 }
 
-// Close releases all cached file handles. Safe to call multiple times.
+// Close releases all cached file handles, and spare segments once any still being prepared is
+// finished. Safe to call multiple times.
 func (s *OSByteStore) Close() error {
+	for _, ready := range s.dropSpares("") {
+		<-ready
+	}
 	s.mu.Lock()
 	handles := s.handles
 	s.handles = make(map[string]*openSegment)
@@ -782,8 +857,10 @@ type HandleReleaser interface {
 	ReleaseHandles(prefix string) error
 }
 
-// ReleaseHandles implements HandleReleaser. A segment appended to again later is reopened.
+// ReleaseHandles implements HandleReleaser. A segment appended to again later is reopened. Spare
+// segments prepared under prefix are given up: whoever opens the namespace next starts its own.
 func (s *OSByteStore) ReleaseHandles(prefix string) error {
+	s.dropSpares(prefix)
 	s.mu.Lock()
 	var release []*openSegment
 	var releaseReaders []*os.File
