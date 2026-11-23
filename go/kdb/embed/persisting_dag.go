@@ -174,7 +174,7 @@ func (d *PersistingCommitDAG) PersistAsync(c document.Commit) (wait func() error
 	if d.log == nil {
 		return d.afterDurable(c, func() error { return nil }), nil
 	}
-	rec, err := deltaRecordFor(c)
+	rec, err := d.deltaRecordFor(c)
 	if err != nil {
 		return nil, err
 	}
@@ -211,10 +211,15 @@ func chainOnBarrier(wait func() error, barrier *TxnGroup, syncAck bool) func() e
 	}
 }
 
-func deltaRecordFor(c document.Commit) (storage.DeltaRecord, error) {
-	payload, err := c.ToPayloadBytes()
-	if err != nil {
-		return storage.DeltaRecord{}, err
+// deltaRecordFor is c's delta log record. Its payload is the one the delegate encoded to hash c
+// when it appended it, if c is that commit (W5: serialized once); otherwise c is encoded here.
+func (d *PersistingCommitDAG) deltaRecordFor(c document.Commit) (storage.DeltaRecord, error) {
+	payload, ok := d.delegate.TakeCommitPayload(c.Hash)
+	if !ok {
+		var err error
+		if payload, err = c.ToPayloadBytes(); err != nil {
+			return storage.DeltaRecord{}, err
+		}
 	}
 	return storage.DeltaRecord{
 		CommitHash:  c.Hash,
@@ -244,7 +249,7 @@ func (d *PersistingCommitDAG) persistPart(c document.Commit, g *TxnGroup) (wait 
 	if d.log == nil {
 		return func() error { return nil }, predecessor, nil
 	}
-	rec, err := deltaRecordFor(c)
+	rec, err := d.deltaRecordFor(c)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -1,6 +1,8 @@
 package document
 
 import (
+	"crypto/sha256"
+
 	"github.com/limidus/kdb/go/kdb/codec"
 )
 
@@ -142,6 +144,41 @@ func BuildCommitWithAttachments(
 	}
 	c.Hash = h
 	return c, nil
+}
+
+// BuildCommitWithPayload is BuildCommitWithAttachments that also returns the commit's canonical
+// payload - the bytes its hash is the SHA-256 of, and the bytes the delta log records - encoded
+// once for both. A caller that logs the commit hands these on instead of encoding it again
+// (Cassandra serializes a Mutation once and reuses the buffer). payload is nil for a commit the
+// direct codec does not write; the caller encodes that one itself, as before.
+func BuildCommitWithPayload(
+	parentHashes []codec.Hash,
+	namespaceID string,
+	transactionID codec.UUID,
+	timestamp codec.Timestamp,
+	authorNodeID codec.UUID,
+	operations []Op,
+	documentTreeHash codec.Hash,
+	schemaHash *codec.Hash,
+	message string,
+	attachmentTreeHash *codec.Hash,
+) (c Commit, payload []byte, err error) {
+	c = Commit{
+		ParentHashes: parentHashes, NamespaceID: namespaceID,
+		TransactionID: transactionID, Timestamp: timestamp, AuthorNodeID: authorNodeID,
+		Operations: operations, DocumentTreeHash: documentTreeHash, SchemaHash: schemaHash,
+		Message: message, AttachmentTreeHash: attachmentTreeHash,
+	}
+	if p, ok := encodeCommitDirect(&c); ok {
+		c.Hash = codec.Hash{Bytes: sha256.Sum256(p)}
+		return c, p, nil
+	}
+	h, err := ComputeCommitHash(c)
+	if err != nil {
+		return Commit{}, nil, err
+	}
+	c.Hash = h
+	return c, nil, nil
 }
 
 // FromPayloadBytes decodes a commit from canonical payload bytes.
