@@ -75,6 +75,11 @@ type InMemoryCommitDag struct {
 	_ [cacheLinePadBytes]byte
 
 	mu sync.RWMutex
+	// lastPayload is the canonical payload of the commit appendCommitLocked built last, kept for
+	// the caller that logs it (TakeCommitPayload) so the commit is encoded once, not twice.
+	// Guarded by payloadMu, not mu, so taking it never waits on readers.
+	payloadMu   sync.Mutex
+	lastPayload retainedPayload
 	// nodes holds every resident commit together with the small amount of
 	// graph metadata that is not part of the commit itself. It is a map of
 	// structs rather than a map of commits plus a parallel map of
@@ -1056,7 +1061,7 @@ func (d *InMemoryCommitDag) appendCommitLocked(
 		return document.Commit{}, err
 	}
 	d.putTreeLocked(newDocumentTree)
-	commit, err := document.BuildCommitWithAttachments(
+	commit, payload, err := document.BuildCommitWithPayload(
 		parents, d.NamespaceID, tx.ID, d.causalTimestampLocked(tx.Timestamp, parents), tx.AuthorNodeID,
 		tx.Operations, newDocumentTree.TreeHash, schemaHash, message, attachRoot,
 	)
@@ -1068,6 +1073,7 @@ func (d *InMemoryCommitDag) appendCommitLocked(
 	if err := d.putCommitLocked(commit, true, false); err != nil {
 		return document.Commit{}, err
 	}
+	d.retainPayload(commit.Hash, payload)
 	b, ok := d.branches[branchToAdvance]
 	if !ok {
 		return document.Commit{}, NewConsistencyError("branch missing", d.NamespaceID, &commit.Hash)
@@ -1080,6 +1086,40 @@ func (d *InMemoryCommitDag) appendCommitLocked(
 	// this core - AppendCommit, AppendCommitDetached and AppendMergeCommitOnto.
 	d.publishHeadLocked()
 	return commit, nil
+}
+
+// retainedPayload is a commit's canonical payload bytes, by commit hash.
+type retainedPayload struct {
+	hash  codec.Hash
+	bytes []byte
+}
+
+// maxRetainedPayload bounds what retainPayload keeps: a commit nobody logs (a memory-only
+// namespace) holds its payload until the next append, and that should never be a bulk import.
+const maxRetainedPayload = 1 << 20
+
+func (d *InMemoryCommitDag) retainPayload(h codec.Hash, payload []byte) {
+	if len(payload) > maxRetainedPayload {
+		payload = nil
+	}
+	d.payloadMu.Lock()
+	d.lastPayload = retainedPayload{hash: h, bytes: payload}
+	d.payloadMu.Unlock()
+}
+
+// TakeCommitPayload hands over the canonical payload bytes of the commit this DAG appended last,
+// if that commit's hash is h, and forgets them. The bytes are exactly what Commit.ToPayloadBytes
+// returns for it: they are what its hash was computed over. ok is false when h is not the last
+// appended commit (or its payload was not kept); the caller then encodes the commit itself.
+func (d *InMemoryCommitDag) TakeCommitPayload(h codec.Hash) (payload []byte, ok bool) {
+	d.payloadMu.Lock()
+	defer d.payloadMu.Unlock()
+	if d.lastPayload.bytes == nil || d.lastPayload.hash != h {
+		return nil, false
+	}
+	payload = d.lastPayload.bytes
+	d.lastPayload = retainedPayload{}
+	return payload, true
 }
 
 // causalTimestampLocked returns ts, raised if needed to one microsecond past the latest of
