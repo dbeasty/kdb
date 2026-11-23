@@ -33,6 +33,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"os"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -66,7 +67,7 @@ type store interface {
 func main() {
 	target := flag.String("target", "kdb", "kdb, kdb-embed or mongo")
 	embedDur := flag.String("embed-durability", "fast", "kdb-embed only: fast (async, 100 ms flush) or durable (sync)")
-	embedCache := flag.Int64("embed-cache", 0, "kdb-embed only: document cache budget in bytes; 0 = the service's sizing (an eighth of the container), -1 = the embedded runtime's own default (64 MiB)")
+	embedCache := flag.Int64("embed-cache", 0, "kdb-embed only: document cache budget in bytes; 0 = the service's sizing (an eighth of the container), -1 = the embedded runtime's own default (a sixteenth of the container, 64-256 MiB)")
 	addr := flag.String("addr", "127.0.0.1:9090", "kdb-service address (kdb) or mongodb:// URI (mongo)")
 	label := flag.String("label", "", "free-form label copied into every result line (e.g. image tag, durability)")
 	ns := flag.String("namespace", "bench/ycsb", "KDB namespace / Mongo database.collection")
@@ -132,6 +133,26 @@ func main() {
 			res.write(*jsonOut, *target, *label)
 		}
 	}
+	if *target == "kdb-embed" {
+		printProcessMemory()
+	}
+}
+
+// printProcessMemory reports this process's memory after the cells - for kdb-embed that is the
+// database's footprint, which docker stats is not around to read (the container exits with the
+// run). VmHWM is the peak resident set; the Go figures show how much of it is heap.
+func printProcessMemory() {
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	line := fmt.Sprintf("# memory heap_inuse=%dMiB heap_sys=%dMiB", ms.HeapInuse>>20, ms.HeapSys>>20)
+	if b, err := os.ReadFile("/proc/self/status"); err == nil {
+		for _, l := range strings.Split(string(b), "\n") {
+			if k, v, ok := strings.Cut(l, ":"); ok && (k == "VmRSS" || k == "VmHWM") {
+				line += " " + k + "=" + strings.Join(strings.Fields(v), "")
+			}
+		}
+	}
+	fmt.Println(line)
 }
 
 // cellSeed gives every cell its own random stream. Seeding by concurrency alone gave update@8 and
@@ -425,7 +446,7 @@ type embedStore struct {
 }
 
 // openEmbedded opens a file runtime in this process the way kdb-service opens one, with the
-// service's cache pool sizing (an eighth of the container) instead of the embedded 64 MiB default,
+// service's cache pool sizing (an eighth of the container) instead of the embedded default,
 // so the comparison with the wire target is about the network and not the cache.
 func openEmbedded(dir, ns, durability string, cacheBytes int64) (*embedStore, error) {
 	opts := embed.FileRuntimeOptionsFromEnv()
