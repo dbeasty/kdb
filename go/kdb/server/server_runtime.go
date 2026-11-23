@@ -719,6 +719,50 @@ func (s *KdbServerRuntime) Upsert(namespaceID string, docID codec.UUID, jsonBody
 	})
 }
 
+// Replace writes jsonBody as the whole of docID in namespaceID - whatever was stored before - at the
+// head the write lands on, and never conflicts (ConflictPolicyLastWrite, as Upsert). It is the
+// write Upsert installs once its merge is worked out, offered directly: the body is checked to be
+// a JSON object and its version hashed before the write gate (as Upsert's premerge does), so the
+// gate front only checks the schema and installs it. The commit records an ordinary write of the
+// body, exactly as an Upsert creating the document would.
+func (s *KdbServerRuntime) Replace(namespaceID string, docID codec.UUID, jsonBody string, principal auth.Principal) (document.Commit, error) {
+	if _, err := document.FromJSONWithID(docID, jsonBody); err != nil {
+		return document.Commit{}, err
+	}
+	if preparer, ok := s.Runtime.Storage.(storage.VersionPreparer); ok {
+		preparer.PrepareVersion(namespaceID, document.Document{ID: docID, JSON: jsonBody})
+	}
+	return s.writeAtHead([]document.Op{document.WriteOp{DocID: docID, Patch: jsonBody, Replace: true, Prevalidated: true}}, principal)
+}
+
+// Delete removes docID from namespaceID at the head the write lands on, and never conflicts.
+// Deleting a document that is not there commits a delete of nothing, as a transaction would.
+func (s *KdbServerRuntime) Delete(namespaceID string, docID codec.UUID, principal auth.Principal) (document.Commit, error) {
+	_ = namespaceID
+	return s.writeAtHead([]document.Op{document.DeleteOp{DocID: docID}}, principal)
+}
+
+// writeAtHead commits ops on whatever the head is at the front of the write gate, last write wins:
+// Upsert's path for writes that need no merge.
+func (s *KdbServerRuntime) writeAtHead(ops []document.Op, principal auth.Principal) (document.Commit, error) {
+	txID, err := codec.RandomUUID()
+	if err != nil {
+		return document.Commit{}, err
+	}
+	tx := s.authored(document.Transaction{ID: txID, Operations: ops, Timestamp: codec.TimestampNow()})
+	return s.clientWrite(tx, func() (document.Commit, error) {
+		return s.runTransaction(tx, principal, txOptions{atHead: true}, func() (transactionResult, error) {
+			live := tx
+			head, err := s.Runtime.DAG.Head()
+			if err != nil {
+				return nil, err
+			}
+			live.BaseVersion = head
+			return s.UpsertEngine.Commit(live, s.dag, s.Runtime.Storage, s.Schema(), nil, s.clientMessage(live))
+		})
+	})
+}
+
 // premergedUpsert is an Upsert's result worked out ahead of the write gate: the whole document it
 // would store, and the version of the document it was merged onto (absent for a new document).
 type premergedUpsert struct {

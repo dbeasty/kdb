@@ -5,6 +5,7 @@
 
 kdb/embed         # embedded runtime: open, put, commit, materialize
 kdb/driver        # database/sql driver over that runtime
+kdb/docdb         # concurrent document API (get/put/merge/delete) over the server runtime
 kdb/sql           # KDB-SQL parser, planner, executor
 kdb/query/hybrid  # hybrid query engine
 kdb/index         # index core
