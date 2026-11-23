@@ -2,7 +2,6 @@ package dag
 
 import (
 	"bytes"
-	"slices"
 	"sort"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -427,7 +426,9 @@ func (s *nodeStore) replace(c document.Commit) bool {
 // newSlot hands out an empty slot. A free slot is never one a segment write is reading: slots let
 // go of while frozen wait in frozenFreed.
 func (s *nodeStore) newSlot() uint32 {
-	if n := len(s.free); n > 0 {
+	// Not while frozen: a commit admitted during a flush must land above the freeze, where the
+	// flush's attach looks for what stays resident (attachFlushed).
+	if n := len(s.free); n > 0 && s.frozen == 0 {
 		i := s.free[n-1]
 		s.free = s.free[:n-1]
 		return i
@@ -672,20 +673,34 @@ func (s *nodeStore) forEachHorizonCandidate(stubbed func(codec.Hash) bool, fn fu
 	}
 }
 
-// residentForWrite notes the resident commits include accepts - unsorted - and freezes the
-// resident slots so the write can read their records in place. flags says what the record alone
-// cannot (entryHasOps, entryOwnsTx). Unless shadowed, a commit some segment still has a (hidden)
-// record for is left out - two segments must never share a commit - and waits for the merge that
-// drops that record; for a resident commit, having such a record is exactly being in hidden.
-func (s *nodeStore) residentForWrite(in *graphWriteInput, include func(codec.Hash, []byte) bool, flags func(codec.Hash, []byte) uint32, shadowed bool) {
+// beginResidentWrite freezes the resident slots for a write that reads their records in place,
+// and returns how many slots the freeze covers; snapshotSlots then notes, a batch at a time,
+// which of them the write takes.
+func (s *nodeStore) beginResidentWrite(in *graphWriteInput) uint32 {
+	in.chunks, in.per = s.freeze()
 	// Sized up front: appending would grow it 1.25x at a time and allocate five times its size.
 	in.resident = make([]residentEntry, 0, len(s.index))
-	for h, i := range s.index {
+	return s.frozen
+}
+
+// snapshotSlots notes the live commits in frozen slots [lo, hi): include's go to the write, with
+// flags saying what the record alone cannot (entryHasOps, entryOwnsTx); the rest are held back.
+// Unless shadowed, a commit some segment still has a (hidden) record for is held back too - two
+// segments must never share a commit - and waits for the merge that drops that record; for a
+// resident commit, having such a record is exactly being in hidden.
+//
+// The lock may be released between batches: a frozen record never changes, so a slot whose index
+// entry no longer names it was freed or copied since the freeze, and the copy - in a slot above
+// the freeze - stays resident for the next write. No commit admitted meanwhile is below it.
+func (s *nodeStore) snapshotSlots(in *graphWriteInput, lo, hi uint32, include func(codec.Hash, []byte) bool, flags func(codec.Hash, []byte) uint32, shadowed bool) {
+	for i := lo; i < hi; i++ {
 		r := s.at(i)
-		if !include(h, r) {
+		h := recHash(r)
+		if j, ok := s.index[h]; !ok || j != i {
 			continue
 		}
-		if _, hid := s.hidden[h]; hid && !shadowed {
+		if _, hid := s.hidden[h]; !include(h, r) || (hid && !shadowed) {
+			in.heldBack = append(in.heldBack, residentEntry{hash: h, slot: i})
 			continue
 		}
 		in.resident = append(in.resident, residentEntry{hash: h, slot: i, flags: flags(h, r)})
@@ -697,7 +712,11 @@ func (s *nodeStore) residentForWrite(in *graphWriteInput, include func(codec.Has
 			in.side[h] = residentSide{msg: msg, extra: extra, attach: attach}
 		}
 	}
-	in.chunks, in.per = s.freeze()
+}
+
+// residentForWrite is beginResidentWrite and every slot's snapshot, in one critical section.
+func (s *nodeStore) residentForWrite(in *graphWriteInput, include func(codec.Hash, []byte) bool, flags func(codec.Hash, []byte) uint32, shadowed bool) {
+	s.snapshotSlots(in, 0, s.beginResidentWrite(in), include, flags, shadowed)
 }
 
 // sortResident orders a write's resident entries by hash, as the format stores them. Run without
@@ -749,40 +768,90 @@ func (s *nodeStore) segmentsForWrite(in *graphWriteInput, inputs []*graphBase) {
 	}
 }
 
-// attachFlushed adds nb, written from exactly the resident entries (sorted, so entry i is record
-// i), as the newest segment: each flushed commit leaves the resident tier, keeping any generation
-// it gained meanwhile as an override; one deleted meanwhile becomes a hidden record. Ends the
-// freeze. O(flushed commits). Reports false, changing nothing, if nb is not what entries describe.
-func (s *nodeStore) attachFlushed(nb *graphBase, entries []residentEntry) bool {
+// attachFlushed adds nb, written from exactly in's resident entries (sorted, so entry i is record
+// i), as the newest segment, and ends the freeze. The flushed commits leave the resident tier; one
+// rewritten while the flush ran (a new generation, a re-put) keeps what changed as an override,
+// and one deleted meanwhile becomes a hidden record.
+//
+// O(what stays resident), not O(what was flushed): the resident tier is rebuilt from the commits
+// the flush held back and those admitted or rewritten since the freeze - all above it - instead of
+// the flushed ones being deleted one at a time under the DAG's write lock. Reports false, changing
+// nothing, if nb is not what the entries describe.
+func (s *nodeStore) attachFlushed(nb *graphBase, in *graphWriteInput) bool {
+	entries := in.resident
 	if nb.count != len(entries) || (nb.count > 0 && (nb.hashAt(0) != entries[0].hash || nb.hashAt(nb.count-1) != entries[nb.count-1].hash)) {
 		return false
 	}
-	s.unfreeze()
-	s.free = slices.Grow(s.free, len(entries)) // one allocation, not a 1.25x ladder
-	for pos := range entries {
-		h := entries[pos].hash
-		if i, ok := s.index[h]; ok {
-			if g := recGeneration(s.at(i)); g != nb.generation(pos) {
-				if s.genOverride == nil {
-					s.genOverride = make(map[codec.Hash]uint32)
-				}
-				s.genOverride[h] = g
+	flushed := func(h codec.Hash) (int, bool) {
+		i := sort.Search(len(entries), func(i int) bool { return bytes.Compare(entries[i].hash.Bytes[:], h.Bytes[:]) >= 0 })
+		return i, i < len(entries) && entries[i].hash == h
+	}
+	frozen := s.frozen
+	// Flushed commits whose frozen slot was let go of: deleted (hidden now), or rewritten into a
+	// slot above the freeze (found below). A frozen record keeps its bytes until the freeze ends.
+	for _, i := range s.frozenFreed {
+		h := recHash(s.at(i))
+		if pos, ok := flushed(h); ok && entries[pos].slot == i {
+			if _, still := s.index[h]; !still {
+				s.hide(nb, h)
 			}
-			s.freeSlot(h, i)
-			delete(s.messages, h)
-			delete(s.extra, h)
-			delete(s.attachRoots, h)
+		}
+	}
+	setOverride := func(h codec.Hash, g uint32) {
+		if s.genOverride == nil {
+			s.genOverride = make(map[codec.Hash]uint32)
+		}
+		s.genOverride[h] = g
+	}
+	old := *s
+	*s = nodeStore{
+		index: make(map[codec.Hash]uint32, len(in.heldBack)+int(old.used-frozen)), chunkSlots: old.chunkSlots,
+		namespaces: old.namespaces, ops: old.ops,
+		segs: append([]*graphBase{nb}, old.segs...), hidden: old.hidden, genOverride: old.genOverride,
+		segRecords: old.segRecords + nb.count, genEpoch: old.genEpoch, recent: old.recent, recentOK: old.recentOK,
+	}
+	keep := func(h codec.Hash, from uint32) {
+		j := s.newSlot()
+		copy(s.at(j), old.at(from))
+		s.index[h] = j
+		if m, ok := old.messages[h]; ok {
+			if s.messages == nil {
+				s.messages = make(map[codec.Hash]string)
+			}
+			s.messages[h] = m
+		}
+		if x, ok := old.extra[h]; ok {
+			if s.extra == nil {
+				s.extra = make(map[codec.Hash][]codec.Hash)
+			}
+			s.extra[h] = x
+		}
+		if a, ok := old.attachRoots[h]; ok {
+			if s.attachRoots == nil {
+				s.attachRoots = make(map[codec.Hash]codec.Hash)
+			}
+			s.attachRoots[h] = a
+		}
+	}
+	for _, e := range in.heldBack {
+		if i, ok := old.index[e.hash]; ok && i == e.slot {
+			keep(e.hash, i)
+		}
+	}
+	for i := frozen; i < old.used; i++ {
+		h := recHash(old.at(i))
+		if j, ok := old.index[h]; !ok || j != i {
+			continue // free
+		}
+		if pos, ok := flushed(h); ok {
+			// Rewritten while the flush ran: nb has the commit; keep its newer generation.
+			if g := recGeneration(old.at(i)); g != nb.generation(pos) {
+				setOverride(h, g)
+			}
 			continue
 		}
-		s.hide(nb, h) // deleted while the flush ran
+		keep(h, i)
 	}
-	s.segs = append([]*graphBase{nb}, s.segs...)
-	s.segRecords += nb.count
-	s.compactSlab()
-	s.index = shrunk(s.index)
-	s.messages = shrunk(s.messages)
-	s.extra = shrunk(s.extra)
-	s.attachRoots = shrunk(s.attachRoots)
 	return true
 }
 

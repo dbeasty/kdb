@@ -358,9 +358,16 @@ func (d *InMemoryCommitDag) graphIncludeLocked() (func(codec.Hash, []byte) bool,
 	return include, flags
 }
 
+// graphSnapshotBatch is how many resident slots a flush notes per hold of the DAG's lock: a
+// flush of 50,000 commits taken in one hold stalled every writer for ~8 ms.
+const graphSnapshotBatch = 1024
+
 // flushResident writes the resident tier as a new segment when it holds at least
 // graph.rebuildCommits commits (or force), streaming the records from where they are. The first
 // segment a namespace writes is marked full: it is the whole graph.
+//
+// The DAG's write lock is held only in short pieces: the freeze, one batch of slots at a time, and
+// an attach proportional to what stays resident. Writers run in between.
 func (d *InMemoryCommitDag) flushResident(force bool) (bool, error) {
 	d.graphFlushMu.Lock()
 	defer d.graphFlushMu.Unlock()
@@ -371,20 +378,12 @@ func (d *InMemoryCommitDag) flushResident(force bool) (bool, error) {
 		return false, nil
 	}
 	full := len(d.nodes.segs) == 0
-	// Generations go into the segment, so they must be sound before the records are read.
+	// Generations go into the segment, so they must be sound before the records are read. One
+	// recomputed after this rewrites its record into a fresh slot, which the next flush takes.
 	d.ensureGenerationsLocked()
 	include, flags := d.graphIncludeLocked()
 	in := &graphWriteInput{stop: &d.graphStop}
-	d.nodes.residentForWrite(in, include, flags, false)
-	// What stays resident however often this runs (provisional, unlogged, shadowed): the next
-	// size-triggered flush counts its threshold from there.
-	heldBack := d.nodes.residentLen() - len(in.resident)
-	if len(in.resident) == 0 {
-		d.nodes.unfreeze()
-		d.graphFlushFloor = heldBack
-		d.mu.Unlock()
-		return false, nil // everything resident is held back; nothing to flush
-	}
+	limit := d.nodes.beginResidentWrite(in)
 	dir, seq := d.graphDir, d.graphNextSeq
 	d.graphNextSeq++
 	d.mu.Unlock()
@@ -394,6 +393,21 @@ func (d *InMemoryCommitDag) flushResident(force bool) (bool, error) {
 		d.nodes.unfreeze()
 		d.mu.Unlock()
 		return false, err
+	}
+	for lo := uint32(0); lo < limit; lo += graphSnapshotBatch {
+		d.mu.Lock()
+		d.nodes.snapshotSlots(in, lo, min(lo+graphSnapshotBatch, limit), include, flags, false)
+		d.mu.Unlock()
+		if d.graphStop.Load() {
+			return abort(errGraphWriteStopped)
+		}
+	}
+	if len(in.resident) == 0 {
+		d.mu.Lock()
+		d.nodes.unfreeze()
+		d.graphFlushFloor = len(in.heldBack)
+		d.mu.Unlock()
+		return false, nil // everything resident is held back; nothing to flush
 	}
 	in.sortResident()
 	tmp, written, err := writeGraphSegment(dir, d.NamespaceID, seq, full, in)
@@ -415,37 +429,45 @@ func (d *InMemoryCommitDag) flushResident(force bool) (bool, error) {
 		return abort(err)
 	}
 	d.mu.Lock()
-	if !d.attachFlushedLocked(nb, in.resident) {
+	fast := d.nodes.attachFlushed(nb, in)
+	if !fast {
 		d.nodes.unfreeze()
 		d.attachLocked(nb, nil)
 	}
-	d.graphFlushFloor = heldBack
+	// What stays resident however often this runs (provisional, unlogged, shadowed): the next
+	// size-triggered flush counts its threshold from there.
+	d.graphFlushFloor = len(in.heldBack)
 	d.mu.Unlock()
+	if fast {
+		d.dropFlushedIndexEntries(nb, in.resident)
+	}
 	return true, nil
 }
 
-// attachFlushedLocked attaches a flush's segment and drops exactly the flushed commits'
-// transaction-index and eviction-set entries - which the segment now answers - instead of
-// probing every segment for every entry. Must hold mu exclusively.
-func (d *InMemoryCommitDag) attachFlushedLocked(nb *graphBase, entries []residentEntry) bool {
-	if !d.nodes.attachFlushed(nb, entries) {
-		return false
-	}
-	for pos := range entries {
-		h := entries[pos].hash
-		if d.nodes.isResident(h) {
-			continue
-		}
-		if entries[pos].flags&entryOwnsTx != 0 {
-			if tx := nb.tx(pos); d.txIndex[tx] == h {
-				delete(d.txIndex, tx)
+// dropFlushedIndexEntries removes the flushed commits' transaction-index and eviction-set entries,
+// which the segment now answers, a batch per hold of the lock. Until then they give the same
+// answers the segment would: the commit each names is in the DAG, in nb.
+func (d *InMemoryCommitDag) dropFlushedIndexEntries(nb *graphBase, entries []residentEntry) {
+	for lo := 0; lo < len(entries); lo += graphSnapshotBatch {
+		d.mu.Lock()
+		for pos := lo; pos < min(lo+graphSnapshotBatch, len(entries)); pos++ {
+			h := entries[pos].hash
+			if d.nodes.isResident(h) {
+				continue
 			}
+			if entries[pos].flags&entryOwnsTx != 0 {
+				if tx := nb.tx(pos); d.txIndex[tx] == h {
+					delete(d.txIndex, tx)
+				}
+			}
+			delete(d.opsEvicted, h)
 		}
-		delete(d.opsEvicted, h)
+		d.mu.Unlock()
 	}
-	d.txIndex = shrunk(d.txIndex)
+	d.mu.Lock()
+	d.txIndex = shrunk(d.txIndex) // see nodeStore.attach
 	d.opsEvicted = shrunk(d.opsEvicted)
-	return true
+	d.mu.Unlock()
 }
 
 // pickMergeLocked is the next merge the policy calls for, oldest first, or nil. Must hold mu.

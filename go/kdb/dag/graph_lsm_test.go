@@ -687,3 +687,43 @@ func TestGraphResidentTierConvergesUnderBurst(t *testing.T) {
 		t.Fatalf("resident tier holds %d commits once idle, want < %d (%+v)", st.ResidentCommits, threshold, st)
 	}
 }
+
+// How long a flush of a full tier keeps writers waiting for the DAG's lock - measured, not pinned
+// (it is wall time). Before the snapshot was taken in batches and the attach rebuilt only what
+// stays resident, a 50,000-commit flush held the lock ~8 ms and then ~14 ms.
+func TestGraphFlushWriterStall(t *testing.T) {
+	if testing.Short() {
+		t.Skip("timing")
+	}
+	d, _ := lsmDag(t, 1<<30, 0)
+	head, _ := d.Head()
+	head, _ = chain(t, d, head, 50_000, 1)
+	if _, err := d.flushResident(true); err != nil {
+		t.Fatal(err)
+	}
+	chain(t, d, head, 50_000, 2)
+	stop := make(chan struct{})
+	worst := make(chan time.Duration)
+	go func() {
+		var w time.Duration
+		for {
+			select {
+			case <-stop:
+				worst <- w
+				return
+			default:
+			}
+			s := time.Now()
+			d.mu.Lock()
+			d.mu.Unlock()
+			w = max(w, time.Since(s))
+		}
+	}()
+	s := time.Now()
+	if did, err := d.flushResident(true); err != nil || !did {
+		t.Fatalf("flush: %v %v", did, err)
+	}
+	took := time.Since(s)
+	close(stop)
+	t.Logf("flush of 50,000 commits took %v; the longest a writer waited for the lock: %v", took, <-worst)
+}

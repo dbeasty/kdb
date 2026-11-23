@@ -46,6 +46,7 @@ type residentSide struct {
 // graphWriteInput is everything a write reads, captured under the DAG's lock and read without it.
 type graphWriteInput struct {
 	resident []residentEntry // sorted by hash; the slots are frozen until the write ends
+	heldBack []residentEntry // live frozen slots the write does not take (no flags)
 	side     map[codec.Hash]residentSide
 	chunks   [][]byte // the resident tier's chunks as they stood; frozen slots never change in them
 	per      uint32   // records per full chunk
