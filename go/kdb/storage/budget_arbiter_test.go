@@ -257,10 +257,10 @@ func TestArbiterNeverOverCommitsThePool(t *testing.T) {
 		}
 	}
 
-	// Worth seeing rather than only asserting: with the default 64 MiB pool, nine floors claim
-	// 36 MiB of it and only 28 MiB is left to arbitrate. That is why DefaultHostMemoryBudgetBytes
-	// says a multi-namespace deployment should name a real total rather than inherit a default
-	// sized for one namespace.
+	// Worth seeing rather than only asserting: with a 64 MiB pool (the embedded default's floor),
+	// nine floors claim 36 MiB of it and only 28 MiB is left to arbitrate. That is why a
+	// multi-namespace deployment on a small host should name a real total rather than inherit the
+	// default.
 	t.Logf("hot=%d floor-bound idle=%d static-ninth=%d floors=%d of pool=%d",
 		hot, storage.DefaultNamespaceFloorBytes, staticNinth,
 		9*storage.DefaultNamespaceFloorBytes, int64(pool))

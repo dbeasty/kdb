@@ -98,7 +98,9 @@ func (h *Host) openNamespace(
 	if opts.Storage.Compression != nil {
 		compression = *opts.Storage.Compression
 	}
-	memoryBudget := int64(64 * 1024 * 1024)
+	// NamespaceWithOptions always arrives with a budget: the caller's fixed one, or the opening
+	// share of the host's pool. The floor only covers a caller reaching here without either.
+	memoryBudget := MinDefaultMemoryBudgetBytes
 	if opts.Storage.MemoryBudgetBytes > 0 {
 		memoryBudget = opts.Storage.MemoryBudgetBytes
 	}

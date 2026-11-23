@@ -459,7 +459,7 @@ Rules of thumb implied by the structures above:
 | document tree node cost | one node per distinct nibble path; unchanged subtrees are shared |
 | delta segment size | grows until the process restarts (a new segment starts per open) |
 | WAL segment size | rotates at `walMaxSegmentBytes`, default 64 MiB |
-| block cache | 25 % of `GlobalMemoryBudgetBytes` (64 MiB default for file runtimes → 16 MiB cache) |
+| block cache | 25 % of `GlobalMemoryBudgetBytes` (file runtimes default to a share of ¹⁄₁₆ of the process's memory, 64-256 MiB, pooled across the process) |
 | per connection | 4 frames × ≤ 16 MiB worst case + one goroutine stack |
 
 -----

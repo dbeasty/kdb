@@ -93,6 +93,15 @@ func (a *BudgetArbiter) TotalBytes() int64 {
 	return a.total
 }
 
+// Participants is how many namespaces are registered. A host about to open one more sizes the
+// open from it - roughly the share Register is about to hand out - when the pool is shared with
+// namespaces the host itself does not know about.
+func (a *BudgetArbiter) Participants() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.parts)
+}
+
 // SetFloorBytes overrides the per-namespace floor. For tests and for a host whose pool is small
 // enough that the default floor would not fit the namespaces it expects.
 func (a *BudgetArbiter) SetFloorBytes(b int64) {

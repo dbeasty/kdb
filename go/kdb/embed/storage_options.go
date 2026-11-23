@@ -70,11 +70,15 @@ type FileRuntimeOptions struct {
 // struct also holds wiring (the IO shim) that OpenFileRuntime owns and callers
 // must not set.
 type StorageOptions struct {
-	// MemoryBudgetBytes caps the hot tier this runtime may hold in memory.
-	// Zero keeps the historical default of 64 MiB — fine for one runtime,
-	// but an application that opens several runtimes in one process is
-	// multiplying that default by each open, and needs to hand each runtime
-	// its slice of the real limit instead.
+	// MemoryBudgetBytes caps the hot tier this runtime may hold in memory; on
+	// a Host, it is the pool the host's namespaces divide. A positive value is
+	// taken as given and belongs to this runtime or host alone.
+	//
+	// Zero draws from the process's default pool: DefaultMemoryBudgetBytes, a
+	// sixteenth of the memory the process may use, between 64 MiB and
+	// 256 MiB, divided among every default-sized store open in the process
+	// rather than taken by each. Set it to bound KDB to a figure the
+	// application chose, or to give a store a cache of its own.
 	MemoryBudgetBytes int64
 
 	// Durability decides how much of the write-out a commit waits for. Zero

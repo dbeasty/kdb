@@ -3,7 +3,9 @@ package embed
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/schema"
@@ -42,6 +44,11 @@ type Host struct {
 	io       storage.PlatformIOShim
 
 	arbiter *storage.BudgetArbiter
+	// sharedPool says arbiter is the process-wide default pool (see sharedPool), which this host
+	// was lent rather than owns: it registers its namespaces there under budgetKeyPrefix, which
+	// keeps them apart from every other store's, and releases rather than closes it.
+	sharedPool      bool
+	budgetKeyPrefix string
 	// adapter presents every open namespace under this host as one storage.Adapter, kept in step
 	// with nss as namespaces open and close.
 	adapter *engine.MultiplexAdapter
@@ -104,16 +111,9 @@ type namespaceEntry struct {
 	schema  schema.KdbSchema
 }
 
-// DefaultHostMemoryBudgetBytes is the pool a host divides across its namespaces when the caller
-// names no total. Exactly the per-runtime default the single-namespace open path has always
-// used, so a host with one namespace under it is proportioned byte for byte the way that
-// namespace would have been on its own.
-//
-// It does mean a host with nine namespaces divides the same 64 MiB nine ways rather than handing
-// out 64 MiB nine times. That is the point - see docs/kdb-spec-layer17-multi-namespace-runtime.md
-// §1.1 - but it also means a multi-namespace deployment should set a real total rather than
-// inherit a default sized for one namespace.
-const DefaultHostMemoryBudgetBytes int64 = 64 << 20
+// hostSeq numbers hosts within the process, so two hosts over one data root (several read-only
+// attaches may coexist) still register distinct keys in the shared pool.
+var hostSeq atomic.Uint64
 
 // namespaceBudget is one namespace's side of the host's memory pool: the storage engine holds
 // document versions, historical trees and the memtable, and the commit DAG holds operations, so
@@ -218,20 +218,43 @@ func OpenFileHost(dataRoot string, opts FileRuntimeOptions) (*Host, error) {
 		return nil, fmt.Errorf("kdb: opening the cross-namespace transaction log: %w", err)
 	}
 
-	pool := opts.Storage.MemoryBudgetBytes
-	if pool <= 0 {
-		pool = DefaultHostMemoryBudgetBytes
-	}
-	return &Host{
+	h := &Host{
 		txn:      txn,
 		dataRoot: dataRoot,
 		opts:     opts,
 		lock:     lock,
 		io:       io,
-		arbiter:  storage.NewBudgetArbiter(pool, storage.DefaultBudgetRebalanceInterval),
 		adapter:  engine.NewMultiplexAdapter(),
 		nss:      make(map[string]*namespaceEntry),
-	}, nil
+	}
+	// An explicit total is this host's own pool, exactly as before. No total means the process's
+	// default pool, which every other default-sized store divides too (DefaultMemoryBudgetBytes).
+	// Acquired last, so no error path above has to give it back.
+	if pool := opts.Storage.MemoryBudgetBytes; pool > 0 {
+		h.arbiter = storage.NewBudgetArbiter(pool, storage.DefaultBudgetRebalanceInterval)
+	} else {
+		h.arbiter = sharedPool.acquire()
+		h.sharedPool = true
+		h.budgetKeyPrefix = fmt.Sprintf("%s\x00%d\x00", dataRoot, hostSeq.Add(1))
+	}
+	return h, nil
+}
+
+// MemoryKey is the name namespaceID is registered under in MemoryArbiter. The namespace id
+// itself for a host with its own pool; prefixed with this host's identity in the process-wide
+// pool, where other stores' namespaces may share the id.
+func (h *Host) MemoryKey(namespaceID string) string { return h.budgetKeyPrefix + namespaceID }
+
+// MemoryShares is the budget most recently applied to each of this host's namespaces, keyed by
+// namespace id - this host's slice of MemoryArbiter().Shares(). For metrics and tests.
+func (h *Host) MemoryShares() map[string]int64 {
+	out := make(map[string]int64)
+	for key, share := range h.arbiter.Shares() {
+		if ns, ok := strings.CutPrefix(key, h.budgetKeyPrefix); ok {
+			out[ns] = share
+		}
+	}
+	return out
 }
 
 // Adapter presents every namespace open under this host as a single storage.Adapter, dispatching
@@ -249,7 +272,9 @@ func (h *Host) Transactions() *TxnCoordinator { return h.txn }
 
 // MemoryArbiter is the pool this host divides across its namespaces. Exposed so a caller can
 // change the floor, pin one namespace's share with Reserve, or read the current allocation for
-// metrics.
+// metrics. Participants are named by MemoryKey. For a host opened without
+// StorageOptions.MemoryBudgetBytes this is the process-wide default pool, shared with every other
+// default-sized store: its total and floor are the process's, not this host's.
 func (h *Host) MemoryArbiter() *storage.BudgetArbiter { return h.arbiter }
 
 // DataRoot is the directory this host holds the lock on.
@@ -304,7 +329,12 @@ func (h *Host) NamespaceWithOptions(catalog, namespaceID string, sch schema.KdbS
 	// the transient spike the pool exists to prevent. The arbiter refines this a moment later.
 	fixed := sopts.MemoryBudgetBytes > 0
 	if !fixed {
-		opts.Storage.MemoryBudgetBytes = h.arbiter.TotalBytes() / int64(len(h.nss)+1)
+		sharing := len(h.nss)
+		if h.sharedPool {
+			// The process pool is also divided among other stores' namespaces.
+			sharing = h.arbiter.Participants()
+		}
+		opts.Storage.MemoryBudgetBytes = h.arbiter.TotalBytes() / int64(sharing+1)
 	}
 	h.mu.Unlock()
 
@@ -343,9 +373,9 @@ func (h *Host) NamespaceWithOptions(catalog, namespaceID string, sch schema.KdbS
 		if fixed {
 			// An explicit per-namespace budget opts out of the pool: carved off the top and left
 			// alone, so a caller who has decided what one namespace needs keeps that decision.
-			h.arbiter.Reserve(namespaceID, sopts.MemoryBudgetBytes)
+			h.arbiter.Reserve(h.MemoryKey(namespaceID), sopts.MemoryBudgetBytes)
 		}
-		h.arbiter.Register(namespaceID, budget)
+		h.arbiter.Register(h.MemoryKey(namespaceID), budget)
 	}
 	return entry.rt, nil
 }
@@ -384,7 +414,7 @@ func (h *Host) CloseNamespace(namespaceID string) error {
 	entry.rt.runCloseHooks()
 	// Before the storage close, so the namespaces that are staying get the room back at the
 	// moment it stops being used rather than at the next tick.
-	h.arbiter.Unregister(namespaceID)
+	h.arbiter.Unregister(h.MemoryKey(namespaceID))
 	err := entry.close()
 	// The host's byte store is shared by every namespace and keeps a handle per segment written:
 	// without this, each namespace ever opened would hold its file descriptors and memory until
@@ -438,8 +468,18 @@ func (h *Host) Close() error {
 	h.mu.Unlock()
 
 	// Stop rebalancing before anything is torn down, so no tick lands on a namespace that is
-	// mid-close. Namespaces keep whatever ceiling they last had; see BudgetArbiter.Close.
-	h.arbiter.Close()
+	// mid-close. Namespaces keep whatever ceiling they last had; see BudgetArbiter.Close. The
+	// process pool keeps serving other stores, so this host's namespaces leave it instead - which
+	// also hands their room back to those stores now rather than at the next tick - and the host
+	// gives up its hold, the last one closing the pool.
+	if h.sharedPool {
+		for _, id := range ids {
+			h.arbiter.Unregister(h.MemoryKey(id))
+		}
+		sharedPool.release(h.arbiter)
+	} else {
+		h.arbiter.Close()
+	}
 
 	var firstErr error
 	for _, id := range ids {

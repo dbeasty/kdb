@@ -556,6 +556,35 @@ view). To serve several namespaces from one process, open an `embed.Host` once
 (`embed.OpenFileHost(dataRoot, opts)`) and call `host.Namespace(catalog, id, schema)`; it shares the
 directory lock, the I/O shim and the memory budget. `OpenFileRuntime` is that, with one namespace.
 
+#### Embedded memory
+
+An embedded store's cache (document versions, SSTable blocks, delta frames, memtables) is bounded by
+`StorageOptions.MemoryBudgetBytes`.
+
+- **Unset (the default):** the store draws from one pool per process, `embed.DefaultMemoryBudgetBytes()`:
+  a sixteenth of the memory the process may use (the cgroup limit, else physical RAM), at least 64 MiB
+  and at most 256 MiB. Every default-sized store in the process divides that one pool - runtimes,
+  hosts and `database/sql` connections alike - so opening a second store does not double the
+  ceiling. The pool is sized when the first such store opens and goes away when the last one closes.
+  On Android and iOS it stays at 64 MiB.
+- **Set:** the figure belongs to that runtime (or, on a `Host`, to that host's namespaces) alone, and
+  stays out of the process pool.
+
+kdb-service sizes its pool at twice that fraction (an eighth, up to 4 GiB; `--cache-mb`), because it
+owns its container; an embedded store shares its process with your application. The shape is
+Cassandra's for caches nobody sized: a fraction of what the process has, with a cap (`key_cache_size`
+defaults to min(5% of heap, 100 MB), `file_cache_size` to min(¼ of heap, 512 MB)). With 100k 1 KB
+documents the old fixed 64 MiB served point reads several times slower than a cache that holds the hot
+set (docs/kdb-basic-rw-performance-plan.md, E2). Give a store more with:
+
+```go
+opts := embed.FileRuntimeOptionsFromEnv()
+opts.Storage.MemoryBudgetBytes = 512 << 20 // this store's own 512 MiB, outside the shared pool
+rt, err := embed.OpenFileRuntimeWithOptions(dir, catalog, ns, schema.None(), opts)
+```
+
+`host.MemoryShares()` reports what each of a host's namespaces currently holds.
+
 ### 7.1 The runtime: documents, history, branches
 
 ````go
