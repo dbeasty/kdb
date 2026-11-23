@@ -12,7 +12,10 @@ MongoDB; durable writes 0.80-1.13x MongoDB `j:true` (v0.9.4: 0.43-0.69x) with wo
 lower than before D2 and below MongoDB's; concurrent writes under fast durability still
 0.36-0.47x, bound by the per-namespace commit rate (~20-24k/s), which only W8 (several writes per
 commit) gets past. M1 found what holds KDB's memory - the commit graph's
-resident tier, unbounded between maintenance passes - and proposes a fix that needs a design.
+resident tier, unbounded between maintenance passes - and is now fixed (branch
+`perf/rw-m1-graph-memory`, [M1 - measured](#m1---measured)): the commit graph flushes by size and
+merges size-tiered, the container at this workload drops from 1.29 GB to 0.86 GB (MongoDB 7:
+0.6-0.7 GB), write throughput unchanged.
 **Waiting on the user:** W8 (design below, with the decisions it needs) and E2 (trade-off below).
 
 ## Goal and constraints
@@ -485,6 +488,137 @@ older Go readers open everything a newer one leaves after a clean close, and aft
 does not read graph segments at all - a checkpoint with graph references already makes it
 replay - so nothing changes for it.
 
+### M1 - implemented (branch `perf/rw-m1-graph-memory`)
+
+As designed, plus what building it turned up:
+
+- **The flush floor.** The threshold counts from what the last flush could not take (commits held
+  back as provisional or unlogged), not from what was resident when it finished - counting the
+  commits that arrived during the flush stopped the flusher after the first round, and the first
+  test run showed a 500-commit threshold holding 17,678.
+- **Sizing, not copying.** The first streaming flush still allocated 597 B per flushed commit: the
+  entry list grown by `append` (Go grows large slices 1.25x at a time, so the allocations sum to
+  ~5x the final size), the same for the transaction list, and a 1 MiB write buffer. Sized up front
+  and with a 256 KiB buffer it is ~100 B per commit (`TestGraphFlushDoesNotCopyTheResidentTier`
+  pins < 120; a copy of the tier is > 256).
+- **`attachRoot` allocated on every call**, found or not (the variable escaped from inside the
+  `if`): a pre-existing cost on every resident commit read, now only on a hit.
+- **Syncs.** Segments were synced once at the end with `os.File.Sync`, which on macOS is
+  `F_FULLFSYNC` - contrary to the format comment, harmless every 5 minutes, not every few seconds.
+  Now a plain `fsync` on macOS, and on Linux a sync every megabyte as the segment is written
+  (Cassandra's `trickle_fsync`, as D2 does for SSTables), so a flush never queues a whole segment
+  ahead of the commit log's `fdatasync`.
+- **Background writers stop before the close checkpoint** (`StopGraphWork`), so a merge never
+  finishes after the last checkpoint and leaves its output pending for a checkpoint that never
+  comes; a write in flight gives up and leaves everything where it was.
+
+Tests (`go/kdb/dag/graph_lsm_test.go`): the bounded tier (resident never above threshold + one
+batch, < threshold once idle, ~2.8 records written per commit at 20k commits), convergence when
+appends outrun every flush, the flush's allocation, copy-on-write under concurrent re-puts and
+generation rewrites, a random sequence of flushes/merges/major compactions/deletions checked
+against the reader-visible view and the on-disk disjointness invariant after every step,
+size-tiered bucketing, a merge waiting for the checkpoint, the three crash windows reopened
+(old checkpoint, new checkpoint before the rename, replay), capture-time pinning, stopping at
+close, and the bloom filter. `TestGraphResidentTierLongRun` (not `-short`) runs a million commits
+or more (`KDB_GRAPH_LONGRUN`) with the heap sampled.
+
+- **The flush's lock holds.** The first A/B (below) showed throughput unchanged but write p99.9 at
+  32 workers doubled and max tripled: a 50,000-commit flush held the DAG's write lock ~8 ms to note
+  what it takes and ~14 ms to attach the segment. Now the snapshot walks the frozen slots 1,024 at
+  a time, releasing the lock between batches (a frozen record never changes, so a slot whose index
+  entry no longer names it was freed or copied above the freeze), and the attach rebuilds the
+  resident tier from what stays - held-back commits and those admitted since the freeze, all above
+  it (the free list is not reused while frozen, so nothing lands below) - instead of deleting every
+  flushed commit; the flushed commits' transaction-index entries go afterwards, a batch per lock
+  hold. The longest a writer waits for the lock during a 50,000-commit flush: ~14 ms -> 1.2 ms
+  (`TestGraphFlushWriterStall`). The 1.2 ms was the flusher winning the lock straight back
+  between batches (`sync.Mutex` favours the running goroutine until a waiter has waited 1 ms), so
+  a commit waited up to a millisecond at each of its lock acquisitions for the ~15 ms a snapshot
+  took. Sleeping between batches as long as the last one held the lock: 0.25 ms. A GOGC=150 run
+  ruled out the other suspect - more frequent GC (204 cycles over the matrix against 150, the
+  333 MiB of pointer-free records having been ballast) - its tails were no better.
+- **Merges are throttled to 64 MiB/s** - Cassandra's `compaction_throughput` default, for the same
+  reason. Every A/B showed insert max latencies of 30-90 ms against base's 15-20: the insert
+  cells run last, where the run's biggest size-tiered merge lands (four 200k-record segments into
+  one, ~93 MB, nearly a second of a core in one burst on a 4-CPU container). 64 MiB/s is ~8x what
+  merging needs on average at 25k commits/s (2.7 records of ~116 B a commit); flushes, which bound
+  memory, and an operator's `CompactGraphFile` are not throttled.
+- **Two latent defects, found by the server's deepen tests under `KDB_GRAPH_REBUILD_COMMITS=3`**
+  (base passes them only because it never flushed in time; a maintenance flush between a
+  snapshot bootstrap and a deepen hits both in production):
+  - Generation recompute covered only the resident tier, on the premise that nothing arrives
+    below a segment commit. A deepen does exactly that: the history under a snapshot root that
+    was already flushed kept the root's stale generation, and pruned `IsAncestor` answered false.
+    Segments now keep the set of parents they name outside themselves (their EXT sections);
+    storing one of those, or `Unshallow` / `InvalidateGenerations`, makes the next recompute
+    include the segments - O(history), on those rare paths only - writing overrides.
+  - A checkpoint naming segments left unlogged commits out of its resident list only. One
+    flushed between `MarkLogged` and a failed log write's `MarkUnlogged` came back on the next
+    open with no operations to read. Such commits now go in the checkpoint's hidden list (the
+    existing `GraphHidden`; no format change).
+
+### M1 - measured
+
+Base: `perf/rw-docs-results` (305dbb9a, now on main as #353). rwcompare matrix at 100k documents,
+`ab.sh`, two alternating passes per binary, the frozen base worktree's harness; this Mac's load
+was 8-13 throughout (another project's `llama-server` held 3-4 cores), the same for both binaries.
+
+**Memory, after the full matrix sequence** (`mem.sh`-style: load + read/update/mixed50/insert at
+1/8/32, ~820k commits, fast durability; peaks sampled every 2 s during the run):
+
+| | base | M1 |
+|---|--:|--:|
+| `docker stats` at the end | 1,289 MiB | 861-864 MiB |
+| cgroup anon (Go heap + runtime) | 1,264 MiB | 807 MiB |
+| Go heap in use (`kdb_go_heap_alloc_bytes`) | 1,085 MiB | 698 MiB |
+| VmHWM (peak RSS) | 1,365 MiB | 1,129 MiB |
+| commit graph, at the end | 333 MiB | 21 MiB |
+| commit graph, peak during the run | 333 MiB | 21 MiB |
+| GC cycles over the run | 150 | 204 |
+
+The container drops ~425 MiB, more than the 300 the M1 measurement predicted: the tier's index
+and transaction-index entries went with it. Every other structure is the same size or smaller
+(the live tree 75 -> 65 MiB).
+KDB at this workload now sits at ~0.86 GB against MongoDB 7's 0.6-0.7 GB.
+
+**Throughput, final binary** (ops/s means; per-pass values in parentheses; reads are the control):
+
+| cell | c | fast m1/base | durable m1/base |
+|---|--:|--:|--:|
+| read | 1 / 8 / 32 | 1.09 / 1.03 / 0.98 | 0.96 / 1.00 / 1.01 |
+| update | 1 / 8 / 32 | 1.01 / 1.02 / 1.00 | 0.96 / 0.93 / 0.98 |
+| mixed50 | 1 / 8 / 32 | 1.01 / 0.99 / 0.98 | 0.94 / 0.96 / 0.99 |
+| insert | 1 / 8 / 32 | 0.93 / 0.97 / 0.97 | 1.01 / 1.03 / 0.99 |
+| load | 32 | 1.08 | 1.02 |
+
+Write cells' geometric mean: 0.986 (fast) and 0.976 (durable) in this A/B, 0.982 and 0.990 in the
+first (the binary before the lock-hold fix); reads' 1.032 and 0.990, then 0.960 and 0.969. No cell
+moved the same way by more than 5% in both A/Bs except insert@1 fast (0.94, 0.93), whose base
+passes themselves spread 8%. Write throughput: unchanged.
+
+**Tails at 32 workers** (write p99.9 / max, ms, the two passes):
+
+| cell | base | M1 before the lock fix | M1 |
+|---|---|---|---|
+| update fast | 9.1/23, 8.7/19 (first A/B: 8.0/13, 7.9/13) | 16.8/36, 14.8/41 | 12.9/31, 14.3/29 |
+| mixed50 fast | 10.5/36, 9.1/44 | 16.9/51, 22.7/80 | 16.7/41, 17.7/42 |
+| update durable | 8.5/15, 7.6/22 | 16.7/36, 14.7/39 | 12.3/20, 13.0/31 |
+
+p99 is unchanged (4-5 ms either way); p99.9 is still ~1.5x base after the lock fix.
+What it was not: GC. M1 runs 36% more GC cycles over the matrix (204 against 150) - the 333 MiB
+of pointer-free records it removed were ballast that raised GOGC's trigger - but M1 with
+`GOGC=150`, which brings the cadence back, had no better tails (c=32 only, two passes, load 5-7:
+update p99.9 13.5/13.1 ms against M1's 11.1/10.2 and base's 8.0/8.9). What was left is the flush's
+batched snapshot letting the flusher win the lock back between batches; see the yield above, and
+the final A/B below.
+
+**Long run** (`KDB_GRAPH_LONGRUN=2000000 go test ./kdb/dag -run TestGraphResidentTierLongRun`,
+the default 50,000-commit threshold, heap sampled every 20 ms): 2,000,000 commits in 3.3 s; the
+resident tier between 49,490 and 50,000 commits at every sample, the commit graph's heap 19-24
+MiB at the samples and 31 MiB at its peak, heap in use 22-90 MiB with no doubling at a flush;
+2.68 records written per commit; 6-8 segments, 216 MiB on disk. Before M1 the same run would have
+held all 2,000,000 resident (~800 MB).
+
 ## Not done yet - the plan
 
 | # | item | Cassandra mechanism | expected | status |
@@ -492,7 +626,7 @@ replay - so nothing changes for it.
 | W8 | **Several writes per commit**: the only way past the per-namespace commit rate (~22-25k/s) | commit-log group sync + applying a batch of mutations as one update | concurrent writes towards MongoDB's 46-60k/s | **design below; needs the user's decisions before any code** |
 | E2 | Embedded cache default: fixed 64 MiB vs machine-sized | caches sized from the heap | embedded reads with hot data > 64 MiB | **trade-off below; the user's decision** |
 | W9 | **Stale premerges** (new, from the W7 profile): a zipfian-hot document is often written again between an Upsert's premerge and its turn at the gate, so the gate re-merges it - 11% of gate time at update@32. Merge faster at the gate: one parse of the stored body instead of several - the merge is of top-level keys only | `AtomicBTreePartition` retries its CAS before taking the lock | up to ~10% of gate time on hot keys | low (faster merge) |
-| M1 | Bound the commit graph's resident tier: flush by size, merge graph segments size-tiered, stream the flush | memtable flush on heap space; SizeTieredCompactionStrategy | ~300 MiB less at this workload, no 2x flush peak, bounded at any write rate | measured and diagnosed (M1 above); needs a design pass on the graph file (#159) |
+| M1 | Bound the commit graph's resident tier: flush by size, merge graph segments size-tiered, stream the flush | memtable flush on heap space; SizeTieredCompactionStrategy; per-SSTable bloom filters; trickle_fsync | ~300 MiB less at this workload, no 2x flush peak, bounded at any write rate | **done** on `perf/rw-m1-graph-memory`: 1,289 -> 861 MiB, graph 333 -> 21 MiB, writes 0.98x (noise); see [M1 - measured](#m1---measured) |
 
 ### W8 - several writes per commit (design; not implemented)
 
