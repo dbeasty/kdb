@@ -165,6 +165,10 @@ func FromDocumentBodyValue(value codec.Value) (Document, error) {
 }
 
 func validateObjectJSON(jsonText string) error {
+	if isObjectJSON(jsonText) {
+		return nil
+	}
+	// Rejected, or beyond what the scan follows: encoding/json decides, with its own error.
 	var v any
 	if err := json.Unmarshal([]byte(jsonText), &v); err != nil {
 		return NewDecodeError("invalid json", nil, err)
