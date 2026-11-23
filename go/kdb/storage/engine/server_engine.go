@@ -1048,7 +1048,14 @@ func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec
 		// Under a mode that deletes delta segments, the log is not a home
 		// this version can rely on - but that home is filled in lazily, at
 		// PrepareForTruncation time, not here. See document_bodies.go.
-		prev, hadPrev := e.tree.HashFor(doc.ID)
+		//
+		// The tree is updated first: the walk that inserts the version also reports the one it
+		// replaces (W7), where a lookup before it walked the same path again. Nothing reads
+		// e.tree before it is published below, so the order is invisible to readers.
+		next, prev, hadPrev, err := e.tree.WithSpinePrev(doc.ID, h, spine)
+		if err != nil {
+			return document.DocumentTree{}, err
+		}
 		// Pin before Put, never after: Put evicts to stay within budget as
 		// part of the insert, so a version pinned afterwards can already be
 		// gone - and for a document larger than one shard's share of the
@@ -1073,10 +1080,7 @@ func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec
 				e.docsByHash.Unpin(prev)
 			}
 		}
-		e.tree, err = e.tree.WithSpine(doc.ID, h, spine)
-		if err != nil {
-			return document.DocumentTree{}, err
-		}
+		e.tree = next
 	}
 	if len(durable) > 0 {
 		e.durMu.Lock()
