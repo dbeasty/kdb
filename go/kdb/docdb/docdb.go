@@ -35,6 +35,10 @@ type Options struct {
 	// Principal is who writes are attributed to and authorized as. The zero value is anonymous,
 	// which the default (allow-all) authorization accepts.
 	Principal auth.Principal
+	// CoalesceWrites commits writes from concurrent goroutines together, several per commit
+	// (server.KdbServerRuntime.CoalesceWrites): more writes per second under concurrency, never
+	// two writes to one document in a commit. Off by default.
+	CoalesceWrites bool
 }
 
 // DB is one open namespace. Its methods are safe for concurrent use.
@@ -63,7 +67,9 @@ func Open(dir, namespace string, opts Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DB{rt: server.NewKdbServerRuntime(rt), ns: namespace, principal: opts.Principal}, nil
+	srv := server.NewKdbServerRuntime(rt)
+	srv.CoalesceWrites = opts.CoalesceWrites
+	return &DB{rt: srv, ns: namespace, principal: opts.Principal}, nil
 }
 
 // Get returns the document stored under id at the current head.

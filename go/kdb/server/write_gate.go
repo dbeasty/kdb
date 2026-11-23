@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -90,16 +91,27 @@ func (g *writeGate) longHold() (*BusyError, <-chan struct{}) {
 //
 // While a long hold is on (beginLongHold) it refuses with the hold's BusyError instead.
 func (g *writeGate) acquire(ctx context.Context) (release func(), err error) {
-	return g.admit(ctx, true)
+	return g.admit(ctx, true, nil)
+}
+
+// errServedWhileQueued is acquireUnlessServed's report that served closed before the gate came
+// free: another writer took the queued write into its batch (writeBatcher), so the caller does
+// not need the gate at all.
+var errServedWhileQueued = errors.New("kdb server: write committed by another writer's batch")
+
+// acquireUnlessServed is acquire for a write a batch leader may take on its behalf: it gives up
+// queueing, with errServedWhileQueued, as soon as served is closed.
+func (g *writeGate) acquireUnlessServed(ctx context.Context, served <-chan struct{}) (release func(), err error) {
+	return g.admit(ctx, true, served)
 }
 
 // acquireThroughHold is acquire for an internal caller that must wait out a long hold rather than
 // be refused by it - one that takes the gate to let admitted writes drain, not to write.
 func (g *writeGate) acquireThroughHold(ctx context.Context) (release func(), err error) {
-	return g.admit(ctx, false)
+	return g.admit(ctx, false, nil)
 }
 
-func (g *writeGate) admit(ctx context.Context, refuseDuringHold bool) (release func(), err error) {
+func (g *writeGate) admit(ctx context.Context, refuseDuringHold bool, served <-chan struct{}) (release func(), err error) {
 	if refuseDuringHold {
 		if held, _ := g.longHold(); held != nil {
 			return nil, held
@@ -129,6 +141,8 @@ func (g *writeGate) admit(ctx context.Context, refuseDuringHold bool) (release f
 			}, nil
 		case <-ctx.Done():
 			return nil, &DeadlineExceededError{Reason: "timed out waiting for an earlier write to finish"}
+		case <-served:
+			return nil, errServedWhileQueued
 		case <-wake:
 			// A long hold began: loop to refuse with it (or, if it has already ended, to wait on).
 		}
