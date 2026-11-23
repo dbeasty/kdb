@@ -77,7 +77,7 @@ func main() {
 	cells := flag.String("cells", "read,update,mixed50,read95,insert", "comma-separated workloads: read, update, mixed50 (YCSB A), read95 (YCSB B), insert")
 	concs := flag.String("concurrency", "1,8,32", "comma-separated worker counts; every cell runs at each")
 	ops := flag.Int("ops", 0, "operations per cell; 0 = 20k at concurrency 1, 100k up to 8, 200k above")
-	dist := flag.String("dist", "zipf", "key choice for read/update: zipf (YCSB's 0.99 skew) or uniform")
+	dist := flag.String("dist", "zipf", "key choice for read/update: zipf (YCSB's 0.99 skew), uniform, or hot:N (uniform over N documents - a few documents everyone writes)")
 	seed := flag.Uint64("seed", 42, "document ids and values derive from this")
 	mongoJ := flag.Bool("mongo-j", false, "Mongo writes with {j:true} (journal synced before the ack) instead of the default {w:1}")
 	jsonOut := flag.String("json", "", "append one JSON object per cell to this file")
@@ -211,7 +211,15 @@ func runCell(ctx context.Context, st store, spec cellSpec, ids []string, vals []
 				// nearest legal skew. Scrambled below so the hot keys are not the first loaded.
 				zipf = rand.NewZipf(rng, 1.01, 1, uint64(len(ids)-1))
 			}
+			hot := 0
+			if n, ok := strings.CutPrefix(dist, "hot:"); ok {
+				hot, _ = strconv.Atoi(n)
+				hot = min(max(hot, 1), len(ids))
+			}
 			pick := func() string {
+				if hot > 0 {
+					return ids[rng.IntN(hot)]
+				}
 				if zipf != nil {
 					k := zipf.Uint64()
 					return ids[(k*0x9E3779B97F4A7C15)%uint64(len(ids))]
