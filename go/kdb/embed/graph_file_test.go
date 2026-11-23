@@ -71,7 +71,8 @@ func TestGraphFileLifecycleThroughRuntime(t *testing.T) {
 	if !d.GraphFileActive() {
 		t.Fatal("no graph file after passing the rebuild threshold")
 	}
-	if st := rt.CommitGraphStatus(); st.FileCommits < 30 || st.ResidentCommits != 0 {
+	// Flushed by size as the commits arrived: whatever is left resident is under the threshold.
+	if st := rt.CommitGraphStatus(); st.FileCommits < 20 || st.ResidentCommits >= 20 || st.FileCommits+st.ResidentCommits < 31 {
 		t.Fatalf("after rebuild: %+v", st)
 	}
 	writeRevs(t, rt, ns, 30, 35) // resident tail on top of the file
@@ -90,7 +91,7 @@ func TestGraphFileLifecycleThroughRuntime(t *testing.T) {
 	if !d2.GraphFileActive() {
 		t.Fatal("graph file not attached on reopen")
 	}
-	if st := rt2.CommitGraphStatus(); st.FileCommits < 30 {
+	if st := rt2.CommitGraphStatus(); st.FileCommits < 20 {
 		t.Fatalf("reopened graph shows %d commits", st.FileCommits)
 	}
 	if got := historyOf(t, rt2); !reflect.DeepEqual(got, want) {

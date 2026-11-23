@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -160,20 +161,43 @@ type InMemoryCommitDag struct {
 	// generation(parent) < generation(child) and must be rebuilt before
 	// anything prunes with them. See storeCommitLocked.
 	genStale bool
+	// genStaleSegments says the next recompute must include the graph segments too: history
+	// arrived below commits already written to one (a deepen, an unshallow, a parent stored after
+	// a flushed child), so their generations were derived without it. Rare, and O(history) when
+	// it happens; see recomputeGenerationsLocked.
+	genStaleSegments bool
 	// mergeBaseSteps counts the commits the merge-base walks have stepped through (see
 	// MergeBaseSteps). Only those walks touch it, and they hold mu exclusively.
 	mergeBaseSteps uint64
 	// graphDir is where the commit graph's segments live (see graph_attach.go); the mappings
-	// themselves are nodes' segment tier. graphRebuild serializes segment writes, which run
-	// without holding mu.
+	// themselves are nodes' segment tier. Segment writes run without holding mu: graphFlushMu
+	// serializes flushes (resident tier -> segment) and graphMergeMu merges (segments -> segment),
+	// so a long merge never holds a flush up.
 	graphDir      string
 	graphReadOnly bool
 	graphNextSeq  uint64
-	// graphPinned is the segments the checkpoint on disk references, and graphDeferred the
-	// superseded ones waiting for a checkpoint that no longer does. See graph_checkpoint.go.
+	graphFlushMu  sync.Mutex
+	graphMergeMu  sync.Mutex
+	// graphFiles guards graphPinned and graphDeferred, and every rename or removal of a segment
+	// file. Taken after mu, never before. graphPinned is the segments the checkpoint on disk (or
+	// one being written) references, and graphDeferred the superseded ones waiting for a
+	// checkpoint that no longer does. See graph_checkpoint.go.
+	graphFiles    sync.Mutex
 	graphPinned   map[uint64]bool
 	graphDeferred []deferredSegment
-	graphRebuild  sync.Mutex
+	// Size-triggered writes (graph_attach.go), guarded by mu. graphAuto is on once the embedding
+	// runtime has opened the graph (StartGraphAutoFlush); the flusher and compactor are on-demand
+	// goroutines, at most one of each, that exit when there is nothing to do.
+	graphAuto       bool
+	graphFlushing   bool
+	graphMerging    bool
+	graphFlushFloor int       // the resident commits the last flush left behind
+	graphRetryAt    time.Time // after a failed background write, not before this
+	graphStop       atomic.Bool
+	graphWork       sync.WaitGroup
+	// graphWritten counts segment records ever written - flushes, merges and rewrites - so the
+	// write amplification of the policy can be read off (GraphFileStats).
+	graphWritten atomic.Int64
 
 	// provisional holds commits appended as one part of a cross-namespace group that has not
 	// been durably decided yet; provisionalGen counts every such append. See provisional.go.
@@ -641,6 +665,7 @@ func (d *InMemoryCommitDag) Unshallow(hash codec.Hash) error {
 	}
 	delete(d.shallow, hash)
 	d.genStale = true
+	d.genStaleSegments = true // the root or its descendants may be in a segment
 	d.ancestryVersion++
 	d.ancestryEpoch++
 	return nil
@@ -652,6 +677,7 @@ func (d *InMemoryCommitDag) InvalidateGenerations() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.genStale = true
+	d.genStaleSegments = true
 	d.ancestryVersion++
 	d.ancestryEpoch++
 }
