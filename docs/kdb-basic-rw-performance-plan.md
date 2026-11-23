@@ -472,37 +472,38 @@ rule should a client-supplied id ever reach these paths.
   eighth (it owns its container); an embedded store takes half that.
 
 Measured with the same `kdb-embed` setup (4 CPUs / 3 GB, so the new default is 192 MiB; 100k 1 KB
-documents; 1M-operation cells; `-embed-cache 67108864` for the old default, `-1` for the new one,
-`0` for the service's 384 MiB), two passes in alternating order, ops/s mean (passes):
+documents; `-embed-cache 67108864` for the old default, `-1` for the new one, `0` for the service's
+384 MiB). Two passes in alternating order, each under the shared benchmark lock, and any run that
+another benchmark container overlapped was thrown away and redone (none had to be). Ops/s, mean
+(passes). Reads, 1M-operation cells:
 
 | cell | c | old 64 MiB | new default (192 MiB) | service sizing (384 MiB) | new / old |
 |---|--:|--:|--:|--:|--:|
-| read | 1 | 302,794 (291,188 / 314,399) | 482,172 (481,990 / 482,353) | 994,790 | 1.59x |
-| read | 8 | 828,123 (750,921 / 905,324) | 1,612,520 (1,499,134 / 1,725,906) | 3,564,596 | 1.95x |
-| read | 32 | 1,029,987 (1,004,755 / 1,055,219) | 1,883,911 (1,840,785 / 1,927,037) | 3,793,752 | 1.83x |
-| read95 | 1 | 158,420 (157,774 / 159,066) | 200,343 (195,204 / 205,481) | 277,591 | 1.26x |
-| read95 | 8 | 159,765 (159,447 / 160,082) | 212,485 (205,270 / 219,700) | 262,031 | 1.33x |
-| read95 | 32 | 155,490 (160,560 / 150,420) | 202,706 (198,615 / 206,797) | 240,510 | 1.30x |
-| load (100k inserts) | 32 | 30,458 (29,749 / 31,167) | 27,114 (26,103 / 28,124) | 27,254 | 0.89x |
-| peak RSS after the cells | | 593-603 MB | 886-892 MB | 1,057-1,075 MB | +290 MB |
+| read | 1 | 313,798 (306,194 / 321,401) | 532,213 (485,733 / 578,692) | 1,081,952 | 1.70x |
+| read | 8 | 955,393 (978,366 / 932,419) | 1,683,043 (1,591,233 / 1,774,853) | 3,634,267 | 1.76x |
+| read | 32 | 1,070,101 (1,062,629 / 1,077,574) | 1,978,140 (1,882,939 / 2,073,341) | 3,980,106 | 1.85x |
+| read95 | 1 | 165,118 (166,298 / 163,939) | 220,193 (214,185 / 226,201) | 284,718 | 1.33x |
+| read95 | 8 | 170,281 (175,303 / 165,259) | 213,101 (222,765 / 203,438) | 284,203 | 1.25x |
+| read95 | 32 | 151,378 (151,213 / 151,543) | 201,362 (197,798 / 204,925) | 253,970 | 1.33x |
+| peak RSS after the cells | | 608-615 MB | 878-880 MB | 1,057-1,077 MB | +270 MB |
 
-Writes, the same way (default op counts, old and new only, two passes alternated):
+Writes, default op counts, old and new only:
 
 | cell | c | old 64 MiB | new default (192 MiB) | new / old |
 |---|--:|--:|--:|--:|
-| load (100k inserts) | 32 | 32,526 (29,663 / 35,388) | 28,484 (28,104 / 28,864) | 0.88x |
-| update | 1 / 8 / 32 | 18,766 / 20,554 / 17,902 | 19,402 / 19,372 / 18,294 | 1.03x / 0.94x / 1.02x |
-| insert | 1 / 8 / 32 | 26,312 / 26,516 / 26,659 | 27,077 / 26,310 / 26,465 | 1.03x / 0.99x / 0.99x |
-| peak RSS after the cells | | 1.22 GB | 1.38-1.48 GB | +160-260 MB |
+| update | 1 / 8 / 32 | 19,842 / 20,275 / 19,033 | 20,383 / 19,378 / 19,016 | 1.03x / 0.96x / 1.00x |
+| insert | 1 / 8 / 32 | 27,130 / 26,129 / 25,608 | 30,116 / 28,333 / 25,927 | 1.11x / 1.08x / 1.01x |
+| first 100k inserts (load phase, 4 runs each) | 32 | 29,027-34,140 | 28,694-33,242 | 0.95x, ranges overlap |
+| peak RSS after the cells | | 1.17 GB | 1.41-1.50 GB | +240-320 MB |
 
-Reads gain 1.6-1.95x and read95 1.3x; the service's sizing would roughly double that again, at
-another 170 MB. Steady-state writes are unchanged (0.94-1.03x). The one cost that repeats in all
-four passes is the first 100k inserts into an empty store, about 11% slower (3.4-3.6 s against
-2.8-3.4 s) with either bigger cache: the cache keeps those bodies resident, so the collector has
-more live heap to mark while it grows. Once the store is loaded, inserts run at the old rate. The memory cost is about twice the budget increase (128 MiB more budget, ~290 MB
-more resident): Go's collector lets the heap grow to twice what is live (`GOGC=100`), so a bigger
-cache holds more garbage too. That is the trade an embedder now gets by default and can undo with
-`MemoryBudgetBytes = 64 << 20`.
+Reads gain 1.7-1.85x and read95 1.25-1.33x; the service's sizing would roughly double that again,
+at another ~190 MB. Writes are unchanged (0.96-1.11x). The memory cost is about twice the budget
+increase (128 MiB more budget, ~270 MB more resident): Go's collector lets the heap grow to twice
+what is live (`GOGC=100`), so a bigger cache carries more garbage too. That is the trade an embedder
+now gets by default, and `MemoryBudgetBytes = 64 << 20` undoes it.
+
+A first A/B overlapped with another session's unlocked kdb-service runs. It agreed on reads but
+showed a 0.88x load phase that the clean rerun does not reproduce.
 
 **Before the decision.** kdb-service sizes its document cache from the machine (an eighth of the container, via
 `server.CachePoolBytes`); an embedded runtime takes a fixed 64 MiB (`MemoryBudgetBytes` zero). An
