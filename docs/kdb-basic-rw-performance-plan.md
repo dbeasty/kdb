@@ -1,7 +1,8 @@
 # KDB basic reads and writes: closing the gap to MongoDB
 
-Written 2026-11-22 against `main` 6bc4d0e9 (v0.9.3 plus docs), rebased onto v0.9.4 (2c2420ba);
-branch `perf/basic-rw`. Every item that changes architecture names the Cassandra mechanism it
+Written 2026-11-22 against `main` 6bc4d0e9 (v0.9.3 plus docs); measured rebased onto v0.9.4
+(2c2420ba), then rebased onto c7a6b41f (#344, which changes memtable flush-failure retry and
+read-error handling, not the paths measured here); branch `perf/basic-rw`. Every item that changes architecture names the Cassandra mechanism it
 follows, as `kdb-memory-cassandra-plan.md` and `kdb-qtask-cpu-plan.md` do. Pure local fixes do not.
 
 **Status (2026-11-22):** W1-W4 and F1 are implemented and measured in this branch. Reads beat
