@@ -54,13 +54,15 @@ func TestReplicatedChainOfAnUnknownVersionHoldsMerging(t *testing.T) {
 	if h := b.data.AdvertisedResolutionHash(); !strings.HasPrefix(h, "unsupported:") {
 		t.Fatalf("B advertises %q for a chain it cannot run", h)
 	}
-	reported := false
-	for _, e := range b.data.Conflicts.List() {
-		if e.Kind == "meta-apply" && strings.Contains(e.Detail, "newer than this node runs") {
-			reported = true
+	// The chain is installed before the conflict is recorded (MetaStore.apply), so the install
+	// being visible does not mean the report is: wait for it.
+	reportedNow := func() bool {
+		for _, e := range b.data.Conflicts.List() {
+			if e.Kind == "meta-apply" && strings.Contains(e.Detail, "newer than this node runs") {
+				return true
+			}
 		}
+		return false
 	}
-	if !reported {
-		t.Fatalf("expected the unknown version in B's conflict queue, got %+v", b.data.Conflicts.List())
-	}
+	waitFor(t, "the unknown version in B's conflict queue", reportedNow)
 }
