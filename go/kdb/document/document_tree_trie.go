@@ -198,8 +198,9 @@ func uuidAfter(a, b codec.UUID) bool {
 // which the caller holds. place then takes the slab lock just to copy the records in and count
 // the references they add. Records refer to each other by refLocal|index until placed.
 type trieEdit struct {
-	v    trieView
-	keep map[uint64]bool // translate: the segments a rebased tree may refer into
+	v     trieView
+	spine *LeafSpine      // trieWithSpine: the new leaf's hashes, worked out before the edit
+	keep  map[uint64]bool // translate: the segments a rebased tree may refer into
 	// Shared across the trees of one rebase (rebaseTrees), so a record several of them reach is
 	// translated, copied and placed once and then shared, as it was before.
 	memo, placed map[tref]tref
@@ -226,7 +227,7 @@ func getEdit(v trieView) *trieEdit {
 }
 
 func putEdit(e *trieEdit) {
-	e.v, e.keep, e.memo, e.placed = trieView{}, nil, nil, nil
+	e.v, e.keep, e.memo, e.placed, e.spine = trieView{}, nil, nil, nil, nil
 	if len(e.recs) > 1024 { // a large rebase: do not keep its buffer
 		e.recs = nil
 	}
@@ -276,8 +277,38 @@ func (e *trieEdit) next() (tref, *editRec) {
 
 func (e *trieEdit) newLeaf(key *[16]byte, content codec.Hash, depth int) tref {
 	r, rec := e.next()
-	*rec = editRec{hash: foldLeaf(key[:], content, depth), id: *key, content: content, leaf: true}
+	var h [32]byte
+	if sp := e.spine; sp != nil && sp.id == *key && sp.content == content {
+		h = sp.at[depth]
+	} else {
+		h = foldLeaf(key[:], content, depth)
+	}
+	*rec = editRec{hash: h, id: *key, content: content, leaf: true}
 	return r
+}
+
+// LeafSpine is a document version's leaf hash folded up to every depth of the trie: at[d] is what
+// foldLeaf(id, content, d) returns. The fold is most of an update's hashing and depends on nothing
+// but the version, so a writer can work it out before it holds whatever serializes its tree
+// update (the server's write gate), and the update then only looks up the depth it lands at.
+// Computing every depth costs a few rounds more than the one depth an update needs - depth is
+// only known once the tree is - and those few rounds are spent outside the serialized section.
+type LeafSpine struct {
+	id      [16]byte
+	content codec.Hash
+	at      [trieDepth + 1][32]byte
+}
+
+// NewLeafSpine folds the leaf of (docID, contentHash) to every depth.
+func NewLeafSpine(docID codec.UUID, contentHash codec.Hash) *LeafSpine {
+	sp := &LeafSpine{id: uuidKey(docID), content: contentHash}
+	sp.at[trieDepth] = leafHash(sp.id[:], contentHash)
+	sh := spineHashers.Get().(*spineHasher)
+	for d := trieDepth - 1; d >= 0; d-- {
+		sp.at[d] = sh.onlyChild(nibbleAt(sp.id[:], d), sp.at[d+1])
+	}
+	spineHashers.Put(sh)
+	return sp
 }
 
 func (e *trieEdit) newNode(children *[16]tref) tref {
@@ -448,6 +479,11 @@ func (s *trieSlab) commit(e *trieEdit, r tref, gen uint32) *trieTree {
 // trieWith returns the tree h with (id, contentHash) set, sharing every subtree not on id's
 // path with h. O(trieDepth). A nil h is the empty tree; the result then starts a new slab.
 func trieWith(h *trieTree, id codec.UUID, contentHash codec.Hash) *trieTree {
+	return trieWithSpine(h, id, contentHash, nil)
+}
+
+// trieWithSpine is trieWith taking the new leaf's hashes from spine (nil: hash them here).
+func trieWithSpine(h *trieTree, id codec.UUID, contentHash codec.Hash, spine *LeafSpine) *trieTree {
 	var s *trieSlab
 	var root tref
 	var gen uint32
@@ -458,6 +494,7 @@ func trieWith(h *trieTree, id codec.UUID, contentHash codec.Hash) *trieTree {
 		s, root, gen = h.slab, h.root, h.gen
 	}
 	e := getEdit(s.view())
+	e.spine = spine
 	key := uuidKey(id)
 	nr := e.insert(root, &key, contentHash, 0)
 	out := h

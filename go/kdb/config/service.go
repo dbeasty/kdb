@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -150,6 +151,31 @@ type ServiceSettings struct {
 	AsyncSyncIntervalMS int
 	Compression         string
 	SyncMode            string
+	// PreallocateSegments creates each new delta segment at its full size, zeroed, so appends
+	// never grow the file and a sync has no file-size metadata to commit
+	// (embed.StorageOptions.PreallocateSegments). With SyncMode fast on Linux, that is what turns
+	// each sync into a data-only fdatasync. Costs one segment of disk (64 MiB by default) per
+	// open namespace up front. On by default on Linux, off elsewhere - see defaultSyncPath.
+	PreallocateSegments bool
+}
+
+// defaultSyncPath is the durable-write path kdb-service uses unless configured otherwise, per
+// platform. On Linux it is fdatasync into preallocated segments: fdatasync still forces the data,
+// and any metadata needed to read it back, through the drive cache - as power-loss-safe as fsync -
+// and on a file whose size never changes it has no metadata left to commit, so a durable commit
+// costs one data flush instead of a data flush plus a journal commit (2x durable writes on one
+// connection, docs/kdb-basic-rw-performance-plan.md D1). That is the commit-log arrangement
+// Cassandra uses (fixed-size segments its CommitLogSegmentManager creates up front) and the
+// sync PostgreSQL defaults to on Linux. Elsewhere "fast" is weaker - on macOS it is
+// F_BARRIERFSYNC, which leaves the drive cache unflushed - so other platforms keep full syncs
+// into growing segments. Embedded runtimes are not affected: they keep their own zero-value
+// defaults (full, no preallocation), because an embedded store with many small namespaces should
+// not pay a segment of disk per namespace by default.
+func defaultSyncPath() (syncMode string, preallocate bool) {
+	if runtime.GOOS == "linux" {
+		return "fast", true
+	}
+	return "full", false
 }
 
 // DefaultServiceSettings mirrors the flag defaults declared in cmd/kdb-service.
@@ -199,12 +225,14 @@ func DefaultServiceSettings() ServiceSettings {
 		Durability:          "sync",
 		AsyncSyncIntervalMS: 5,
 		Compression:         "zstd",
-		// full: every physical sync forces the drive cache to media
-		// (F_FULLFSYNC on darwin). "fast" keeps process/OS-crash durability at
-		// a fraction of the cost - see storage/io.SyncMode.
-		SyncMode: "full",
+		// Per platform - see defaultSyncPath: fdatasync into preallocated segments on Linux, full
+		// syncs (F_FULLFSYNC on darwin) into growing segments elsewhere.
+		SyncMode:            defaultSyncMode,
+		PreallocateSegments: defaultPreallocate,
 	}
 }
+
+var defaultSyncMode, defaultPreallocate = defaultSyncPath()
 
 // ServiceFile is the JSON shape of a kdb-service config file (--config). Every field is
 // optional - pointer fields distinguish "absent" from a real zero value, so a file can set
@@ -253,6 +281,7 @@ type ServiceFile struct {
 	AsyncSyncIntervalMS *int    `json:"asyncSyncIntervalMs"`
 	Compression         *string `json:"compression"`
 	SyncMode            *string `json:"syncMode"`
+	PreallocateSegments *bool   `json:"preallocateSegments"`
 }
 
 // ServiceTLSFile is ServiceFile's nested TLS block, matching the --tls-* flags.
@@ -373,6 +402,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		setIf(&s.AsyncSyncIntervalMS, file.AsyncSyncIntervalMS)
 		setIf(&s.Compression, file.Compression)
 		setIf(&s.SyncMode, file.SyncMode)
+		setIf(&s.PreallocateSegments, file.PreallocateSegments)
 	}
 
 	// Layer 3: environment.
@@ -517,6 +547,9 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 	}
 	envString("KDB_COMPRESSION", &s.Compression)
 	envString("KDB_SYNC_MODE", &s.SyncMode)
+	if err := envBool("KDB_PREALLOCATE_SEGMENTS", &s.PreallocateSegments); err != nil {
+		return s, err
+	}
 
 	// Layer 4: explicitly-set flags.
 	flagOverrides := []struct {
@@ -566,6 +599,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		{"async-sync-interval-ms", func() { s.AsyncSyncIntervalMS = flags.AsyncSyncIntervalMS }},
 		{"compression", func() { s.Compression = flags.Compression }},
 		{"sync-mode", func() { s.SyncMode = flags.SyncMode }},
+		{"preallocate-segments", func() { s.PreallocateSegments = flags.PreallocateSegments }},
 	}
 	for _, o := range flagOverrides {
 		if flagWasSet(o.name) {

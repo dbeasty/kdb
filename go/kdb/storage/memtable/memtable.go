@@ -322,6 +322,10 @@ type Manager struct {
 	// and is folded under the active table by the next Flush, so a retry writes it out instead
 	// of replacing (and so losing) it.
 	failedFlush *SortedTable
+	// flushMu runs one Flush at a time: there is one pendingFlush slot, and a second flush
+	// swapping its generation in while the first is still writing would hide the first one's
+	// generation from Get until its table landed.
+	flushMu sync.Mutex
 }
 
 // NewManager returns a memtable manager for a namespace.
@@ -431,6 +435,8 @@ func (mgr *Manager) Contains(key codec.Hash) bool {
 // writes persisted only those - either way the failed generation's writes were reachable from
 // nowhere. Mirrors MemTableManager.flush in kdb-storage-memtable.
 func (mgr *Manager) Flush(level int) (sstable.Handle, error) {
+	mgr.flushMu.Lock()
+	defer mgr.flushMu.Unlock()
 	mgr.mu.Lock()
 	snap := mgr.active
 	if failed := mgr.failedFlush; failed != nil {

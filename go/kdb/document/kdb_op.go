@@ -19,6 +19,11 @@ type WriteOp struct {
 	// (operationsAsStored), so Replace is never part of the stored KdbOp and replay, history and
 	// peer sync see no new op kind. That is why it is not in toValue.
 	Replace bool
+	// Prevalidated, with Replace, says the caller has already checked that Patch is a JSON
+	// object, so staging stores it without parsing it again. Request-only like Replace, and only
+	// ever set in-process (an Upsert resolves its merge before the write gate and hands the gate
+	// the result); a decoded op never carries it.
+	Prevalidated bool
 }
 
 func (WriteOp) isOp() {}

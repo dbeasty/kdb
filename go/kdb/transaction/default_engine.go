@@ -379,19 +379,27 @@ func runSchemaPhase(
 	for index, op := range tx.Operations {
 		switch o := op.(type) {
 		case document.WriteOp:
-			baseDoc, touched := pending[o.DocID]
-			if !touched {
-				var readErr error
-				baseDoc, readErr = store.GetDocument(namespaceID, o.DocID, baselineTreeHash)
-				if readErr != nil {
-					return schemaOutcome{rollingSchema: rolling, err: readErr}
+			// A replace does not read what it replaces: under bounded live bodies that read can be
+			// a cold load, and this runs at the front of the write gate.
+			var baseDoc *document.Document
+			if !o.Replace {
+				var touched bool
+				if baseDoc, touched = pending[o.DocID]; !touched {
+					var readErr error
+					baseDoc, readErr = store.GetDocument(namespaceID, o.DocID, baselineTreeHash)
+					if readErr != nil {
+						return schemaOutcome{rollingSchema: rolling, err: readErr}
+					}
 				}
 			}
 			var candidate document.Document
 			var err error
-			if baseDoc != nil && !o.Replace {
+			switch {
+			case baseDoc != nil:
 				candidate, err = baseDoc.Merge(o.Patch)
-			} else {
+			case o.Replace && o.Prevalidated:
+				candidate = document.Document{ID: o.DocID, JSON: o.Patch}
+			default:
 				candidate, err = document.FromJSONWithID(o.DocID, o.Patch)
 			}
 			if err != nil {

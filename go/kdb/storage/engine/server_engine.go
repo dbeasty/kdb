@@ -148,11 +148,21 @@ type ServerEngine struct {
 	frameReads atomic.Pointer[frameReads]
 	// pendingLocations holds the content hashes a commit tree produced,
 	// keyed by that tree's hash, waiting for the log to report where the
-	// commit naming it landed. See RecordCommitLocation.
+	// commit naming it landed. See RecordCommitLocation. Several commits in
+	// flight can produce the same tree (a write that changes nothing leaves
+	// its parent's tree), so each tree hash holds a queue, oldest first, the
+	// order the log reports them in - as durablePins does.
 	pendingMu        sync.Mutex
-	pendingLocations map[codec.Hash][]TreeChange
+	pendingLocations map[codec.Hash][][]TreeChange
 	pendingOrder     []codec.Hash
 	pending          *shardedPendingStore
+	// flushing is set while maybeFlushMemtable's background flush runs; Close waits on flushes.
+	flushing atomic.Bool
+	flushes  sync.WaitGroup
+	// prepared holds versions a writer hashed before it reached whatever serializes CommitTree
+	// (PrepareVersion), keyed by document.
+	preparedMu       sync.Mutex
+	prepared         map[codec.UUID]preparedVersion
 	enlistmentStates map[codec.UUID]storage.EnlistmentEvictionState
 
 	// treeMu guards tree, a running DocumentTree updated incrementally
@@ -386,6 +396,9 @@ func (e *ServerEngine) Close() error {
 	// difference between a historical read resolving by address next time
 	// and having to replay the log to rebuild what it needed.
 	var firstErr error
+	// A background flush first (maybeFlushMemtable): it must not start writing a table after the
+	// blob store below is closed.
+	e.flushes.Wait()
 	// Only where there is somewhere to flush to: an engine built without an
 	// IO shim (in-memory targets, and much of the test suite) has a
 	// memtable whose writer would dereference a nil store.
@@ -548,6 +561,61 @@ func (e *ServerEngine) GetDocument(namespaceID string, docID codec.UUID, atCommi
 	}
 	cp := d
 	return &cp, nil
+}
+
+// preparedVersion is a version's content hash and leaf spine, worked out ahead of CommitTree.
+type preparedVersion struct {
+	json  string
+	hash  codec.Hash
+	spine *document.LeafSpine
+}
+
+// maxPreparedVersions bounds prepared: an entry whose commit never comes (the write failed, or
+// took the gate's own path) is otherwise only replaced by the document's next prepare.
+const maxPreparedVersions = 4096
+
+// PrepareVersion is storage.VersionPreparer: hash doc - its content hash and its leaf folded to
+// every depth of the trie - now, so the CommitTree that stores it only looks the hashes up. Both
+// are functions of the version alone; CommitTree uses them only for exactly this body.
+func (e *ServerEngine) PrepareVersion(namespaceID string, doc document.Document) {
+	h, err := doc.ContentHash()
+	if err != nil {
+		return
+	}
+	pv := preparedVersion{json: doc.JSON, hash: h, spine: document.NewLeafSpine(doc.ID, h)}
+	e.preparedMu.Lock()
+	if e.prepared == nil || len(e.prepared) >= maxPreparedVersions {
+		e.prepared = make(map[codec.UUID]preparedVersion)
+	}
+	e.prepared[doc.ID] = pv
+	e.preparedMu.Unlock()
+}
+
+// versionHashes is doc's content hash and, when PrepareVersion worked them out for this exact
+// body, its leaf spine; otherwise the hash is computed here and the trie folds the leaf itself.
+func (e *ServerEngine) versionHashes(doc document.Document) (codec.Hash, *document.LeafSpine, error) {
+	e.preparedMu.Lock()
+	pv, ok := e.prepared[doc.ID]
+	if ok {
+		delete(e.prepared, doc.ID)
+	}
+	e.preparedMu.Unlock()
+	if ok && pv.json == doc.JSON {
+		return pv.hash, pv.spine, nil
+	}
+	h, err := doc.ContentHash()
+	return h, nil, err
+}
+
+// DocumentHash is storage.DocumentHasher: the version of docID that tree treeHash holds, read off
+// the trie without touching docsByHash, so it is never a cold load.
+func (e *ServerEngine) DocumentHash(namespaceID string, docID codec.UUID, treeHash codec.Hash) (codec.Hash, bool, bool) {
+	tree, ok, err := e.treeAt(treeHash)
+	if err != nil || !ok {
+		return codec.Hash{}, false, false
+	}
+	h, found := tree.HashFor(docID)
+	return h, found, true
 }
 
 // loadCold re-reads a version docsByHash no longer holds, and re-admits it
@@ -908,14 +976,33 @@ func (e *ServerEngine) CommitTree(namespaceID string, parentTreeHash codec.Hash)
 // Best-effort: a failed flush leaves the generation reachable through
 // pendingFlush, so nothing written is lost, and the next commit tries
 // again.
+//
+// The table is written on a goroutine of its own, as Cassandra writes a full memtable on its flush
+// writer while writes go on into a fresh one (ColumnFamilyStore.switchMemtable): the caller is a
+// commit, and on the server a commit holds the write gate, so writing the table and syncing it in
+// line put every writer behind a disk write - the largest stalls in a write-heavy run. A writer
+// waits only when a second generation fills before the first has been written (twice the
+// threshold), as Cassandra blocks writes once memtables pending flush pass their cleanup threshold.
 func (e *ServerEngine) maybeFlushMemtable() {
 	if e.memTable == nil || e.config.IOShim == nil {
 		return
 	}
-	if e.memTable.SizeBytes() < e.memtableFlushBytes() {
+	size, limit := e.memTable.SizeBytes(), e.memtableFlushBytes()
+	if size < limit {
 		return
 	}
-	_, _ = e.memTable.Flush(0)
+	if e.flushing.CompareAndSwap(false, true) {
+		e.flushes.Add(1)
+		go func() {
+			defer e.flushes.Done()
+			defer e.flushing.Store(false)
+			_, _ = e.memTable.Flush(0)
+		}()
+		return
+	}
+	if size >= 2*limit {
+		_, _ = e.memTable.Flush(0)
+	}
 }
 
 func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec.Hash) (document.DocumentTree, error) {
@@ -949,7 +1036,7 @@ func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec
 	baseTree := e.tree
 	changed := make([]TreeChange, 0, len(puts))
 	for _, doc := range puts {
-		h, err := doc.ContentHash()
+		h, spine, err := e.versionHashes(doc)
 		if err != nil {
 			return document.DocumentTree{}, err
 		}
@@ -977,7 +1064,7 @@ func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec
 		if hadPrev && prev != h && !bounded {
 			e.docsByHash.Unpin(prev)
 		}
-		e.tree, err = e.tree.With(doc.ID, h)
+		e.tree, err = e.tree.WithSpine(doc.ID, h, spine)
 		if err != nil {
 			return document.DocumentTree{}, err
 		}

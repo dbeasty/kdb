@@ -134,7 +134,8 @@ func Main() {
 	fs.StringVar(&flagVals.Durability, "durability", flagVals.Durability, "how much of the write-out a commit waits for: sync (default - an acknowledged write is fsynced; concurrent commits share the fsync via group commit, so this is no longer a physical sync per write), async (acknowledged once queued in memory - a crash can lose whatever had not been flushed), or memory (nothing is written to the delta log at all; everything is lost on restart - tests and throwaway workloads only)")
 	fs.IntVar(&flagVals.AsyncSyncIntervalMS, "async-sync-interval-ms", flagVals.AsyncSyncIntervalMS, "background sync period under --durability=async; ignored otherwise")
 	fs.StringVar(&flagVals.Compression, "compression", flagVals.Compression, "codec for newly-written delta frames and SSTable blocks: zstd (default) or none. Each frame records its own codec, so changing this leaves already-written segments readable")
-	fs.StringVar(&flagVals.SyncMode, "sync-mode", flagVals.SyncMode, "physical sync primitive: full (default - data forced to media, F_FULLFSYNC on macOS, survives power loss) or fast (F_BARRIERFSYNC on macOS / fdatasync on Linux - survives process and OS crashes, an order of magnitude cheaper; power loss can lose what the drive cache held)")
+	fs.StringVar(&flagVals.SyncMode, "sync-mode", flagVals.SyncMode, "physical sync primitive: full (fsync; F_FULLFSYNC on macOS) or fast (fdatasync on Linux - forces data through the drive cache like fsync, so it survives power loss, and with --preallocate-segments it commits no metadata; F_BARRIERFSYNC on macOS - survives process and OS crashes, but power loss can lose what the drive cache held). Default fast on Linux, full elsewhere")
+	fs.BoolVar(&flagVals.PreallocateSegments, "preallocate-segments", flagVals.PreallocateSegments, "create each new delta segment at its full size (zeroed), so appends never grow the file and a durable commit's sync has no size metadata to commit - with --sync-mode fast on Linux, about 2x the durable writes on one connection. Costs one segment of disk (64 MiB by default) per open namespace up front. Default on on Linux, off elsewhere; =false to turn off")
 	fs.BoolVar(&showVersion, "version", false, "print version and exit")
 	_ = fs.Parse(os.Args[1:])
 
@@ -285,6 +286,7 @@ func Main() {
 		opts.Storage.Compression = &compression
 		opts.Storage.AsyncSyncIntervalMillis = int64(cfg.AsyncSyncIntervalMS)
 		opts.Storage.SyncMode = syncMode
+		opts.Storage.PreallocateSegments = cfg.PreallocateSegments
 		opts.Storage.AttachmentUploadGrace = cfg.AttachmentUploadGrace
 		opts.Storage.AttachmentDeltaStepBytes = int64(cfg.AttachmentDeltaStepMB) << 20
 		opts.Storage.DisableAttachmentDeltas = !cfg.AttachmentDeltas

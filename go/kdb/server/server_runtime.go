@@ -677,31 +677,114 @@ func (s *KdbServerRuntime) Commit(namespaceID string, tx document.Transaction, s
 // matching component 40 spec §3/§5's Upsert contract: no BaseVersion, never conflicts. A new
 // document is stored exactly as supplied; an existing one is updated by a shallow root-level
 // merge of jsonBody onto the stored body (document.Document.Merge), so a key jsonBody omits
-// keeps its stored value. Always anchors on the current head internally,
-// since callers of Upsert by definition don't have (and don't want) one.
+// keeps its stored value.
+//
+// The merge reads the document at the head the write lands on, resolved at the front of the
+// write gate where nothing else can move it - the way Cassandra applies a mutation to the
+// partition as it is at that moment (AtomicBTreePartition) rather than to a snapshot taken
+// earlier. Resolving the head before queueing, as this once did, merged a writer that had queued
+// behind another onto the version before that one, and wrote back a body without the fields the
+// writer ahead had just set; LAST_WRITE detects no conflicts, so nothing reported the loss.
+//
+// The merge itself is worked out before the gate, also as AtomicBTreePartition does it: build the
+// update off the lock, then install it only if what it was built from is still current (there a
+// compare-and-swap of the partition's root, here a comparison of the document's content hash at
+// the gate front), else redo it under the lock. Reading the stored body, parsing both sides,
+// re-encoding and validating were over half of what each write held the gate for; at the front
+// only a hash lookup in the live tree remains when nothing else wrote the document meanwhile.
 func (s *KdbServerRuntime) Upsert(namespaceID string, docID codec.UUID, jsonBody string, principal auth.Principal) (document.Commit, error) {
-	head, err := s.Runtime.DAG.Head()
-	if err != nil {
-		return document.Commit{}, err
-	}
 	txID, err := codec.RandomUUID()
 	if err != nil {
 		return document.Commit{}, err
 	}
-	// Pinned here rather than left to runTransaction, and the difference is the whole fix.
-	// Between this Head() and the front of the write gate every other writer commits, each
-	// publishing a newer tree; with the history cache sized in whole trees that is more than
-	// enough to push this one out before runTransaction is even entered. Pinning at the instant
-	// the base is resolved - when it is still the live tree and certain to be resident - is the
-	// only placement that closes that window. See ServerEngine.PinTree.
-	defer s.pinBaseTree(head)()
-	tx := document.Transaction{
-		ID:          txID,
-		BaseVersion: head,
-		Operations:  []document.Op{document.WriteOp{DocID: docID, Patch: jsonBody}},
-		Timestamp:   codec.TimestampNow(),
+	tx := s.authored(document.Transaction{
+		ID:         txID,
+		Operations: []document.Op{document.WriteOp{DocID: docID, Patch: jsonBody}},
+		Timestamp:  codec.TimestampNow(),
+	})
+	pre, havePre := s.premerge(namespaceID, docID, jsonBody)
+	return s.clientWrite(tx, func() (document.Commit, error) {
+		return s.runTransaction(tx, principal, txOptions{atHead: true}, func() (transactionResult, error) {
+			live := tx
+			head, commit, ok, err := s.Runtime.DAG.HeadCommit()
+			if err != nil {
+				return nil, err
+			}
+			live.BaseVersion = head
+			if havePre && ok && pre.stillCurrent(s, namespaceID, docID, commit.DocumentTreeHash) {
+				live.Operations = []document.Op{document.WriteOp{DocID: docID, Patch: pre.body, Replace: true, Prevalidated: true}}
+			}
+			return s.UpsertEngine.Commit(live, s.dag, s.Runtime.Storage, s.Schema(), nil, s.clientMessage(live))
+		})
+	})
+}
+
+// premergedUpsert is an Upsert's result worked out ahead of the write gate: the whole document it
+// would store, and the version of the document it was merged onto (absent for a new document).
+type premergedUpsert struct {
+	body   string
+	source codec.Hash
+	absent bool
+}
+
+// premerge resolves an Upsert against the live head before the gate. ok is false when the gate
+// should do the work as it always has: no DAG, a body that does not merge (the gate reports the
+// error), or storage that cannot say which version a tree holds. The schema is still checked at
+// the gate, against the schema as it is then; only the JSON-object check is not repeated.
+func (s *KdbServerRuntime) premerge(namespaceID string, docID codec.UUID, patch string) (premergedUpsert, bool) {
+	hasher, isHasher := s.Runtime.Storage.(storage.DocumentHasher)
+	if s.dag == nil || !isHasher {
+		return premergedUpsert{}, false
 	}
-	return s.commitWith(s.UpsertEngine, tx, principal)
+	_, commit, ok, err := s.Runtime.DAG.HeadCommit()
+	if err != nil || !ok {
+		return premergedUpsert{}, false
+	}
+	tree := commit.DocumentTreeHash
+	source, found, resolved := hasher.DocumentHash(namespaceID, docID, tree)
+	if !resolved {
+		return premergedUpsert{}, false
+	}
+	pre := premergedUpsert{body: patch, absent: !found}
+	if !found {
+		if _, err := document.FromJSONWithID(docID, patch); err != nil {
+			return premergedUpsert{}, false
+		}
+	} else {
+		stored, err := s.Runtime.Storage.GetDocument(namespaceID, docID, tree)
+		if err != nil || stored == nil {
+			return premergedUpsert{}, false
+		}
+		merged, err := stored.Merge(patch)
+		if err != nil {
+			return premergedUpsert{}, false
+		}
+		pre.body, pre.source = merged.JSON, source
+	}
+	// The version's hashing too: its content hash and Merkle leaf depend on nothing the gate
+	// decides. (Cassandra keeps Merkle trees off the write path altogether and builds them at
+	// repair time; KDB's commits name their tree, so the tree is updated per commit, but the
+	// part of that update that is the version's own can be done here.)
+	if preparer, ok := s.Runtime.Storage.(storage.VersionPreparer); ok {
+		preparer.PrepareVersion(namespaceID, document.Document{ID: docID, JSON: pre.body})
+	}
+	return pre, true
+}
+
+// stillCurrent reports whether the document the merge was built from is still the one tree holds.
+func (p premergedUpsert) stillCurrent(s *KdbServerRuntime, namespaceID string, docID codec.UUID, tree codec.Hash) bool {
+	hasher, ok := s.Runtime.Storage.(storage.DocumentHasher)
+	if !ok {
+		return false
+	}
+	h, found, resolved := hasher.DocumentHash(namespaceID, docID, tree)
+	if !resolved {
+		return false
+	}
+	if p.absent {
+		return !found
+	}
+	return found && h == p.source
 }
 
 // pinBaseTree keeps the document tree of commit base resolvable without a rebuild until the
@@ -816,6 +899,9 @@ type txOptions struct {
 	// inside this package, never from a principal a client presented. The commit message travels
 	// with the engine call the caller builds, not here.
 	system bool
+	// atHead marks a transaction that takes its base version at the front of the write gate
+	// (Upsert): there is no earlier base for the queue wait to pin.
+	atHead bool
 }
 
 // runTransaction holds every cross-cutting concern Commit/Upsert/Replay share (draining,
@@ -838,17 +924,22 @@ func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal aut
 	// writers - and Commit hard-fails with BaseNotFoundError if it has been reclaimed by then.
 	// Nothing else roots it: a base version is not a branch head. (Replay needs no equivalent -
 	// it ignores tx.BaseVersion and targets the live head, which is a branch head already.)
-	defer s.dag.Pin(tx.BaseVersion)()
+	if !opts.atHead {
+		defer s.dag.Pin(tx.BaseVersion)()
+	}
 	// The base version's *tree* has to survive the same window, and for a sharper reason than
 	// the commit does. Keeping the commit only keeps Commit from hard-failing; keeping the tree
 	// is what stops the schema phase rebuilding it, once per operation, on the commit path.
 	//
 	// Best-effort here on purpose: a client-supplied BaseVersion can name a tree that was
 	// evicted long before this call, and no pin can retroactively make it resident. Callers
-	// that resolve their own base - Upsert, which anchors on head - pin it at that moment
-	// instead, which is the only point at which the tree is certain to still be there. This one
-	// then nests harmlessly on top; tree pins are counted.
-	defer s.pinBaseTree(tx.BaseVersion)()
+	// that resolve their own base from head before queueing (the system writes in meta.go and
+	// expiry.go) pin it at that moment instead, which is the only point at which the tree is
+	// certain to still be there. This one then nests harmlessly on top; tree pins are counted.
+	// Upsert has no such base: it reads the live head at the gate front (opts.atHead).
+	if !opts.atHead {
+		defer s.pinBaseTree(tx.BaseVersion)()
+	}
 	timeout := s.WriteTimeout
 	if timeout <= 0 {
 		timeout = DefaultWriteTimeout

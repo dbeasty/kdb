@@ -71,6 +71,21 @@ type DamageTolerantReader interface {
 	StreamCommitsPastDamage(segment DeltaSegmentRef, fn func(document.Commit, int64) error) error
 }
 
+// DocumentHasher is implemented by adapters that can say which version of a document a tree holds
+// - its content hash - without reading the version's body. found is false for a document the tree
+// does not hold; ok is false when the adapter cannot resolve the tree, in which case the caller
+// falls back to GetDocument.
+type DocumentHasher interface {
+	DocumentHash(namespaceID string, docID codec.UUID, treeHash codec.Hash) (hash codec.Hash, found, ok bool)
+}
+
+// VersionPreparer is implemented by adapters that can do a version's hashing before CommitTree
+// stores it, for a writer that knows the body it is about to commit before it reaches whatever
+// serializes its commits. Advisory: CommitTree stores the same tree whether or not it was called.
+type VersionPreparer interface {
+	PrepareVersion(namespaceID string, doc document.Document)
+}
+
 // TreeResolver resolves a whole document tree by hash - for Merkle comparison between peers
 // (document.DocumentTree.Node), which needs the trie rather than a walk of it. ok is false for a
 // tree the store does not hold.
