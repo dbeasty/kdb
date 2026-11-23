@@ -31,7 +31,7 @@ const DefaultBudgetFractionOfSystemMemory = 0.75
 // A protection that must be discovered before it works is not a protection; the numbers above are
 // chosen so that switching it on by default is safe rather than surprising.
 func DetectMemoryBudgetBytes() uint64 {
-	if v, ok := cgroupMemoryLimitBytes(); ok {
+	if v, ok := storage.CgroupMemoryLimitBytes(); ok {
 		return v
 	}
 	if total, err := storage.TotalSystemMemoryBytes(); err == nil && total > 0 {
@@ -114,10 +114,11 @@ func peerSyncMaxConnections(setting int) int {
 // index history, the live tree and commit graph, and per-request garbage, which together held about
 // as much as the pool in qtask's write-heavy benchmark. A first cut at a quarter of the machine
 // for the pool alone put that benchmark's container at its limit and the memory guard shed writes.
-// An embedded runtime keeps embed.DefaultHostMemoryBudgetBytes (64 MiB) - it shares its process
-// with an application that owns the memory - but a server process owns its container. At the old
-// fixed 64 MiB, qtask's 517k-document benchmark ran with a 4 MiB frame cache and a 9 MiB block
-// cache in a 4 GiB container and decompressed the same frames on every read.
+// An embedded runtime takes half that fraction and stops at 256 MiB (embed.DefaultMemoryBudgetBytes,
+// one pool per process) - it shares its process with an application that owns the memory - but a
+// server process owns its container. At the old fixed 64 MiB, qtask's 517k-document benchmark ran
+// with a 4 MiB frame cache and a 9 MiB block cache in a 4 GiB container and decompressed the same
+// frames on every read.
 const (
 	CachePoolFractionOfMemory       = 0.125
 	MinCachePoolBytes         int64 = 64 << 20
@@ -132,7 +133,7 @@ func CachePoolBytes(cacheMB int) (int64, string) {
 		return int64(cacheMB) << 20, "explicit"
 	}
 	machine, source := int64(0), ""
-	if v, ok := cgroupMemoryLimitBytes(); ok {
+	if v, ok := storage.CgroupMemoryLimitBytes(); ok {
 		machine, source = int64(v), "an eighth of the cgroup memory limit"
 	} else if total, err := storage.TotalSystemMemoryBytes(); err == nil && total > 0 {
 		machine, source = int64(total), "an eighth of host RAM"

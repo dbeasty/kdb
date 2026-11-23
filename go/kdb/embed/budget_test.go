@@ -22,9 +22,10 @@ func fill(t *testing.T, rt *embed.EmbeddedKdbRuntime, ns string, n, size int) {
 	}
 }
 
-// The compatibility case. A host with one namespace under it must hand that namespace the whole
-// pool, because that is exactly what the single-namespace open path gave it before any of this
-// existed - 64 MiB, from which the engine derives the same four sub-budgets it always did.
+// The compatibility case. A host with one namespace under it - and nothing else default-sized
+// open in the process - must hand that namespace the whole pool, because that is exactly what the
+// single-namespace open path gives it: DefaultMemoryBudgetBytes, from which the engine derives the
+// same four sub-budgets it always did.
 func TestSingleNamespaceGetsTheWholePool(t *testing.T) {
 	root := t.TempDir()
 	host, err := embed.OpenFileHost(root, hostOpts())
@@ -35,9 +36,11 @@ func TestSingleNamespaceGetsTheWholePool(t *testing.T) {
 	if _, err := host.Namespace("app", "app/only", schema.None()); err != nil {
 		t.Fatalf("open namespace: %v", err)
 	}
-	shares := host.MemoryArbiter().Shares()
-	if got := shares["app/only"]; got != embed.DefaultHostMemoryBudgetBytes {
-		t.Fatalf("lone namespace got %d, want the whole %d pool", got, embed.DefaultHostMemoryBudgetBytes)
+	if pool := host.MemoryArbiter().TotalBytes(); pool != embed.DefaultMemoryBudgetBytes() {
+		t.Fatalf("default pool is %d, want DefaultMemoryBudgetBytes %d", pool, embed.DefaultMemoryBudgetBytes())
+	}
+	if got := host.MemoryShares()["app/only"]; got != embed.DefaultMemoryBudgetBytes() {
+		t.Fatalf("lone namespace got %d, want the whole %d pool", got, embed.DefaultMemoryBudgetBytes())
 	}
 }
 
@@ -167,10 +170,10 @@ func TestClosingANamespaceReturnsItsShare(t *testing.T) {
 	if err := host.CloseNamespace("app/going"); err != nil {
 		t.Fatalf("close app/going: %v", err)
 	}
-	if got := host.MemoryArbiter().Shares()["app/stay"]; got != embed.DefaultHostMemoryBudgetBytes {
-		t.Fatalf("survivor got %d, want the whole %d pool back", got, embed.DefaultHostMemoryBudgetBytes)
+	if got := host.MemoryShares()["app/stay"]; got != embed.DefaultMemoryBudgetBytes() {
+		t.Fatalf("survivor got %d, want the whole %d pool back", got, embed.DefaultMemoryBudgetBytes())
 	}
-	if _, still := host.MemoryArbiter().Shares()["app/going"]; still {
+	if _, still := host.MemoryShares()["app/going"]; still {
 		t.Fatal("a closed namespace still holds a share of the pool")
 	}
 }

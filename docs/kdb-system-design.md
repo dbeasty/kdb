@@ -535,7 +535,7 @@ converts offline. `restore_archive.go` restores segments from an archive sink.
 `server/inbound_peers.go`) widen the NONE window so peers that are merely behind do not lose commits; a peer silent
 longer than `--peer-retention-grace` (7d default) stops pinning history and re-bootstraps by snapshot.
 
-**Bounded caches** (all derived from `GlobalMemoryBudgetBytes`; embed default 64 MiB): document versions 50%
+**Bounded caches** (all derived from `GlobalMemoryBudgetBytes`; embed default ¹⁄₁₆ of the process's memory, 64-256 MiB, one pool per process): document versions 50%
 (sharded x64, LRU with pins; `KDB_DOCUMENT_CACHE_BYTES`), commit ops 25% (`KDB_COMMIT_OPS_BYTES`), historical trees
 25% (`boundedTreeStore` LRU with pins; `KDB_HISTORY_TREE_CACHE_BYTES`), memtable flush threshold 25%, SSTable block
 cache 25%. The current tree is outside the tree cache.
