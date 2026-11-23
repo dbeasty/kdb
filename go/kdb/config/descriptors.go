@@ -470,6 +470,13 @@ func serviceSpecs() []settingSpec {
 			value:  yn(func(s ServiceSettings) bool { return s.PreallocateSegments }),
 			inFile: func(f *ServiceFile) bool { return f.PreallocateSegments != nil },
 		},
+		{
+			key: "storage.coalesceWrites", flag: "coalesce-writes", env: "KDB_COALESCE_WRITES",
+			scope: ScopeProcess, mutability: MutabilityRestart,
+			help:   "commit the single-document last-write-wins writes (upsert, replace, delete) waiting at a namespace's write gate together, several per commit: past the one-commit-per-write rate limit under concurrency. Never two writes to one document in a commit. Off by default",
+			value:  yn(func(s ServiceSettings) bool { return s.CoalesceWrites }),
+			inFile: func(f *ServiceFile) bool { return f.CoalesceWrites != nil },
+		},
 	}
 }
 

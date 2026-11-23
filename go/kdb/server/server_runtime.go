@@ -121,6 +121,12 @@ type KdbServerRuntime struct {
 	// embedded caller driving Engine.Commit on a shared *InMemoryCommitDag still wants for
 	// throughput, but the correctness floor is in the DAG itself now.
 	writeGate *writeGate
+	// CoalesceWrites commits the last-write-wins single-document writes (Upsert, Replace, Delete)
+	// queued at the write gate together, several per commit, never two to one document (W8; see
+	// write_batch.go). Off by default: with it off every write is its own commit, as always.
+	CoalesceWrites bool
+	batcher        writeBatcher
+
 	// WriteTimeout bounds how long a commit may wait queued before *DeadlineExceededError.
 	// Defaults to DefaultWriteTimeout; safe to change at any time.
 	WriteTimeout time.Duration
@@ -703,6 +709,17 @@ func (s *KdbServerRuntime) Upsert(namespaceID string, docID codec.UUID, jsonBody
 		Timestamp:  codec.TimestampNow(),
 	})
 	pre, havePre := s.premerge(namespaceID, docID, jsonBody)
+	if s.coalescing() {
+		w := &batchedWrite{tx: tx, docID: docID, bytes: len(jsonBody), op: func(headOK bool, headTree codec.Hash) document.Op {
+			if havePre && headOK && pre.stillCurrent(s, namespaceID, docID, headTree) {
+				return document.WriteOp{DocID: docID, Patch: pre.body, Replace: true, Prevalidated: true}
+			}
+			return document.WriteOp{DocID: docID, Patch: jsonBody}
+		}}
+		if c, err, alone := s.commitCoalesced(w, principal); !alone {
+			return c, err
+		}
+	}
 	return s.clientWrite(tx, func() (document.Commit, error) {
 		return s.runTransaction(tx, principal, txOptions{atHead: true}, func() (transactionResult, error) {
 			live := tx
@@ -750,6 +767,12 @@ func (s *KdbServerRuntime) writeAtHead(ops []document.Op, principal auth.Princip
 		return document.Commit{}, err
 	}
 	tx := s.authored(document.Transaction{ID: txID, Operations: ops, Timestamp: codec.TimestampNow()})
+	if len(ops) == 1 && s.coalescing() {
+		w := &batchedWrite{tx: tx, docID: opDocID(ops[0]), bytes: transactionPayloadBytes(tx), op: singleOp(ops[0])}
+		if c, err, alone := s.commitCoalesced(w, principal); !alone {
+			return c, err
+		}
+	}
 	return s.clientWrite(tx, func() (document.Commit, error) {
 		return s.runTransaction(tx, principal, txOptions{atHead: true}, func() (transactionResult, error) {
 			live := tx
