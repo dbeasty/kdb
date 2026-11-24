@@ -129,9 +129,10 @@ func TestLargeFrameIsDecompressedOnceForAllItsDocuments(t *testing.T) {
 	if misses := readAll(t, srv, eng, ids, bodies); misses > 3 {
 		t.Fatalf("first pass over %d documents of one large frame decompressed it %d times, want ~1", len(ids), misses)
 	}
-	if eng.LargeFrameBodiesRefiled() < int64(len(ids)) {
-		t.Fatalf("%d versions re-filed by value, want at least %d", eng.LargeFrameBodiesRefiled(), len(ids))
-	}
+	// Reopening with a different threshold also starts a background re-filing pass
+	// (embed.startVersionRefile), which may file the bodies before the reads meet the frame; then
+	// the reads' own counter (LargeFrameBodiesRefiled) stays at 0. Who filed them does not matter:
+	// once the first pass is over, every body is by value and nothing decompresses the frame again.
 	if misses := readAll(t, srv, eng, ids, bodies); misses > 0 {
 		t.Fatalf("second pass decompressed %d frames, want 0", misses)
 	}
