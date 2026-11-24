@@ -640,6 +640,11 @@ func TestGraphResidentTierLongRun(t *testing.T) {
 	step := n / 10
 	for done := 0; done < n; done += 1000 {
 		head, _ = chain(t, d, head, 1000, int64(done))
+		// A real writer waits for its commits to be acknowledged; this loop does not, and on a
+		// machine with one or two CPUs (a CI runner running other packages' tests) it would
+		// starve the flusher and measure the overshoot of a writer no server has. The burst
+		// case is TestGraphResidentTierConvergesUnderBurst.
+		time.Sleep(time.Millisecond)
 		if (done+1000)%step == 0 {
 			st := d.GraphFileStats()
 			var ms runtime.MemStats
