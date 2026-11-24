@@ -600,6 +600,9 @@ func TestGraphSegmentBloomHasEveryRecord(t *testing.T) {
 	}
 }
 
+// longRunCommitsPerSecond paces TestGraphResidentTierLongRun's writer (see there).
+const longRunCommitsPerSecond = 50_000
+
 // The long run: a million commits or more through size-triggered flushes and merges, sampling the
 // heap. The resident tier stays bounded, and the heap does not double at a flush.
 // KDB_GRAPH_LONGRUN sets the commit count (default 1,000,000).
@@ -640,11 +643,14 @@ func TestGraphResidentTierLongRun(t *testing.T) {
 	step := n / 10
 	for done := 0; done < n; done += 1000 {
 		head, _ = chain(t, d, head, 1000, int64(done))
-		// A real writer waits for its commits to be acknowledged; this loop does not, and on a
-		// machine with one or two CPUs (a CI runner running other packages' tests) it would
-		// starve the flusher and measure the overshoot of a writer no server has. The burst
-		// case is TestGraphResidentTierConvergesUnderBurst.
-		time.Sleep(time.Millisecond)
+		// A real writer is paced by its acknowledgements: kdb-service commits tens of thousands a
+		// second, not the hundreds of thousands this loop could. The tier's size is its threshold
+		// plus what arrives while one flush runs, so an unpaced loop on a 1-2 CPU runner measures
+		// a writer no server has (a 145-300 MiB peak against the ~68 MiB bound). The burst case
+		// is TestGraphResidentTierConvergesUnderBurst.
+		if wait := time.Until(start.Add(time.Duration(done+1000) * time.Second / longRunCommitsPerSecond)); wait > 0 {
+			time.Sleep(wait)
+		}
 		if (done+1000)%step == 0 {
 			st := d.GraphFileStats()
 			var ms runtime.MemStats
